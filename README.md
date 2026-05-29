@@ -16,6 +16,15 @@
 <p align="center">
   <em>Not a headless simulacrum. Your actual Chrome, your actual Firefox,<br />
   with your actual logged-in sessions, extensions, and cookies.</em>
+  
+</p>
+
+<p align="center">
+  <b>One browser, two, or a thousand (I dare you)</b>
+</p>
+
+<p align="center">
+  Alternative to proprietary extensions from closedAI and Misanthropic.
 </p>
 
 ---
