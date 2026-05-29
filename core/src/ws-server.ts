@@ -5,6 +5,7 @@ import type { Server } from "node:http";
 import type { CoreToExt, ExtToCore } from "./types.js";
 import { registry } from "./registry.js";
 import { loadConfig } from "./config.js";
+import { isAuthRequired, validateApiKey } from "./auth.js";
 
 /** Active WebSocket connections: browserId → WebSocket */
 const connections = new Map<string, WebSocket>();
@@ -113,13 +114,12 @@ export function createWsServer(httpServer: Server): WebSocketServer {
           }
 
           // Auth check (optional — only when configured)
-          const authConfig = loadConfig().auth;
-          if (authConfig.apiKey.length > 0) {
+          if (isAuthRequired()) {
             const authKey = (msg.payload as any).authKey as string | undefined;
-            if (!authKey || authKey !== authConfig.apiKey) {
+            if (!validateApiKey(authKey)) {
               const reply: CoreToExt = {
                 type: "auth_required",
-                payload: { message: "API key required for this server" },
+                payload: { message: "Authentication failed" },
               };
               ws.send(JSON.stringify(reply));
               ws.close();

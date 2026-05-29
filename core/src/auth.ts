@@ -4,6 +4,7 @@
 // EXPORTS: isAuthRequired, validateApiKey
 // DOCS: docs/spec.md §9 Authentication
 
+import { timingSafeEqual } from "node:crypto";
 import { loadConfig } from "./config.js";
 
 /**
@@ -25,5 +26,8 @@ export function validateApiKey(key: string | null | undefined): boolean {
   const cfg = loadConfig();
   if (!isAuthRequired()) return true;         // auth disabled — pass
   if (!key) return false;                     // key required but missing
-  return key === cfg.auth.apiKey;             // constant-time-ish comparison
+  const keyBuf = Buffer.from(key);
+  const cfgBuf = Buffer.from(cfg.auth.apiKey);
+  if (keyBuf.length !== cfgBuf.length) return false;
+  return timingSafeEqual(keyBuf, cfgBuf);
 }

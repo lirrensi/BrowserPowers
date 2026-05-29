@@ -7,8 +7,13 @@ const BASE = `http://${config.host}:${config.port}${config.rest.path}`;
 const FETCH_TIMEOUT_MS = 5000;
 
 function apiFetch(url: string, options?: RequestInit): Promise<Response> {
+  const headers = new Headers(options?.headers ?? {});
+  if (config.auth.apiKey) {
+    headers.set("Authorization", `Bearer ${config.auth.apiKey}`);
+  }
   return fetch(url, {
     ...options,
+    headers,
     signal: options?.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 }
@@ -406,7 +411,7 @@ program
   .description("Run the first-time setup wizard")
   .action(async () => {
     const { createInterface } = await import("node:readline");
-    const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
+    const { existsSync, writeFileSync, mkdirSync, chmodSync } = await import("node:fs");
     const { homedir } = await import("node:os");
     const { resolve } = await import("node:path");
     const { loadConfig } = await import("../config.js");
@@ -467,6 +472,7 @@ program
 
     mkdirSync(configDir, { recursive: true });
     writeFileSync(configPath, stringify(config), "utf-8");
+    chmodSync(configPath, 0o600);
 
     console.log(`\n✅ Config created at ${configPath}`);
     console.log("\n── Next steps ──");

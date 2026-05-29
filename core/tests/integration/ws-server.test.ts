@@ -269,7 +269,7 @@ describe("WS Auth", () => {
     });
     const msg = JSON.parse(raw);
     expect(msg.type).toBe("auth_required");
-    expect(msg.payload.message).toBe("API key required for this server");
+    expect(msg.payload.message).toBe("Authentication failed");
 
     await closePromise;
   });
@@ -299,7 +299,7 @@ describe("WS Auth", () => {
     });
     const msg = JSON.parse(raw);
     expect(msg.type).toBe("auth_required");
-    expect(msg.payload.message).toBe("API key required for this server");
+    expect(msg.payload.message).toBe("Authentication failed");
 
     await closePromise;
   });

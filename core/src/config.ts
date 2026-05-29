@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
@@ -45,6 +45,7 @@ export function loadConfig(): ServerConfig {
   if (!existsSync(CONFIG_PATH)) {
     mkdirSync(CONFIG_DIR, { recursive: true });
     writeFileSync(CONFIG_PATH, stringify(DEFAULT_CONFIG), "utf-8");
+    chmodSync(CONFIG_PATH, 0o600);
     cachedConfig = { ...DEFAULT_CONFIG };
     return cachedConfig;
   }
@@ -54,7 +55,10 @@ export function loadConfig(): ServerConfig {
   try {
     parsed = parse(raw) as Partial<ServerConfig>;
   } catch (err) {
-    console.warn(`[config] Failed to parse config YAML: ${(err as Error).message}. Falling back to defaults.`);
+    throw new Error(
+      `Failed to parse config YAML at ${CONFIG_PATH}: ${(err as Error).message}. ` +
+      `Fix or delete the file to start the server with safe defaults.`
+    );
   }
 
   cachedConfig = {
@@ -80,6 +84,7 @@ export function reloadConfig(): ServerConfig {
 export function saveConfig(config: ServerConfig): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, stringify(config), "utf-8");
+  chmodSync(CONFIG_PATH, 0o600);
 }
 
 export { CONFIG_DIR, CONFIG_PATH };

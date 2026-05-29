@@ -3,6 +3,7 @@ import { restApp } from "./adapters/rest.js";
 import { mountMcpServer } from "./adapters/mcp.js";
 import { loadConfig } from "./config.js";
 import { registry } from "./registry.js";
+import { isAuthRequired, validateApiKey } from "./auth.js";
 
 const config = loadConfig();
 
@@ -49,11 +50,9 @@ export function createApp(): Hono {
   // Placed before the origin guard so 401 takes priority over 403.
   app.use("*", async (c, next) => {
     // Skip auth for health check, root, and CORS preflight
-    if (c.req.path === "/" || c.req.path.startsWith("/api/health") || c.req.method === "OPTIONS") {
+    if (c.req.path === "/" || c.req.path === "/api/health" || c.req.method === "OPTIONS") {
       return next();
     }
-
-    const { isAuthRequired, validateApiKey } = await import("./auth.js");
     if (!isAuthRequired()) return next();
 
     // Try Authorization: Bearer <key> first, then X-API-Key
