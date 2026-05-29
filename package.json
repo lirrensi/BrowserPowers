@@ -41,6 +41,9 @@
         "vitest": "^4.1.7",
         "ws": "^8.21.0"
     },
+    "pnpm": {
+        "onlyBuiltDependencies": ["esbuild"]
+    },
     "engines": {
         "node": ">=18",
         "pnpm": ">=9"

@@ -31,9 +31,6 @@
     "bin": {
         "browserpowers": "./dist/index.js"
     },
-    "pnpm": {
-        "onlyBuiltDependencies": ["esbuild"]
-    },
     "dependencies": {
         "@hono/node-server": "^2.0.2",
         "@modelcontextprotocol/sdk": "^1.29.0",
