@@ -9,6 +9,10 @@
 </p>
 
 <p align="center">
+  <img src="assets/browserpowers_cat.jpeg" alt="BrowserPowers Cat" width="400" height="400" style="max-width: 400px; max-height: 400px; border-radius: 12px;" />
+</p>
+
+<p align="center">
   <strong>Multi-browser AI agent control</strong> — a central command server that lets AI agents<br />
   control your <em>real browsers</em> via MCP, REST, or CLI.
 </p>
