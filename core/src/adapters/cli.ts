@@ -34,7 +34,7 @@ const program = new Command();
 program
   .name("browserpowers")
   .description("CLI for multi-browser agent control")
-  .version("0.1.0");
+  .version("1.0.0");
 
 // ── Helper: auto-detect target type from shorthand string (#028) ──
 // Mirrors Playwright's locator behavior:

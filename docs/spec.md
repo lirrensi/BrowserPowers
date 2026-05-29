@@ -1093,7 +1093,7 @@ The REST API MUST allow all origins via CORS (`Access-Control-Allow-Origin: *`) 
 The CLI is available via `browserpowers <command>` (or `pnpm run cli -- <command>` during development).
 
 > **Dev mode**: Use `pnpm run cli -- <command>` instead of `browserpowers <command>`.
-> For full setup, follow the install script in `scripts/install.ts`.
+> For full production installation, see the install script at `scripts/install.mjs`.
 
 #### 4.1 Commands
 

@@ -82,8 +82,8 @@ export function createApp(): Hono {
     const browsers = registry.list();
     return c.json({
       name: "browserpowers",
-      version: "0.1.0",
-      docs: "https://github.com/user/browserpowers",
+      version: "1.0.0",
+      docs: "https://github.com/lirrensi/BrowserPowers",
       ws: {
         connected: browsers.length,
       },

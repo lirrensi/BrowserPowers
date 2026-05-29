@@ -64,7 +64,7 @@ browserpowers content "Research Firefox"
 ```
 
 > **Dev mode**: Use `pnpm run cli -- <command>` instead of `browserpowers <command>`.
-> For full setup, follow the install script in `scripts/install.ts`.
+> For full production installation, see the install script at `scripts/install.mjs`.
 
 **Via REST API:**
 

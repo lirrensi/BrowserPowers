@@ -7,12 +7,12 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/user/browserpowers.git"
+        "url": "git+https://github.com/lirrensi/BrowserPowers.git"
     },
     "bugs": {
-        "url": "https://github.com/user/browserpowers/issues"
+        "url": "https://github.com/lirrensi/BrowserPowers/issues"
     },
-    "homepage": "https://github.com/user/browserpowers#readme",
+    "homepage": "https://github.com/lirrensi/BrowserPowers#readme",
     "keywords": [
         "browser-automation",
         "browser-extension",
