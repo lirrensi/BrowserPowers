@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/browserpowers_cat.jpeg" alt="BrowserPowers Cat" width="400" height="400" style="max-width: 400px; max-height: 600px; border-radius: 12px;" />
+  <img src="assets/browserpowers_cat.jpeg" alt="BrowserPowers Cat" />
 </p>
 
 <p align="center">
