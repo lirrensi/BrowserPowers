@@ -42,7 +42,7 @@
         "ws": "^8.21.0"
     },
     "pnpm": {
-        "onlyBuiltDependencies": ["esbuild"]
+        "onlyBuiltDependencies": ["esbuild", "spawn-sync"]
     },
     "engines": {
         "node": ">=18",

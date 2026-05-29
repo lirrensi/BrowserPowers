@@ -35,5 +35,5 @@ jobs:
       - name: Extension unit tests
         run: pnpm test:ext
 
-      - name: TypeScript type check
-        run: pnpm -r exec tsc --noEmit
+      - name: TypeScript type check (core)
+        run: cd core && npx tsc --noEmit

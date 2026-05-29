@@ -80,8 +80,9 @@ describe("storage", () => {
     const settings = await getSettings();
     const expectedPermissions = [
       "tabs", "page.read", "page.act", "page.execute",
-      "screenshots", "history", "bookmarks", "downloads",
-      "network", "storage", "windows", "cookies",
+      "screenshots", "history.read", "history.delete",
+      "bookmarks.read", "bookmarks.modify", "bookmarks.delete",
+      "downloads", "network", "storage", "windows", "cookies",
     ];
     for (const perm of expectedPermissions) {
       expect(settings.permissions).toHaveProperty(perm);
@@ -97,17 +98,21 @@ describe("storage", () => {
     expect(perms.tabs).toBe("allow");
     expect(perms["page.read"]).toBe("allow");
     expect(perms.screenshots).toBe("allow");
+    expect(perms["history.read"]).toBe("allow");
+    expect(perms["bookmarks.read"]).toBe("allow");
+    expect(perms.windows).toBe("allow");
 
-    // These should be "deny" by default (sensitive)
-    expect(perms["page.execute"]).toBe("deny");
-    expect(perms.history).toBe("deny");
-    expect(perms.bookmarks).toBe("deny");
+    // These should be "deny" by default (sensitive / risk of data loss)
     expect(perms.downloads).toBe("deny");
     expect(perms.network).toBe("deny");
     expect(perms.storage).toBe("deny");
 
-    // These should be "ask" by default (user decision)
+    // These should be "ask" by default (user should decide)
     expect(perms["page.act"]).toBe("ask");
+    expect(perms["page.execute"]).toBe("ask");
+    expect(perms["history.delete"]).toBe("ask");
+    expect(perms["bookmarks.modify"]).toBe("ask");
+    expect(perms["bookmarks.delete"]).toBe("ask");
     expect(perms.cookies).toBe("ask");
   });
 

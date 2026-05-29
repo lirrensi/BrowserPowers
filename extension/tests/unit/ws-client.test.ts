@@ -38,6 +38,10 @@ describe("ws-client", () => {
     vi.resetModules();
     MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket as unknown as any);
+    // Prevent ws-client's offline check from trying window.addEventListener
+    if (typeof navigator !== "undefined") {
+      Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+    }
   });
 
   it("deduplicates concurrent connect attempts", async () => {

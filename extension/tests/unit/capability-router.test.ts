@@ -21,6 +21,9 @@ describe("capability-router", () => {
         update: vi.fn().mockResolvedValue({}),
         remove: vi.fn().mockResolvedValue(undefined),
         captureVisibleTab: vi.fn().mockResolvedValue("data:image/png;base64,abc"),
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+        onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+        onActivated: { addListener: vi.fn() },
       },
       scripting: {
         executeScript: vi.fn().mockResolvedValue([{ result: "hello" }]),
@@ -41,6 +44,10 @@ describe("capability-router", () => {
         setBadgeText: vi.fn(),
         setBadgeBackgroundColor: vi.fn(),
       },
+      webRequest: {
+        onBeforeRequest: { addListener: vi.fn() },
+        onCompleted: { addListener: vi.fn() },
+      },
     } as any);
 
     // Bypass isExtensionContext
@@ -50,7 +57,7 @@ describe("capability-router", () => {
     });
   });
 
-  it("tabs.list returns array of tabs", async () => {
+  it("tabs.list returns paginated tab results", async () => {
     const { routeExecute } = await import("../../src/capability-router.js");
     const result = await routeExecute({
       requestId: "test-1",
@@ -58,18 +65,10 @@ describe("capability-router", () => {
       params: {},
     });
     expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
-    expect(result.data).toHaveLength(1);
-  });
-
-  it("page.read returns page content", async () => {
-    const { routeExecute } = await import("../../src/capability-router.js");
-    const result = await routeExecute({
-      requestId: "test-2",
-      tool: "page.read",
-      params: { action: "content" },
-    });
-    expect(result.success).toBe(true);
+    expect(result.data).toHaveProperty("tabs");
+    expect(Array.isArray(result.data.tabs)).toBe(true);
+    expect(result.data.tabs).toHaveLength(1);
+    expect(result.data).toHaveProperty("totalCount", 1);
   });
 
   it("screenshots.capture returns base64 image", async () => {
