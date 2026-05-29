@@ -100,47 +100,113 @@ Use `pnpm run cli -- <command>` instead of `browserpowers <command>` during deve
 
 ## Production Installation
 
-For a permanent installation with system daemon, auto-start, and CLI on PATH:
+A permanent installation — daemon mode, auto-start on boot, CLI on PATH.
 
-### Prerequisites
+### 0. Clone
+
+```bash
+git clone https://github.com/lirrensi/BrowserPowers.git
+cd BrowserPowers
+```
+
+### 1. Prerequisites
+
+The install script checks these for you. If anything is missing, it tells you exactly what to install.
 
 - **Node.js** >= 18
-- **pnpm** (globally installed)
+- **pnpm** >= 9 (globally: `npm install -g pnpm`)
 - **PM2** (globally: `pnpm add -g pm2`)
 - **tsx** (globally: `pnpm add -g tsx`)
 
-### Install
+### 2. Install
 
 ```bash
-# From the repo root:
 node scripts/install.mjs
 ```
 
-This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for both Chrome and Firefox, puts `browserpowers` on your PATH (via a wrapper script), and sets up a PM2 daemon that auto-restarts on boot.
+This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, and sets up a PM2 daemon that auto-restarts on boot.
 
-### Add to PATH
+### 3. Add to PATH
 
-The installer prints the bin directory path. Add it to your user PATH:
+The installer prints the path. Add `~/.browserpowers/bin` to your PATH:
+
+<details>
+<summary><b>Windows</b></summary>
 
 ```powershell
-# PowerShell:
 [Environment]::SetEnvironmentVariable("Path",
   "$env:USERPROFILE\.browserpowers\bin;$env:Path",
   "User")
 ```
 
-Or via System Properties → Advanced → Environment Variables → User PATH.
+Or: System Properties → Advanced → Environment Variables → User PATH.
+</details>
 
-### Verify
+<details>
+<summary><b>macOS / Linux</b></summary>
+
+Add to your shell config (`~/.zshrc`, `~/.bashrc`, or `~/.profile`):
 
 ```bash
-browserpowers --help
-browserpowers status
+export PATH="$PATH:$HOME/.browserpowers/bin"
 ```
+
+Then reload: `source ~/.zshrc` (or restart your terminal).
+</details>
+
+### 4. Start the Server
+
+```bash
+browserpowers serve
+```
+
+The core server starts on `http://127.0.0.1:4199`. It exposes:
+- **REST API** at `/api`
+- **MCP endpoint** at `/mcp`
+- **WebSocket** at `/ws`
+
+> The server must be **running** before the extension can connect and before MCP clients can reach it.
+
+### 5. Load the Extension
+
+Open your browser and load the built extension:
+
+**Chrome:** `chrome://extensions` → Developer mode → Load unpacked → select `~/.browserpowers/extension/`
+
+**Firefox (experimental):** `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → pick `~/.browserpowers/extension-firefox/manifest.json`
+
+### 6. Verify Connection
+
+Click the extension icon in your browser toolbar. The popup shows:
+- **Browser name** — auto-generated (e.g. `quick-fox-a3b2`), editable
+- **Status** — should say **Connected** to `ws://127.0.0.1:4199/ws`
+
+If it shows "Disconnected", check that the core server is running.
+
+From the terminal, confirm the browser registered:
+
+```bash
+browserpowers list
+```
+
+You should see your browser listed with its capabilities.
+
+### 7. Connect MCP
+
+Configure your AI agent client to talk to the core:
+
+```bash
+browserpowers mcp-config --client claude
+# or
+browserpowers mcp-config --client cursor
+```
+
+Paste the output into your client's MCP config file. See the [MCP Integration](#mcp-integration) section for details.
 
 ### Update
 
 ```bash
+cd BrowserPowers
 git pull
 node scripts/install.mjs
 ```
@@ -246,6 +312,9 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 ---
 
 ## MCP Integration
+
+> **Important:** The core server must be **running** before your MCP client can connect.
+> Start it with `browserpowers serve` (or use the PM2 daemon if you ran the install script).
 
 BrowserPowers exposes a full Model Context Protocol server. Connect your MCP client to:
 
