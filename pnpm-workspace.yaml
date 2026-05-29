@@ -5,3 +5,6 @@
 packages:
   - "core"
   - "extension"
+allowBuilds:
+  esbuild: set this to true or false
+  spawn-sync: set this to true or false
