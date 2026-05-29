@@ -31,6 +31,9 @@ const DEFAULT_CONFIG: ServerConfig = {
     defaultTimeoutMs: 120_000,
   },
   browsers: {},
+  auth: {
+    apiKey: "",
+  },
 };
 
 /** Cached config — loaded once at startup, avoids 2× disk read per tool execution */
@@ -62,6 +65,7 @@ export function loadConfig(): ServerConfig {
     ws: { ...DEFAULT_CONFIG.ws, ...parsed.ws },
     gates: { ...DEFAULT_CONFIG.gates, ...parsed.gates },
     queue: { ...DEFAULT_CONFIG.queue, ...parsed.queue },
+    auth: { ...DEFAULT_CONFIG.auth, ...parsed.auth },
   };
 
   return cachedConfig;

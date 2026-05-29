@@ -82,6 +82,14 @@ async function handleCoreMessage(msg: any): Promise<void> {
         break;
       }
 
+      case "auth_required": {
+        console.warn("[bp-ext] Core requires API key — disconnecting");
+        disconnect();
+        const { setAuthRequired } = await import("../src/ws-client.js");
+        setAuthRequired(true);
+        break;
+      }
+
       case "request_approval": {
         const { requestId, tool, params, description } = msg.payload;
         console.log(`[bp-ext] Approval requested: ${tool} (${requestId})`);

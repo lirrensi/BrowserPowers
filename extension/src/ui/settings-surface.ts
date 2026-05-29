@@ -26,6 +26,7 @@ interface ConnectionStatus {
   state: ConnectionState;
   connected: boolean;
   reconnectAttempts: number;
+  authRequired?: boolean;
 }
 
 interface ApprovalItem {
@@ -90,6 +91,9 @@ async function init(mode: SurfaceMode): Promise<void> {
 
   nameInput.value = settings.browserName;
   coreUrlInput.value = settings.coreUrl;
+  const authKeyInput = byId<HTMLInputElement>("auth-key");
+  authKeyInput.value = settings.authKey ?? "";
+  authKeyInput.addEventListener("change", () => { void saveAuthKey(authKeyInput); });
   approvalNotificationsInput.checked = settings.approvalNotificationsEnabled;
 
   renderCapabilities(capsList, effectivePermissions);
@@ -267,6 +271,12 @@ async function updateStatus(statusEl: HTMLElement): Promise<void> {
   try {
     const status = await chrome.runtime.sendMessage({ type: "getConnectionStatus" }) as ConnectionStatus | undefined;
 
+    if (status?.authRequired) {
+      statusEl.textContent = "API key required";
+      statusEl.className = "status disconnected";
+      return;
+    }
+
     switch (status?.state) {
       case "connected":
         statusEl.textContent = "Connected";
@@ -300,6 +310,10 @@ async function saveCoreUrl(coreUrlInput: HTMLInputElement): Promise<void> {
   await saveSettings({ coreUrl: coreUrlInput.value });
 }
 
+async function saveAuthKey(authKeyInput: HTMLInputElement): Promise<void> {
+  await saveSettings({ authKey: authKeyInput.value });
+}
+
 async function saveApprovalNotifications(approvalNotificationsInput: HTMLInputElement): Promise<void> {
   await saveSettings({ approvalNotificationsEnabled: approvalNotificationsInput.checked });
 }
@@ -329,6 +343,8 @@ async function reset(args: {
   args.nameInput.value = settings.browserName;
   args.coreUrlInput.value = settings.coreUrl;
   args.approvalNotificationsInput.checked = settings.approvalNotificationsEnabled;
+  const authKeyInput = byId<HTMLInputElement>("auth-key");
+  authKeyInput.value = settings.authKey ?? "";
   renderCapabilities(args.capsList, await getEffectivePermissions());
   const pageCapsContainer = byId("page-capabilities-list");
   renderPageCapabilities(pageCapsContainer);

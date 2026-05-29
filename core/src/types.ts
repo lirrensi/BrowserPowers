@@ -58,7 +58,8 @@ export type CoreToExt =
   | { type: "execute"; payload: { requestId: string; tool: string; params: Record<string, unknown> } }
   | { type: "heartbeat_ack" }
   | { type: "config_updated"; payload: PermissionProfile }
-  | { type: "request_approval"; payload: { requestId: string; tool: string; params: Record<string, unknown>; description: string } };
+  | { type: "request_approval"; payload: { requestId: string; tool: string; params: Record<string, unknown>; description: string } }
+  | { type: "auth_required"; payload: { message: string } };
 
 export interface RegisterPayload {
   name: string;
@@ -66,6 +67,8 @@ export interface RegisterPayload {
   permissions: PermissionProfile;
   /** Stable ID from a previous session — reuse on reconnect instead of generating a new UUID */
   browserId?: string;
+  /** API key for core server authentication (optional — only needed when core requires it) */
+  authKey?: string;
 }
 
 
@@ -186,4 +189,7 @@ export interface ServerConfig {
   };
   queue: QueueConfig;
   browsers: Record<string, { name: string; permissions: PermissionProfile }>;
+  auth: {
+    apiKey: string;  // empty = no auth required
+  };
 }

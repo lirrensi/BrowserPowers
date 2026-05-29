@@ -18,6 +18,7 @@ export interface ConnectionStatus {
   state: ConnectionState;
   connected: boolean;
   reconnectAttempts: number;
+  authRequired: boolean;
 }
 
 let ws: WebSocket | null = null;
@@ -33,6 +34,7 @@ let connectPromise: Promise<void> | null = null;
 let connectPromiseGeneration = -1;
 let connectionGeneration = 0;
 let reconnectEnabled = true;
+let authRequired = false;
 
 export function onMessage(handler: MessageHandler): void {
   messageHandler = handler;
@@ -194,7 +196,12 @@ export function getConnectionStatus(): ConnectionStatus {
     state: connectionState,
     connected: connectionState === "connected",
     reconnectAttempts,
+    authRequired,
   };
+}
+
+export function setAuthRequired(required: boolean): void {
+  authRequired = required;
 }
 
 // ── internal ──
@@ -221,15 +228,16 @@ async function onConnected(): Promise<void> {
     console.log("[bp-ext] No saved browserId — first connection");
   }
 
-  send({
-    type: "register",
-    payload: {
-      name: settings.browserName,
-      capabilities,
-      permissions,
-      browserId: savedId,
-    },
-  });
+  const registerPayload: Record<string, unknown> = {
+    name: settings.browserName,
+    capabilities,
+    permissions,
+    browserId: savedId,
+  };
+  if (settings.authKey) {
+    registerPayload.authKey = settings.authKey;
+  }
+  send({ type: "register", payload: registerPayload });
 }
 
 function startHeartbeat(): void {

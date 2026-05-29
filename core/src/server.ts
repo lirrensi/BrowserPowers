@@ -45,6 +45,29 @@ function isOriginAllowed(origin: string | null): boolean {
 export function createApp(): Hono {
   const app = new Hono();
 
+  // Auth middleware — guards REST + MCP routes (WS has its own check)
+  // Placed before the origin guard so 401 takes priority over 403.
+  app.use("*", async (c, next) => {
+    // Skip auth for health check, root, and CORS preflight
+    if (c.req.path === "/" || c.req.path.startsWith("/api/health") || c.req.method === "OPTIONS") {
+      return next();
+    }
+
+    const { isAuthRequired, validateApiKey } = await import("./auth.js");
+    if (!isAuthRequired()) return next();
+
+    // Try Authorization: Bearer <key> first, then X-API-Key
+    const bearer = c.req.header("Authorization")?.replace(/^Bearer\s+/i, "");
+    const apiKey = bearer || c.req.header("X-API-Key");
+
+    if (!validateApiKey(apiKey)) {
+      c.header("WWW-Authenticate", "Bearer");
+      return c.json({ error: "Unauthorized — valid API key required" }, 401);
+    }
+
+    await next();
+  });
+
   // Origin guard — block web pages from calling the core's internal API
   app.use("*", async (c, next) => {
     const origin = c.req.header("Origin");
@@ -60,7 +83,7 @@ export function createApp(): Hono {
       c.header("Access-Control-Allow-Origin", "*");
     }
     c.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version");
+    c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Mcp-Protocol-Version");
     c.header("Access-Control-Expose-Headers", "Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate");
     c.header("Vary", "Origin");
 

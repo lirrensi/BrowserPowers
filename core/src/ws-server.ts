@@ -112,6 +112,21 @@ export function createWsServer(httpServer: Server): WebSocketServer {
             return;
           }
 
+          // Auth check (optional — only when configured)
+          const authConfig = loadConfig().auth;
+          if (authConfig.apiKey.length > 0) {
+            const authKey = (msg.payload as any).authKey as string | undefined;
+            if (!authKey || authKey !== authConfig.apiKey) {
+              const reply: CoreToExt = {
+                type: "auth_required",
+                payload: { message: "API key required for this server" },
+              };
+              ws.send(JSON.stringify(reply));
+              ws.close();
+              return;
+            }
+          }
+
           // Reuse stable ID if provided (service worker reconnect), otherwise generate new
           browserId = savedId || randomUUID();
 

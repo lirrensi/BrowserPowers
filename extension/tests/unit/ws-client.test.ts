@@ -33,6 +33,25 @@ class MockWebSocket {
   }
 }
 
+// Shared mock state for storage. Mutations to this object are reflected
+// in the mocked getSettings() calls because the mock returns the reference.
+// Declared BEFORE vi.mock so the factory captures the variable reference.
+const mockSettings: Record<string, unknown> = {
+  browserName: "test-browser",
+  coreUrl: "ws://127.0.0.1:4199/ws",
+  authKey: "",
+  approvalNotificationsEnabled: true,
+  permissions: {} as Record<string, string>,
+  pageSitePermissions: {},
+};
+
+// Mock storage at the top level so it works across all describe blocks.
+// Existing tests (dedup, waiting) need getSettings to return a valid URL.
+vi.mock("../../src/storage.js", () => ({
+  getSettings: vi.fn(() => Promise.resolve(mockSettings)),
+  getEffectivePermissions: vi.fn(() => Promise.resolve({})),
+}));
+
 describe("ws-client", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -61,5 +80,60 @@ describe("ws-client", () => {
     MockWebSocket.instances[0].fail();
 
     expect(getConnectionStatus().state).toBe("waiting");
+  });
+});
+
+describe("auth", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket as unknown as any);
+    if (typeof navigator !== "undefined") {
+      Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+    }
+  });
+
+  it("includes authKey in register payload when set in settings", async () => {
+    mockSettings.authKey = "test-key";
+
+    const { connect } = await import("../../src/ws-client.js");
+    await connect();
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    // Simulate the WebSocket opening — triggers onConnected
+    ws.readyState = MockWebSocket.OPEN;
+    ws.onopen?.({});
+
+    // Wait for the async onConnected to finish and send the register
+    await vi.waitFor(() => {
+      expect(ws.send).toHaveBeenCalled();
+    });
+
+    const sent = JSON.parse(ws.send.mock.calls[0][0]);
+    expect(sent.type).toBe("register");
+    expect(sent.payload.authKey).toBe("test-key");
+  });
+
+  it("does not include authKey in register when settings have empty authKey", async () => {
+    mockSettings.authKey = "";
+
+    const { connect } = await import("../../src/ws-client.js");
+    await connect();
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    ws.readyState = MockWebSocket.OPEN;
+    ws.onopen?.({});
+
+    await vi.waitFor(() => {
+      expect(ws.send).toHaveBeenCalled();
+    });
+
+    const sent = JSON.parse(ws.send.mock.calls[0][0]);
+    expect(sent.type).toBe("register");
+    expect(sent.payload.authKey).toBeUndefined();
   });
 });

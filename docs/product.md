@@ -22,6 +22,7 @@ Instead of ephemeral, headless browser automation (Playwright, Puppeteer, Seleni
 | **Shared brain** | Agent presets, system prompts, skills, and MCP definitions live on the core. Browsers just toggle what they enable locally. |
 | **LLM routing** | Every LLM call passes through the core: logged, inspectable, routable. One API key for all browsers. |
 | **External agent control** | Your coding agent (Cline, Aider, etc.) can command any browser through MCP or the API. |
+| **Optional API key authentication** | Secure the core server with an API key. REST/MCP/WS require the key; CLI bypasses. Default: no auth. |
 
 ---
 
@@ -33,6 +34,8 @@ Instead of ephemeral, headless browser automation (Playwright, Puppeteer, Seleni
 # Install and start the core server
 pnpm dev:core
 # Core listens on localhost:4199 — HTTP, WebSocket, and MCP
+
+> **Optional**: You can set an API key in `~/.config/browserpowers/config.yaml` under `auth.apiKey`. When set, all REST, MCP, and WebSocket connections will require this key. The browser extension will prompt you for the key in its settings UI.
 ```
 
 ### 2. Install the extension
@@ -71,6 +74,7 @@ browserpowers content "Research Firefox"
 ```bash
 curl -X POST http://localhost:4199/api/browsers/:id/execute \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-api-key>" \
    -d '{"tool": "page.read", "params": {"action": "content"}}'
 ```
 

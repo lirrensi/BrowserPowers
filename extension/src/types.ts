@@ -11,6 +11,7 @@ export interface SitePermissionLists {
 export interface ExtensionSettings {
   browserName: string;
   coreUrl: string;
+  authKey: string;  // API key for core authentication (empty = none)
   approvalNotificationsEnabled: boolean;
   permissions: Record<string, PermissionLevel>;
   pageSitePermissions: Record<PagePermissionGroup, SitePermissionLists>;

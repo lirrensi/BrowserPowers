@@ -1,6 +1,6 @@
 {
     "name": "browserpowers-extension",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "private": true,
     "description": "Thin browser extension for BrowserPowers — exposes browser APIs to the core server",
     "author": "lirrensi",

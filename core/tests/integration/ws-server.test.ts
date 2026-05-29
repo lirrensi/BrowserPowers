@@ -3,6 +3,25 @@ import { WebSocket } from "ws";
 import type { Server } from "node:http";
 import { getRandomPort } from "../setup";
 
+// Shared mock config — used by ALL tests in this file because createWsServer
+// and the register handler both call loadConfig(). Mutations to this object
+// are visible to every call because the mock returns the same reference.
+const mockConfig = {
+  port: 4199,
+  host: "127.0.0.1",
+  mcp: { enabled: true, path: "/mcp" },
+  rest: { enabled: true, path: "/api" },
+  ws: { path: "/ws", heartbeatIntervalMs: 30_000 },
+  gates: { defaultPermission: "ask" as const, approvalTimeoutMs: 60_000 },
+  queue: { maxDepth: 50, defaultTimeoutMs: 120_000 },
+  browsers: {} as Record<string, unknown>,
+  auth: { apiKey: "" },
+};
+
+vi.mock("../../src/config.js", () => ({
+  loadConfig: vi.fn(() => mockConfig),
+}));
+
 describe("WebSocket Server + Registry Integration", () => {
   let httpServer: Server;
   let port: number;
@@ -198,5 +217,157 @@ describe("WebSocket Server + Registry Integration", () => {
     expect(cmdMsg.payload.requestId).toBe("reconnect-test-1");
 
     ws2.close();
+  });
+});
+
+describe("WS Auth", () => {
+  let httpServer: Server;
+  let port: number;
+  let wsUrl: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    port = await getRandomPort();
+    wsUrl = `ws://127.0.0.1:${port}/ws`;
+
+    const { createServer } = await import("node:http");
+    httpServer = createServer();
+    const { createWsServer } = await import("../../src/ws-server.js");
+    createWsServer(httpServer);
+    await new Promise<void>((resolve) => httpServer.listen(port, resolve));
+  });
+
+  afterEach(() => {
+    httpServer.close();
+    httpServer.closeAllListeners?.();
+    // Reset auth to disabled for next test
+    mockConfig.auth.apiKey = "";
+  });
+
+  it("rejects register without authKey when auth is required", async () => {
+    mockConfig.auth.apiKey = "test-key";
+
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+
+    const closePromise = new Promise<void>((resolve) => ws.once("close", () => resolve()));
+
+    ws.send(
+      JSON.stringify({
+        type: "register",
+        payload: {
+          name: "Test Browser",
+          capabilities: [{ tool: "tabs.list", description: "List tabs", group: "tabs" }],
+          permissions: {},
+        },
+      })
+    );
+
+    // Must receive auth_required before close
+    const raw = await new Promise<string>((resolve) => {
+      ws.once("message", (data) => resolve(data.toString()));
+    });
+    const msg = JSON.parse(raw);
+    expect(msg.type).toBe("auth_required");
+    expect(msg.payload.message).toBe("API key required for this server");
+
+    await closePromise;
+  });
+
+  it("rejects register with wrong authKey when auth is required", async () => {
+    mockConfig.auth.apiKey = "test-key";
+
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+
+    const closePromise = new Promise<void>((resolve) => ws.once("close", () => resolve()));
+
+    ws.send(
+      JSON.stringify({
+        type: "register",
+        payload: {
+          name: "Test Browser",
+          capabilities: [{ tool: "tabs.list", description: "List tabs", group: "tabs" }],
+          permissions: {},
+          authKey: "wrong-key",
+        },
+      })
+    );
+
+    const raw = await new Promise<string>((resolve) => {
+      ws.once("message", (data) => resolve(data.toString()));
+    });
+    const msg = JSON.parse(raw);
+    expect(msg.type).toBe("auth_required");
+    expect(msg.payload.message).toBe("API key required for this server");
+
+    await closePromise;
+  });
+
+  it("accepts register with correct authKey", async () => {
+    mockConfig.auth.apiKey = "test-key";
+
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+
+    ws.send(
+      JSON.stringify({
+        type: "register",
+        payload: {
+          name: "Auth Browser",
+          capabilities: [{ tool: "tabs.list", description: "List tabs", group: "tabs" }],
+          permissions: {},
+          authKey: "test-key",
+        },
+      })
+    );
+
+    const raw = await new Promise<string>((resolve) => {
+      ws.once("message", (data) => resolve(data.toString()));
+    });
+    const msg = JSON.parse(raw);
+    expect(msg.type).toBe("registered");
+    expect(msg.payload.browserId).toBeDefined();
+
+    // Verify the browser was actually registered in the registry
+    const { registry } = await import("../../src/registry.js");
+    expect(registry.list()).toHaveLength(1);
+    expect(registry.list()[0].name).toBe("Auth Browser");
+
+    ws.close();
+  });
+
+  it("accepts register without authKey when auth is disabled", async () => {
+    // mockConfig.auth.apiKey is already "" from afterEach reset
+    // Explicitly set it anyway for clarity
+    mockConfig.auth.apiKey = "";
+
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+
+    ws.send(
+      JSON.stringify({
+        type: "register",
+        payload: {
+          name: "No-Auth Browser",
+          capabilities: [{ tool: "tabs.list", description: "List tabs", group: "tabs" }],
+          permissions: {},
+        },
+      })
+    );
+
+    const raw = await new Promise<string>((resolve) => {
+      ws.once("message", (data) => resolve(data.toString()));
+    });
+    const msg = JSON.parse(raw);
+    expect(msg.type).toBe("registered");
+    expect(msg.payload.browserId).toBeDefined();
+
+    // Browser is actually in the registry
+    const { registry } = await import("../../src/registry.js");
+    expect(registry.list()).toHaveLength(1);
+    expect(registry.list()[0].name).toBe("No-Auth Browser");
+
+    ws.close();
   });
 });

@@ -1,6 +1,6 @@
 {
     "name": "browserpowers",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "private": false,
     "description": "Multi-browser LLM agent control — core server + browser extension",
     "author": "lirrensi",
@@ -42,7 +42,10 @@
         "ws": "^8.21.0"
     },
     "pnpm": {
-        "onlyBuiltDependencies": ["esbuild", "spawn-sync"]
+        "onlyBuiltDependencies": [
+            "esbuild",
+            "spawn-sync"
+        ]
     },
     "engines": {
         "node": ">=18",

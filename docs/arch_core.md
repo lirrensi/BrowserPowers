@@ -165,6 +165,17 @@ Commander.js program with commands:
 - `list`, `navigate <id> <url>`, `screenshot <id> [file]`, `content <id> [selector]`, `select <id>`, `page read <id> <action> [params...]`, `page act <id> <action> [params...]`, `page js <id> <code>`, `tabs <id>`, `exec <id> <tool> [params...]`, `exec-all <tool> [params...]`
 - All CLI commands are thin wrappers that call the REST API internally
 
+### 11. Auth Middleware (`src/auth.ts`)
+
+Exports shared auth utilities:
+
+- `isAuthRequired()` — returns true when `auth.apiKey` is non-empty
+- `validateApiKey(key)` — validates a key against the configured API key
+
+Used by:
+- `server.ts` — Hono middleware that guards REST and MCP routes (skips health and root)
+- `ws-server.ts` — checks `authKey` in the extension `register` message
+
 ---
 
 ## Data Models / Storage
@@ -273,6 +284,7 @@ Extension loads → init service worker → ws-client.connect()
 | **Timeout all requests** | Every pending request MUST have a timeout. Default: 120 seconds (configurable via `queue.defaultTimeoutMs` or per-call `timeout_ms`). |
 | **Singleton registry** | The registry is a singleton module-level export. Exactly one instance exists per process. |
 | **Config is optional** | The server MUST start even if config file is missing or corrupt (fall back to defaults). |
+| **Auth is optional** | When `auth.apiKey` is empty, all interfaces are unauthenticated. When non-empty, REST, MCP, and WebSocket all require the key. CLI always bypasses. |
 
 ---
 
@@ -291,6 +303,7 @@ Extension loads → init service worker → ws-client.connect()
 | config.yaml | `ws.path` | /ws |
 | config.yaml | `ws.heartbeatIntervalMs` | 30000 |
 | config.yaml | `gates.defaultPermission` | ask |
+| config.yaml | `auth.apiKey` | "" (empty) |
 
 ### Startup
 

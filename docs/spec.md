@@ -163,6 +163,16 @@ Sent by the extension immediately after WebSocket connection is established.
 }
 ```
 
+**Register payload fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Human-readable browser name |
+| `capabilities` | Capability[] | Tools this browser exposes |
+| `permissions` | PermissionProfile | Per-group permission levels |
+| `authKey` | string (optional) | API key for servers with authentication enabled |
+| `browserId` | string (optional) | Previously assigned browser ID for reconnection |
+
 The core MUST respond with a `registered` message containing the assigned `browserId`.
 
 ##### result
@@ -236,6 +246,21 @@ Sent in response to `register`.
   }
 }
 ```
+
+##### auth_required
+
+Sent by the core when the extension's register message is missing or has an invalid API key, and the core requires authentication.
+
+```json
+{
+  "type": "auth_required",
+  "payload": {
+    "message": "API key required for this server"
+  }
+}
+```
+
+The extension MUST close the WebSocket upon receiving this message and surface the authentication requirement to the user. The extension SHOULD provide a field in its settings UI for the user to enter the API key, then reconnect.
 
 ##### execute
 
@@ -1235,6 +1260,10 @@ Created automatically on first run with default values.
 port: 4199
 host: "127.0.0.1"
 
+# Authentication
+auth:
+  apiKey: ""          # API key for REST/MCP/WS access. Empty = no auth required.
+
 # MCP endpoint
 mcp:
   enabled: true
@@ -1423,7 +1452,7 @@ ServerConfig { port, host, mcp, rest, ws, gates, browsers }
    - **Core side**: the Command Service checks the gate before sending any execute command
    - **Extension side**: the extension filters denied capabilities from registration (defense in depth)
 
-3. **No authentication.** The initial version has no authentication on the WebSocket, REST, or MCP interfaces. This is acceptable for localhost-only deployments. Remote deployments MUST add network-layer security.
+3. **Optional API key authentication.** When `auth.apiKey` is set in the configuration, all WebSocket, REST, and MCP connections require the key. REST and MCP accept the key via `Authorization: Bearer <key>` or `X-API-Key: <key>` headers. The browser extension sends the key in its `register` message. The CLI always bypasses authentication. When `auth.apiKey` is empty (default), no authentication is required — suitable for localhost-only deployments.
 
 4. **Sensitive browser data.** History and bookmarks are **read-allowed, write-ask** by default: agents can search history and list bookmarks without approval, but deleting entries or creating bookmarks requires user approval. Downloads are denied by default. The user can tune each group independently in the extension settings.
 
@@ -1444,3 +1473,53 @@ ServerConfig { port, host, mcp, rest, ws, gates, browsers }
 - [WXT](https://wxt.dev/) — Next-gen browser extension framework
 - [Hono](https://hono.dev/) — Ultralight web framework
 - [Commander.js](https://github.com/tj/commander.js) — CLI framework
+
+---
+
+### 9. Authentication
+
+#### 9.1 Overview
+
+Authentication is OPTIONAL. By default, the core server does not require authentication (`auth.apiKey` is empty).
+
+When `auth.apiKey` is set to a non-empty value, all non-CLI interfaces require the API key:
+
+| Interface | Auth mechanism |
+|---|---|
+| REST | `Authorization: Bearer <key>` or `X-API-Key: <key>` header |
+| MCP | `Authorization: Bearer <key>` or `X-API-Key: <key>` header |
+| WebSocket | `authKey` field in the `register` message |
+| CLI | No auth required (local process) |
+
+#### 9.2 Configuration
+
+```yaml
+auth:
+  apiKey: ""    # Set to a secret value to enable authentication
+```
+
+Default: empty string (auth disabled). The health endpoint (`/api/health`) and server root (`/`) remain publicly accessible regardless of auth configuration.
+
+#### 9.3 WebSocket Auth Flow
+
+```
+Extension                     Core (auth.apiKey = "secret")
+  │                              │
+  │── register(+ authKey) ─────►│  checks authKey
+  │                              │  → valid: proceed with registered
+  │                              │  → invalid: send auth_required + close
+  │                              │
+  │◄── registered ──────────────│  (on success)
+  │◄── auth_required + close ───│  (on failure)
+```
+
+#### 9.4 Extension Integration
+
+The browser extension includes an optional API Key field in its settings UI under the Core Server section. When the extension connects to a core that requires authentication:
+
+1. Extension sends `register` without `authKey` (or wrong key)
+2. Core responds with `auth_required` and closes the WebSocket
+3. Extension detects the authentication failure and surfaces "API key required" in its connection status
+4. User enters the API key in the extension settings
+5. Extension reconnects with the key included in the `register` payload
+6. Core validates the key and proceeds with normal registration

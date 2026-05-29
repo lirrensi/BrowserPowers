@@ -55,6 +55,7 @@ function createDefaultSettings(): ExtensionSettings {
   return {
     browserName: `${randomItem(ADJECTIVES)}-${randomItem(ANIMALS)}-${randomSuffix()}`,
     coreUrl: "ws://127.0.0.1:4199/ws",
+    authKey: "",
     approvalNotificationsEnabled: true,
     permissions: {
       tabs: "allow",
