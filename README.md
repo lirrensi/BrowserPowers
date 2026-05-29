@@ -137,11 +137,13 @@ The install script checks these for you. If anything is missing, it tells you ex
 node scripts/install.mjs
 ```
 
-This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, and sets up a PM2 daemon that auto-restarts on boot.
+This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, **and starts a PM2 daemon that auto-restarts on boot**.
 
-### 3. Add to PATH
+> **That's it.** The core server is already running on `http://127.0.0.1:4199`. You can go straight to loading the extension and connecting your MCP clients.
 
-The installer prints the path. Add `~/.browserpowers/bin` to your PATH:
+### 3. Add to PATH (if needed)
+
+The installer prints the path. If `browserpowers` isn't found in your terminal, add `~/.browserpowers/bin` to your PATH:
 
 <details>
 <summary><b>Windows</b></summary>
@@ -167,20 +169,7 @@ export PATH="$PATH:$HOME/.browserpowers/bin"
 Then reload: `source ~/.zshrc` (or restart your terminal).
 </details>
 
-### 4. Start the Server
-
-```bash
-browserpowers serve
-```
-
-The core server starts on `http://127.0.0.1:4199`. It exposes:
-- **REST API** at `/api`
-- **MCP endpoint** at `/mcp`
-- **WebSocket** at `/ws`
-
-> The server must be **running** before the extension can connect and before MCP clients can reach it.
-
-### 5. Load the Extension
+### 4. Load the Extension
 
 Open your browser and load the built extension:
 
@@ -188,13 +177,13 @@ Open your browser and load the built extension:
 
 **Firefox (experimental):** `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → pick `~/.browserpowers/extension-firefox/manifest.json`
 
-### 6. Verify Connection
+### 5. Verify Connection
 
 Click the extension icon in your browser toolbar. The popup shows:
 - **Browser name** — auto-generated (e.g. `quick-fox-a3b2`), editable
 - **Status** — should say **Connected** to `ws://127.0.0.1:4199/ws`
 
-If it shows "Disconnected", check that the core server is running.
+If it shows "Disconnected", check the daemon is running with `pm2 status`.
 
 From the terminal, confirm the browser registered:
 
@@ -204,7 +193,7 @@ browserpowers list
 
 You should see your browser listed with its capabilities.
 
-### 7. Connect MCP
+### 6. Connect MCP
 
 Configure your AI agent client to talk to the core:
 
@@ -215,6 +204,37 @@ browserpowers mcp-config --client cursor
 ```
 
 Paste the output into your client's MCP config file. See the [MCP Integration](#mcp-integration) section for details.
+
+> If you enabled API key authentication (below), add the `Authorization` header to the MCP snippet:
+> ```json
+> "headers": { "Authorization": "Bearer <your-api-key>" }
+> ```
+
+### 7. Enable API Key Authentication (Optional)
+
+By default the server is open to anything on `127.0.0.1`. To lock it down with an API key:
+
+Set `auth.apiKey` in `~/.config/browserpowers/config.yaml`:
+
+```yaml
+auth:
+  apiKey: "your-secret-key"
+```
+
+Then restart the daemon:
+
+```bash
+pm2 restart browserpowers
+```
+
+Once enabled, all REST, MCP, and WebSocket connections require the key:
+
+- **REST / MCP** — pass via `Authorization: Bearer <key>` header or `X-API-Key` header
+- **CLI** — reads the key from config automatically, no extra setup
+- **Extension** — the popup has an API Key field; set it to match or the extension won't connect
+- **MCP clients** — add `"headers": { "Authorization": "Bearer <key>" }` to the client config
+
+To disable, set `apiKey` to an empty string (`""`) and restart.
 
 ### Update
 
@@ -327,7 +347,8 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 ## MCP Integration
 
 > **Important:** The core server must be **running** before your MCP client can connect.
-> Start it with `browserpowers serve` (or use the PM2 daemon if you ran the install script).
+> If you ran the install script, the PM2 daemon already has it running.
+> If you're in development mode, start it with `pnpm dev` (or `pnpm dev:core`).
 
 BrowserPowers exposes a full Model Context Protocol server. Connect your MCP client to:
 
@@ -448,6 +469,7 @@ The core server reads configuration from `~/.config/browserpowers/config.yaml`. 
 | `queue.maxDepth` | `50` | Max queued requests per browser |
 | `queue.defaultTimeoutMs` | `120000` | Per-request timeout |
 | `browsers` | `{}` | Pre-registered browser configs with names and permissions |
+| `auth.apiKey` | `""` (empty) | API key for server authentication. Empty = no auth. Set to any string to require it on all REST, MCP, and WebSocket connections. |
 
 ---
 
