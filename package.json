@@ -1,0 +1,48 @@
+{
+    "name": "browserpowers",
+    "version": "1.0.0",
+    "private": false,
+    "description": "Multi-browser LLM agent control — core server + browser extension",
+    "author": "lirrensi",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/user/browserpowers.git"
+    },
+    "bugs": {
+        "url": "https://github.com/user/browserpowers/issues"
+    },
+    "homepage": "https://github.com/user/browserpowers#readme",
+    "keywords": [
+        "browser-automation",
+        "llm",
+        "ai-agent",
+        "multi-browser",
+        "mcp"
+    ],
+    "scripts": {
+        "dev": "pnpm --parallel -r dev",
+        "dev:core": "pnpm --filter browserpowers dev",
+        "dev:ext": "pnpm --filter browserpowers-extension dev",
+        "dev:ext:chrome": "pnpm --filter browserpowers-extension dev:chrome",
+        "dev:ext:firefox": "pnpm --filter browserpowers-extension dev:firefox",
+        "build": "pnpm --parallel -r build",
+        "test": "pnpm --parallel -r test",
+        "predev": "pnpm build",
+        "prepare": "pnpm --filter browserpowers-extension prepare",
+        "clean": "pnpm --parallel -r clean",
+        "test:core": "vitest run --project core",
+        "test:ext": "vitest run --project extension",
+        "test:e2e": "playwright test"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.60.0",
+        "get-port": "^7.2.0",
+        "vitest": "^4.1.7",
+        "ws": "^8.21.0"
+    },
+    "engines": {
+        "node": ">=18",
+        "pnpm": ">=9"
+    }
+}

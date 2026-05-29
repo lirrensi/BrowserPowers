@@ -1,0 +1,7 @@
+# ── pnpm workspace ────────────────────────────────────
+# Lets you run commands across both packages from the root
+# e.g. `pnpm dev` runs core + extension dev servers in parallel
+
+packages:
+  - "core"
+  - "extension"
