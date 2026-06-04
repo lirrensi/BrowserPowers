@@ -1142,12 +1142,12 @@ export function generateSelector(css: string): Record<string, unknown> {
 
 // ── Console Capture ──
 //
-// Console capture is injected into the page's MAIN world from the service
-// worker via chrome.scripting.executeScript({ world: "MAIN" }). This is done
-// proactively on tab loading (background.ts tabs.onUpdated) and lazily on
-// first page.read({ action: "console" }) call (page-read.ts consoleRead()).
-// No content-script-side code needed — content scripts run in an isolated
-// world that cannot intercept the page's console.log calls.
-//
-// The init func is defined inline in background.ts and page-read.ts because
-// chrome.scripting.executeScript serializes/deserializes functions.
+// Console capture uses registerContentScripts({ world: "MAIN" }) which
+// injects a capture.js into the page's MAIN world at document_start.
+// The MAIN world script writes entries to a shared DOM <meta> attribute,
+// which the content script reads via MutationObserver.
+// This approach was chosen because:
+// 1. executeScript({ world: "MAIN" }) silently fails in some Chrome versions
+// 2. postMessage from MAIN → isolated world is unreliable in some Chrome versions
+// 3. DOM attributes are genuinely shared between worlds — no workarounds needed
+// See docs/arch_extension.md §10 for full architecture and design decisions.

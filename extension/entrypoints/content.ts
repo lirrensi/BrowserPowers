@@ -50,23 +50,35 @@ import {
 import type { Target, ActResult } from "../src/v2/content-actions";
 
 // ── Console Capture Buffer ──
-// Content script buffers console entries received via postMessage from the
-// MAIN world (where the override lives). This buffer survives service worker
-// suspension — data is never lost once captured.
+// The MAIN world override (from capture.js, registered via
+// registerContentScripts({ world: "MAIN" })) writes entries to a shared DOM
+// <meta id="__bp_pipe"> via data-e attribute. The content script watches this
+// element via MutationObserver — the DOM is genuinely shared between worlds.
+// This bypasses broken postMessage and executeScript({ world: "MAIN" }) paths.
 
 const CONSOLE_MAX = 500;
 const consoleBuffer: Array<{ level: string; messages: unknown[]; timestamp: number; stack?: string }> = [];
 
-// Listen for console entries streamed from the MAIN world override via
-// postMessage. Set up at module scope — runs immediately at document_start.
-window.addEventListener("message", (event: MessageEvent) => {
-  if (event.source !== window) return;
-  if (event.data?.source !== "bp-console") return;
-  consoleBuffer.push(event.data.entry);
-  if (consoleBuffer.length > CONSOLE_MAX) {
-    consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX);
-  }
-});
+// Set up pipe element and observer at module scope (runs at document_start).
+// The pipe is created early so capture.js (MAIN world, document_start) can
+// find it when it runs.
+if (typeof MutationObserver !== 'undefined') {
+  const pipe = document.createElement('meta');
+  pipe.id = '__bp_pipe';
+  (document.head || document.documentElement).appendChild(pipe);
+  const obs = new MutationObserver(() => {
+    const raw = pipe.getAttribute('data-e');
+    if (!raw) return;
+    try {
+      const entry = JSON.parse(raw);
+      consoleBuffer.push(entry);
+      if (consoleBuffer.length > CONSOLE_MAX) {
+        consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX);
+      }
+    } catch { /* malformed JSON — skip */ }
+  });
+  obs.observe(pipe, { attributes: true, attributeFilter: ['data-e'] });
+}
 
 // ── Console Entry Type ──
 interface ConsoleEntry { level: string; messages: unknown[]; timestamp: number; stack?: string; }
@@ -75,11 +87,10 @@ export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
   main() {
-    // Wake the service worker and request MAIN world console override injection.
-    // The content script runs at document_start — before any page scripts — so
-    // the SW has time to inject the override before the page's JS executes.
-    // This is best-effort: ~1-5ms race window for synchronous inline scripts.
-    try { chrome.runtime.sendMessage({ type: "injectMainWorldConsoleCapture" }); } catch {}
+    // Console capture is handled by capture.js (registered via
+    // registerContentScripts({ world: "MAIN" })) which overrides console in the
+    // page's MAIN world and pipes entries via a shared DOM <meta> element.
+    // The MutationObserver at module scope (above) buffers them.
 
     chrome.runtime.onMessage.addListener(
       (
