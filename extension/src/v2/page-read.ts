@@ -11,7 +11,7 @@ import { performed, notPerformed, blocked } from "./action-result.js";
 import { setAnchors } from "./anchor-manager.js";
 import type { ActionResult, Target } from "../types.js";
 
-type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector";
+type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console";
 
 export async function dispatchReadAction(
   action: ReadAction,
@@ -44,6 +44,8 @@ export async function dispatchReadAction(
       return listFrames(tabId, frameId);
     case "generate_selector":
       return generateSelector(params, tabId, frameId);
+    case "console":
+      return consoleRead(params, tabId, frameId);
     default:
       return notPerformed("read", `Unknown read action: ${action}`);
   }
@@ -347,6 +349,27 @@ async function generateSelector(params: Record<string, unknown>, tabId: number, 
     });
   } catch (err) {
     return blocked("generate_selector", `Content script error: ${(err as Error).message}`, {
+      errorCode: "CONTENT_SCRIPT_ERROR",
+      recoverable: true,
+    });
+  }
+}
+
+async function consoleRead(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  const limit = (params.limit as number) ?? 50;
+  const offset = (params.offset as number) ?? 0;
+  try {
+    const data = await sendReadMessage(tabId, "console", { limit, offset });
+    if (!data) return contentScriptNotReady("console");
+    if (data.success === false) return notPerformed("console", data.message as string);
+    const entries = (data.entries as Array<unknown>) || [];
+    const totalCount = (data.totalCount as number) ?? 0;
+    return performed("console", `Found ${totalCount} console entries (showing ${entries.length})`, {
+      data: { entries, totalCount },
+      evidence: { totalCount },
+    });
+  } catch (err) {
+    return blocked("console", `Content script error: ${(err as Error).message}`, {
       errorCode: "CONTENT_SCRIPT_ERROR",
       recoverable: true,
     });

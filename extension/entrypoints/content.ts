@@ -46,6 +46,8 @@ import {
   selectText,
   readSummary,
   generateSelector,
+  // Console capture
+  getConsoleEntries,
 } from "../src/v2/content-actions";
 import type { Target, ActResult } from "../src/v2/content-actions";
 
@@ -157,6 +159,12 @@ async function handleRead(
       const css = target?.css as string | undefined;
       if (!css) return { success: false, message: "CSS selector required (use target.css)" };
       return generateSelector(css);
+    }
+    case "console": {
+      const limit = (params.limit as number) ?? 50;
+      const offset = (params.offset as number) ?? 0;
+      const { entries, totalCount } = getConsoleEntries(limit, offset);
+      return { entries, totalCount };
     }
     default:
       return { success: false, message: `Unknown read action: ${action}`, errorCode: "UNKNOWN_ACTION" };

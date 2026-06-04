@@ -10,7 +10,8 @@
  *          waitForElement, waitForTarget, waitForNetworkIdle, waitForFunction,
  *          fillFormFields,
  *          readContent, readTexts, readHtml, readAttr, readMeta, readForms,
- *          countElements, selectText, readSummary, generateSelector
+ *          countElements, selectText, readSummary, generateSelector,
+ *          initConsoleCapture, getConsoleEntries
  * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md
  */
 
@@ -1138,3 +1139,70 @@ export function generateSelector(css: string): Record<string, unknown> {
     elementSummary: tag + (el.id ? "#" + el.id : "") + (classes.length ? "." + classes.slice(0, 2).join(".") : ""),
   };
 }
+
+// ── Console Capture ──
+
+const CONSOLE_MAX_ENTRIES = 500;
+const consoleBuffer: Array<{ level: string; messages: unknown[]; timestamp: number; stack?: string }> = [];
+
+export function initConsoleCapture(): void {
+  // Save originals
+  const origLog = console.log;
+  const origWarn = console.warn;
+  const origError = console.error;
+  const origInfo = console.info;
+  const origDebug = console.debug;
+
+  const capture = (level: string, ...args: unknown[]) => {
+    consoleBuffer.push({
+      level,
+      messages: args,
+      timestamp: Date.now(),
+    });
+    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
+      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
+    }
+  };
+
+  console.log = (...args: unknown[]) => { capture("log", ...args); origLog(...args); };
+  console.warn = (...args: unknown[]) => { capture("warn", ...args); origWarn(...args); };
+  console.error = (...args: unknown[]) => { capture("error", ...args); origError(...args); };
+  console.info = (...args: unknown[]) => { capture("info", ...args); origInfo(...args); };
+  console.debug = (...args: unknown[]) => { capture("debug", ...args); origDebug(...args); };
+
+  // Uncaught errors
+  window.onerror = (event, source, lineno, colno, error) => {
+    consoleBuffer.push({
+      level: "error",
+      messages: [event instanceof Event ? (event as ErrorEvent).message ?? String(event) : String(event)],
+      timestamp: Date.now(),
+      stack: error?.stack || `${source}:${lineno}:${colno}`,
+    });
+    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
+      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
+    }
+  };
+
+  // Unhandled promise rejections
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    consoleBuffer.push({
+      level: "error",
+      messages: [reason?.message ?? String(reason ?? "Unhandled Promise rejection")],
+      timestamp: Date.now(),
+      stack: reason?.stack ?? undefined,
+    });
+    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
+      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
+    }
+  });
+}
+
+export function getConsoleEntries(limit: number = 50, offset: number = 0): { entries: unknown[]; totalCount: number } {
+  const totalCount = consoleBuffer.length;
+  const sliced = consoleBuffer.slice(-(offset + limit), -(offset) || undefined);
+  return { entries: sliced, totalCount };
+}
+
+// Initialize immediately when this module is loaded (content script at document_start)
+initConsoleCapture();

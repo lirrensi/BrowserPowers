@@ -98,7 +98,7 @@ The **only module** in the codebase that calls `chrome.*` APIs. Maps tool names 
 | `tabs.create` | `chrome.tabs.create()` | |
 | `tabs.close` | `chrome.tabs.remove()` | Closes active tab if no tabId given |
 | `tabs.update` | `chrome.tabs.update()` | Navigate, focus, etc. |
-| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select) |
+| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select, console) |
 | `page.act` | `src/v2/page-act.ts` → dispatchActAction | Unified act tool with action dispatch (click, fill, check, select_option, press, scroll, submit, wait_for). Uses structured Target resolution and anchor fast path. |
 | `page.js` | `src/v2/page-js.ts` → dispatchJsAction | JavaScript execution wrapper — gated escape hatch |
 | `screenshots.capture` | `chrome.tabs.captureVisibleTab()` | Returns base64 PNG |
@@ -270,7 +270,7 @@ The v2 Page Interaction API is implemented by a set of modules under `src/v2/`. 
 | `src/v2/target-resolver.ts` | `targetResolverBody` | Injectable string body that resolves structured Target or anchor to a DOM element in page context. Penetrates same-origin iframes and open shadow roots. |
 | `src/v2/anchor-manager.ts` | `setAnchors()`, `getAnchor()`, `clearAnchors()`, `clearAllAnchors()` | Per-tab anchor storage with documentId staleness detection. Anchors live in service worker memory only. |
 | `src/v2/inspector.ts` | `inspectFunctionBody` | Injectable string body for page inspection — scans interactable elements, penetrates iframes and shadow roots, returns structured anchor data with anchor IDs |
-| `src/v2/page-read.ts` | `dispatchReadAction()` | Dispatches read actions (inspect, content, text, html, attr, meta, forms, count, select) via `chrome.scripting.executeScript`, stores inspect anchors |
+| `src/v2/page-read.ts` | `dispatchReadAction()` | Dispatches read actions (inspect, content, text, html, attr, meta, forms, count, select, console) via `chrome.scripting.executeScript`, stores inspect anchors |
 | `src/v2/page-act.ts` | `dispatchActAction()` | Dispatches act actions (click, fill, check, select_option, press, scroll, submit, wait_for) with anchor fast path and structured target resolution |
 | `src/v2/page-js.ts` | `dispatchJsAction()` | Executes arbitrary JavaScript on the page via `chrome.scripting.executeScript`, wraps result in ActionResult envelope |
 

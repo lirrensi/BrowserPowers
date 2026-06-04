@@ -569,6 +569,17 @@ Get the currently selected text on the page.
 
 Aliased as `browser_select` for backward compatibility.
 
+###### `action: "console"`
+
+Retrieve captured console output from the page. The content script intercepts `console.log`, `console.warn`, `console.error`, `console.info`, and `console.debug` calls at `document_start`, along with uncaught exceptions (`window.onerror`) and unhandled promise rejections (`unhandledrejection`). Entries are buffered in memory (max 500) and returned on demand.
+
+| Field | Type | Description |
+|---|---|---|
+| `limit` | number | Max entries to return from the end of the buffer (default 50) |
+| `offset` | number | Skip N entries from the end (default 0) |
+
+**Output**: `data` contains `{ entries: [{ level, messages[], timestamp, stack? }], totalCount: number }`
+
 #### 2.7 Tool: `page_act`
 
 Page Act is the unified tool for interacting with or mutating page elements. It uses an `action` discriminator to select the specific operation. Gated behind the `page.act` permission group.
