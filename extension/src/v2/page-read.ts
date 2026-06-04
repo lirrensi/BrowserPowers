@@ -359,6 +359,8 @@ async function consoleRead(params: Record<string, unknown>, tabId: number, frame
   const limit = (params.limit as number) ?? 50;
   const offset = (params.offset as number) ?? 0;
   try {
+    // Read from the content script's buffer — entries arrive from the MAIN
+    // world via postMessage. The content script is always alive (never sleeps).
     const data = await sendReadMessage(tabId, "console", { limit, offset });
     if (!data) return contentScriptNotReady("console");
     if (data.success === false) return notPerformed("console", data.message as string);

@@ -46,15 +46,41 @@ import {
   selectText,
   readSummary,
   generateSelector,
-  // Console capture
-  getConsoleEntries,
 } from "../src/v2/content-actions";
 import type { Target, ActResult } from "../src/v2/content-actions";
+
+// ── Console Capture Buffer ──
+// Content script buffers console entries received via postMessage from the
+// MAIN world (where the override lives). This buffer survives service worker
+// suspension — data is never lost once captured.
+
+const CONSOLE_MAX = 500;
+const consoleBuffer: Array<{ level: string; messages: unknown[]; timestamp: number; stack?: string }> = [];
+
+// Listen for console entries streamed from the MAIN world override via
+// postMessage. Set up at module scope — runs immediately at document_start.
+window.addEventListener("message", (event: MessageEvent) => {
+  if (event.source !== window) return;
+  if (event.data?.source !== "bp-console") return;
+  consoleBuffer.push(event.data.entry);
+  if (consoleBuffer.length > CONSOLE_MAX) {
+    consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX);
+  }
+});
+
+// ── Console Entry Type ──
+interface ConsoleEntry { level: string; messages: unknown[]; timestamp: number; stack?: string; }
 
 export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
   main() {
+    // Wake the service worker and request MAIN world console override injection.
+    // The content script runs at document_start — before any page scripts — so
+    // the SW has time to inject the override before the page's JS executes.
+    // This is best-effort: ~1-5ms race window for synchronous inline scripts.
+    try { chrome.runtime.sendMessage({ type: "injectMainWorldConsoleCapture" }); } catch {}
+
     chrome.runtime.onMessage.addListener(
       (
         message: { source: string; type: string; action?: string; params?: Record<string, unknown> },
@@ -163,7 +189,8 @@ async function handleRead(
     case "console": {
       const limit = (params.limit as number) ?? 50;
       const offset = (params.offset as number) ?? 0;
-      const { entries, totalCount } = getConsoleEntries(limit, offset);
+      const totalCount = consoleBuffer.length;
+      const entries = consoleBuffer.slice(-(offset + limit), -(offset) || undefined);
       return { entries, totalCount };
     }
     default:

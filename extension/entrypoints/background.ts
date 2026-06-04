@@ -280,6 +280,54 @@ function init(): void {
         break;
       }
 
+      case "injectMainWorldConsoleCapture": {
+        // Content script at document_start wakes us up to inject the console
+        // capture override into the page's MAIN world. This bypasses CSP and
+        // runs before page scripts execute. The override postMessages each
+        // console entry back to the content script for buffering.
+        const tabId = _sender.tab?.id;
+        if (tabId) {
+          chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            func: () => {
+              if ((window as any).__bpConsoleInitialized) return;
+              (window as any).__bpConsoleInitialized = true;
+              const buf: unknown[] = [];
+              const max = 500;
+              const post = (entry: unknown) => {
+                try { window.postMessage({ source: "bp-console", entry }, "*"); } catch { /* ignore */ }
+              };
+              const cap = (level: string, args: unknown[]) => {
+                const entry = { level, messages: args, timestamp: Date.now() };
+                buf.push(entry); post(entry);
+                if (buf.length > max) buf.splice(0, buf.length - max);
+              };
+              const ol = console.log.bind(console), ow = console.warn.bind(console), oe = console.error.bind(console), oi = console.info.bind(console), od = console.debug.bind(console);
+              console.log = (...a: unknown[]) => { cap("log", a); ol(...a); };
+              console.warn = (...a: unknown[]) => { cap("warn", a); ow(...a); };
+              console.error = (...a: unknown[]) => { cap("error", a); oe(...a); };
+              console.info = (...a: unknown[]) => { cap("info", a); oi(...a); };
+              console.debug = (...a: unknown[]) => { cap("debug", a); od(...a); };
+              window.onerror = (ev: unknown, src?: string, line?: number, col?: number, err?: Error) => {
+                const msg = ev instanceof Event ? ((ev as ErrorEvent).message ?? String(ev)) : String(ev);
+                const entry = { level: "error", messages: [msg], timestamp: Date.now(), stack: err?.stack || `${src}:${line}:${col}` };
+                buf.push(entry); post(entry);
+                if (buf.length > max) buf.splice(0, buf.length - max);
+              };
+              window.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+                const r = e.reason;
+                const entry = { level: "error", messages: [r?.message ?? String(r ?? "Unhandled Promise rejection")], timestamp: Date.now(), stack: r?.stack ?? undefined };
+                buf.push(entry); post(entry);
+                if (buf.length > max) buf.splice(0, buf.length - max);
+              });
+              (window as any).__bpConsoleBuffer = buf;
+            },
+          }).catch(() => { /* non-critical */ });
+        }
+        break;
+      }
+
       default:
         return false; // not handled
     }

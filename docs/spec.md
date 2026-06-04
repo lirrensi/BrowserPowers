@@ -571,7 +571,12 @@ Aliased as `browser_select` for backward compatibility.
 
 ###### `action: "console"`
 
-Retrieve captured console output from the page. The content script intercepts `console.log`, `console.warn`, `console.error`, `console.info`, and `console.debug` calls at `document_start`, along with uncaught exceptions (`window.onerror`) and unhandled promise rejections (`unhandledrejection`). Entries are buffered in memory (max 500) and returned on demand.
+Retrieve captured console output from the page. Intercepts `console.log`, `console.warn`, `console.error`, `console.info`, `console.debug`, uncaught exceptions (`window.onerror`), and unhandled promise rejections (`unhandledrejection`). Entries are buffered in memory (max 500) and returned on demand.
+
+**Architecture note**: MV3 content scripts run in an isolated world — overriding `console.log` there does NOT intercept the page's console calls. Instead, the service worker injects a console override into the page's MAIN world via `chrome.scripting.executeScript({ world: "MAIN" })`. Each captured entry is forwarded to the content script via `window.postMessage`, where it is buffered. This means:
+- The capture works on all pages regardless of Content Security Policy (CSP).
+- The buffer survives service worker suspension because the content script is always alive.
+- There is a ~1–5ms race window at page load: synchronous inline `<script>` tags that execute before the service worker injects the override may not be captured. This is a fundamental MV3 limitation — no API exists to retroactively read console history.
 
 | Field | Type | Description |
 |---|---|---|

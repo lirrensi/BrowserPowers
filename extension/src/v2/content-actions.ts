@@ -1141,68 +1141,13 @@ export function generateSelector(css: string): Record<string, unknown> {
 }
 
 // ── Console Capture ──
-
-const CONSOLE_MAX_ENTRIES = 500;
-const consoleBuffer: Array<{ level: string; messages: unknown[]; timestamp: number; stack?: string }> = [];
-
-export function initConsoleCapture(): void {
-  // Save originals
-  const origLog = console.log;
-  const origWarn = console.warn;
-  const origError = console.error;
-  const origInfo = console.info;
-  const origDebug = console.debug;
-
-  const capture = (level: string, ...args: unknown[]) => {
-    consoleBuffer.push({
-      level,
-      messages: args,
-      timestamp: Date.now(),
-    });
-    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
-      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
-    }
-  };
-
-  console.log = (...args: unknown[]) => { capture("log", ...args); origLog(...args); };
-  console.warn = (...args: unknown[]) => { capture("warn", ...args); origWarn(...args); };
-  console.error = (...args: unknown[]) => { capture("error", ...args); origError(...args); };
-  console.info = (...args: unknown[]) => { capture("info", ...args); origInfo(...args); };
-  console.debug = (...args: unknown[]) => { capture("debug", ...args); origDebug(...args); };
-
-  // Uncaught errors
-  window.onerror = (event, source, lineno, colno, error) => {
-    consoleBuffer.push({
-      level: "error",
-      messages: [event instanceof Event ? (event as ErrorEvent).message ?? String(event) : String(event)],
-      timestamp: Date.now(),
-      stack: error?.stack || `${source}:${lineno}:${colno}`,
-    });
-    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
-      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
-    }
-  };
-
-  // Unhandled promise rejections
-  window.addEventListener("unhandledrejection", (event) => {
-    const reason = event.reason;
-    consoleBuffer.push({
-      level: "error",
-      messages: [reason?.message ?? String(reason ?? "Unhandled Promise rejection")],
-      timestamp: Date.now(),
-      stack: reason?.stack ?? undefined,
-    });
-    if (consoleBuffer.length > CONSOLE_MAX_ENTRIES) {
-      consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX_ENTRIES);
-    }
-  });
-}
-
-export function getConsoleEntries(limit: number = 50, offset: number = 0): { entries: unknown[]; totalCount: number } {
-  const totalCount = consoleBuffer.length;
-  const sliced = consoleBuffer.slice(-(offset + limit), -(offset) || undefined);
-  return { entries: sliced, totalCount };
-}
-
-// Initialize immediately when this module is loaded (content script at document_start)
-initConsoleCapture();
+//
+// Console capture is injected into the page's MAIN world from the service
+// worker via chrome.scripting.executeScript({ world: "MAIN" }). This is done
+// proactively on tab loading (background.ts tabs.onUpdated) and lazily on
+// first page.read({ action: "console" }) call (page-read.ts consoleRead()).
+// No content-script-side code needed — content scripts run in an isolated
+// world that cannot intercept the page's console.log calls.
+//
+// The init func is defined inline in background.ts and page-read.ts because
+// chrome.scripting.executeScript serializes/deserializes functions.

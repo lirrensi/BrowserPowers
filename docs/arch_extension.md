@@ -98,7 +98,7 @@ The **only module** in the codebase that calls `chrome.*` APIs. Maps tool names 
 | `tabs.create` | `chrome.tabs.create()` | |
 | `tabs.close` | `chrome.tabs.remove()` | Closes active tab if no tabId given |
 | `tabs.update` | `chrome.tabs.update()` | Navigate, focus, etc. |
-| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select, console) |
+| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select, console). The `console` action queries the content script's buffer (populated via MAIN world postMessage) — see §10. |
 | `page.act` | `src/v2/page-act.ts` → dispatchActAction | Unified act tool with action dispatch (click, fill, check, select_option, press, scroll, submit, wait_for). Uses structured Target resolution and anchor fast path. |
 | `page.js` | `src/v2/page-js.ts` → dispatchJsAction | JavaScript execution wrapper — gated escape hatch |
 | `screenshots.capture` | `chrome.tabs.captureVisibleTab()` | Returns base64 PNG |
@@ -278,6 +278,69 @@ The v2 Page Interaction API is implemented by a set of modules under `src/v2/`. 
 - `target-resolver.ts` and `inspector.ts` export string bodies that are injected into the page context via `chrome.scripting.executeScript`. They do NOT run in the service worker.
 - `action-result.ts`, `anchor-manager.ts`, `page-read.ts`, `page-act.ts`, and `page-js.ts` run in the service worker.
 - All action functions return `ActionResult` envelopes from `action-result.ts`.
+- Console capture (`page.read({ action: "console" })`) uses a different flow — see §10 below.
+
+---
+
+### 10. Console Capture
+
+Console capture demonstrates the core MV3 challenge with page instrumentation and how BrowserPowers solves it.
+
+#### 10.1 The Problem
+
+Manifest V3 content scripts run in an **isolated world** — they share the DOM with the page but have a separate JavaScript execution context. Overriding `console.log` in the content script only intercepts calls from the content script itself, not from the page's main world. There is no API to retroactively read a page's console history.
+
+Additionally:
+- **CSP blocks inline `<script>` tags** injected by content scripts on sites like YouTube.
+- **The service worker can suspend** after ~30s of inactivity, losing any state it held.
+
+#### 10.2 The Architecture
+
+```
+document_start:
+  Content script fires (always alive, never sleeps)
+    ├── chrome.runtime.sendMessage({ type: "injectMainWorldConsoleCapture" })
+    │     → wakes service worker
+    │     → SW: chrome.scripting.executeScript({ world: "MAIN", func: initOverride })
+    │       (bypasses CSP — extension privilege)
+    │
+    └── window.addEventListener("message")
+          ← receives entries from MAIN world via postMessage
+
+MAIN world (after init):
+  console.log / warn / error / info / debug
+    ├── pushes to __bpConsoleBuffer (in-memory fallback)
+    ├── window.postMessage({ source: "bp-console", entry: { level, messages, timestamp, stack? } }, "*")
+    │     → content script receives → consoleBuffer.push(entry)
+    └── calls original console method (preserves normal behavior)
+
+On page.read({ action: "console" }):
+  Service worker → chrome.tabs.sendMessage(tabId, "console", { limit, offset })
+    → content script returns consoleBuffer.slice(−(offset+limit), −offset)
+    → no executeScript round-trip on every query
+```
+
+#### 10.3 Key Properties
+
+| Property | Detail |
+|---|---|
+| **No data loss** | Content script (always alive) holds the buffer. Service worker suspension does not lose entries. |
+| **CSP-proof** | `chrome.scripting.executeScript({ world: "MAIN" })` runs with extension privileges, bypassing page CSP. |
+| **Fast queries** | Buffer is in the content script's memory — queries are direct `sendMessage` round-trips, not executeScript injections. |
+| **Forwarded from MAIN world** | Each console call is `postMessage`'d from MAIN world → isolated world. The buffer in `window.__bpConsoleBuffer` on the MAIN world is a fallback. |
+| **Capacity** | Ring buffer of 500 entries (oldest dropped). Cleared on page navigation (new content script instance). |
+
+#### 10.4 Known Limitation
+
+There is a ~1–5ms race window at `document_start`. The content script sends the wake-up message to the service worker asynchronously. Any synchronous inline `<script>` tags in the page's `<head>` that execute before the service worker injects the override will not be captured. This is a fundamental MV3 limitation — no API exists to retroactively read console history. In practice, this affects very few entries: most modern web apps load scripts asynchronously or after the initial HTML parse.
+
+#### 10.5 Implementation Files
+
+| File | Role |
+|---|---|
+| `entrypoints/background.ts` | Handles `injectMainWorldConsoleCapture` message; injects MAIN world override via `executeScript({ world: "MAIN" })` |
+| `entrypoints/content.ts` | Module-scope postMessage listener; buffers entries; handles `console` read action; sends wake-up at document_start |
+| `src/v2/page-read.ts` | `consoleRead()` dispatches `sendReadMessage` to content script buffer |
 
 ---
 
