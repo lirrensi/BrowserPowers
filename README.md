@@ -1,7 +1,7 @@
 # BrowserPowers
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blueviolet?style=flat-square" alt="Version 1.0.0" />
+  <img src="https://img.shields.io/badge/version-1.3.0-blueviolet?style=flat-square" alt="Version 1.3.0" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
   <img src="https://img.shields.io/badge/chrome-supported-success?style=flat-square" alt="Chrome Supported" />
   <img src="https://img.shields.io/badge/firefox-experimental-orange?style=flat-square" alt="Firefox Experimental" />
