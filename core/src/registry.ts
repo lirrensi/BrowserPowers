@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Browser, Capability, QueuedItem, ToolResult } from "./types.js";
+import type { Browser, Capability, CommandMode, QueuedItem, ToolResult } from "./types.js";
 import { loadConfig } from "./config.js";
 
 interface PendingApproval {
@@ -37,6 +37,12 @@ class BrowserRegistry {
 
   private pendingApprovals = new Map<string, PendingApproval>();
 
+  /** Completed results store: requestId → ToolResult, held for 5 min for async polling */
+  private completedResults = new Map<string, ToolResult>();
+
+  /** Sentinel value for in-flight async requests */
+  static readonly PENDING = Symbol("pending");
+
   private scheduleDrain(browserId: string): void {
     void import("./ws-server.js")
       .then(({ tryDrain }) => tryDrain(browserId))
@@ -51,12 +57,15 @@ class BrowserRegistry {
     name: string,
     capabilities: Capability[],
     permissions: Browser["permissions"],
+    commandMode?: CommandMode,
   ): Browser {
+    const config = loadConfig();
     const browser: Browser = {
       id: browserId,
       name,
       capabilities,
       permissions,
+      commandMode: commandMode ?? config.execution.commandMode,
       connectedAt: Date.now(),
       lastHeartbeat: Date.now(),
     };
@@ -218,6 +227,7 @@ class BrowserRegistry {
       this.removeFromQueue(entry.browserId, requestId);
       entry.resolve(result);
       this.pendingRequests.delete(requestId);
+      this.storeResult(requestId, result);
     }
   }
 
@@ -230,7 +240,27 @@ class BrowserRegistry {
       this.removeFromQueue(entry.browserId, requestId);
       entry.reject(error);
       this.pendingRequests.delete(requestId);
+      this.storeResult(requestId, {
+        browserId: entry.browserId,
+        tool: entry.tool,
+        success: false,
+        error: error.message,
+      });
     }
+  }
+
+  /** Store a completed result for async polling (auto-purged after 5 min) */
+  storeResult(requestId: string, result: ToolResult): void {
+    this.completedResults.set(requestId, result);
+    // Auto-purge after 5 minutes
+    setTimeout(() => {
+      this.completedResults.delete(requestId);
+    }, 5 * 60 * 1000);
+  }
+
+  /** Poll a result by requestId. Returns null if not found or expired. */
+  getResult(requestId: string): ToolResult | null {
+    return this.completedResults.get(requestId) ?? null;
   }
 
   /** Queue an approval request and return a promise that resolves with user's decision */

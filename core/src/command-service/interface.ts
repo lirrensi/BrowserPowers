@@ -9,8 +9,14 @@ export interface CommandService {
   /** List all currently connected browsers */
   listBrowsers(): Promise<BrowserInfo[]>;
 
-  /** Execute a tool on a specific browser */
+  /** Execute a tool on a specific browser (sync: waits for result) */
   execute(browserId: string, tool: string, params: Record<string, unknown>): Promise<ToolResult>;
+
+  /** Execute a tool asynchronously — returns requestId immediately */
+  executeAsync(browserId: string, tool: string, params: Record<string, unknown>): Promise<{ requestId: string }>;
+
+  /** Poll an async result by requestId */
+  getResult(requestId: string): Promise<{ status: "pending" | "complete" | "error"; result?: ToolResult }>;
 
   /** Execute a tool on all connected browsers */
   executeAll(tool: string, params: Record<string, unknown>): Promise<ToolResult[]>;

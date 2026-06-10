@@ -75,7 +75,8 @@ Singleton that maintains the state of all connected browsers:
 - `Map<browserId, string[]>` — per-browser ordered FIFO queues of request IDs
 - `Set<browserId>` — currently busy browsers (one in-flight at a time)
 - `Map<requestId, PendingApproval>` — requests awaiting user approval (gate: ask)
-- Methods: `register`, `unregister`, `heartbeat`, `list`, `get`, `enqueue`, `dequeue`, `resolveRequest`, `rejectRequest`, `rejectAllForBrowser`, `setBusy`, `clearBusy`, `isBusy`, `queuedCount`, `findStale`, `queueApproval`, `resolveApproval`
+- `Map<requestId, ToolResult>` — completed results (async mode, 5-min TTL)
+- Methods: `register`, `unregister`, `heartbeat`, `list`, `get`, `enqueue`, `dequeue`, `resolveRequest`, `rejectRequest`, `rejectAllForBrowser`, `setBusy`, `clearBusy`, `isBusy`, `queuedCount`, `findStale`, `queueApproval`, `resolveApproval`, `storeResult`, `getResult`
 - Requests are enqueued per-browser and drained via `tryDrain()` in the WebSocket server on register/result/error
 - Browser busy flag prevents concurrent execution — only one request at a time per browser
 - On browser disconnect, all queued + pending execution and approval requests for that browser are rejected via `rejectAllForBrowser()`
@@ -94,7 +95,9 @@ Enforces permission profiles before tool execution:
 The **single implementation** of all browser operations. All three adapters (REST, MCP, CLI) call into this:
 
 - `listBrowsers()` — returns all connected browsers with capabilities
-- `execute(browserId, tool, params)` — sends a command to one browser, waits for result
+- `execute(browserId, tool, params)` — sends a command to one browser, waits for result (sync)
+- `executeAsync(browserId, tool, params)` — fire-and-forget: enqueues command, returns `{ requestId }` immediately (async)
+- `getResult(requestId)` — polls for a completed async result; returns `{ status: "pending" | "complete" | "error", result? }`
 - `executeAll(tool, params)` — sends a command to all browsers, collects all results
 - `getCapabilities(browserId)` — returns a browser's available tools
 - `isConnected(browserId)` — checks if a browser is connected
@@ -111,7 +114,19 @@ The flow for `execute`:
 6. **Wait** for result or error (via the Promise returned by `enqueue`)
 7. **Return** result to caller
 
-The WebSocket server's `tryDrain()` function sends the next queued item to the browser, sets the busy flag, and after each result/error calls `tryDrain()` again to process the next item in the queue. This creates a sequential pipeline: each browser processes requests one at a time in FIFO order.
+The WebSocket server's `tryDrain()` function sends the next queued item to the browser, sets the busy flag, and after each result/error calls `tryDrain()` again to process the next item in the queue. This creates a sequential pipeline: each browser processes requests one at a time in FIFO order. The `execute` WebSocket message now includes the browser's `commandMode` field so the extension can decide whether to enrich responses (auto-snapshot on navigate, post-action diff on page.act).
+
+### 6b. Execution Modes
+
+Every browser carries a `commandMode` setting (`"sync"` | `"async"`, default `"sync"`). This is set in the config (`execution.commandMode`) and stored in the registry per-browser. The mode can be overridden per-request via MCP's `mode` parameter, REST's `/execute-async` endpoint, or CLI's `--async` flag.
+
+**Sync mode** (default): `execute()` blocks until the extension returns a result. For `tabs.navigate`, the extension auto-includes a compact page inspect snapshot in the response. For `page.act` mutation actions, the extension captures before/after snapshots and computes a semantic diff showing what changed.
+
+**Async mode**: `executeAsync()` enqueues the request and returns `{ requestId }` immediately. The caller polls `getResult(requestId)` for the result. Completed results are held in the registry for 5 minutes then auto-purged. Async mode rejects `ask`-gated tools (user approval cannot be handled asynchronously).
+
+### 6c. Snapshot Diff (`core/src/snapshot-diff.ts`)
+
+A utility that compares two page inspect snapshots by **semantic key** (`${role ?? tag}|${name ?? ""}|${tag}|${text ?? ""}`) rather than by anchor ID (which is regenerated every inspect). Returns `{ urlChanged, titleChanged, anchorsAdded, anchorsRemoved, anchorsChanged }`. Used by the extension to produce post-action diffs in sync mode. A matching copy lives in `extension/src/v2/snapshot-diff.ts` for use in the service worker context.
 
 The approval flow when gate returns `ask`:
 
@@ -138,9 +153,11 @@ HonoRouter exposing:
 | GET | `/browsers` | List all connected browsers |
 | GET | `/browsers/:id` | Get specific browser |
 | GET | `/browsers/:id/capabilities` | Get browser capabilities |
-| POST | `/browsers/:id/execute` | Execute a tool on one browser |
+| POST | `/browsers/:id/execute` | Execute a tool on one browser (sync) |
+| POST | `/browsers/:id/execute-async` | Execute a tool on one browser (async, returns requestId) |
 | POST | `/execute-all` | Execute a tool on all browsers |
 | GET | `/browsers/:id/screenshot` | Screenshot convenience endpoint |
+| GET | `/results/:requestId` | Poll for async execution result |
 | GET | `/health` | Server health |
 
 ### 9. MCP Adapter (`src/adapters/mcp.ts`)

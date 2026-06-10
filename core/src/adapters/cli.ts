@@ -34,12 +34,40 @@ function prettyPrint(data: unknown): string {
   return JSON.stringify(data, null, 2);
 }
 
+/** Execute a tool via REST, handling --async mode if set on the program */
+async function executeViaRest(
+  browserId: string,
+  tool: string,
+  params: Record<string, unknown>,
+): Promise<unknown> {
+  const isAsync = program.opts().async;
+  if (isAsync) {
+    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute-async`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool, params }),
+    });
+    const data = await res.json() as { requestId?: string; error?: string };
+    if (data.error) cliError(data.error);
+    console.log(`⏳ Queued as ${data.requestId}`);
+    console.log(`   Poll: GET ${BASE}/results/${data.requestId}`);
+    return null;
+  }
+  const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tool, params }),
+  });
+  return res.json();
+}
+
 const program = new Command();
 
 program
   .name("browserpowers")
   .description("CLI for multi-browser agent control")
-  .version("1.0.0");
+  .version("1.0.0")
+  .option("--async", "Execute asynchronously — print requestId and exit immediately");
 
 // ── Helper: auto-detect target type from shorthand string (#028) ──
 // Mirrors Playwright's locator behavior:
@@ -109,12 +137,8 @@ program
   .command("navigate <browserId> <url>")
   .description("Navigate a browser to a URL")
   .action(async (browserId: string, url: string) => {
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: "tabs.create", params: { url } }),
-    });
-    const result = await res.json() as { success: boolean; error?: string };
+    const result = await executeViaRest(browserId, "tabs.create", { url }) as any;
+    if (result === null) return; // async mode
     console.log(result.success ? `✅ Navigated to ${url}` : `❌ ${result.error}`);
   });
 
@@ -123,12 +147,8 @@ program
   .command("screenshot <browserId> [filepath]")
   .description("Take a screenshot of a browser tab")
   .action(async (browserId: string, filepath?: string) => {
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: "screenshots.capture", params: {} }),
-    });
-    const result = await res.json() as { success: boolean; error?: string; data?: { base64?: string } };
+    const result = await executeViaRest(browserId, "screenshots.capture", {}) as any;
+    if (result === null) return; // async mode
     if (!result.success) {
       cliError(result.error ?? "Screenshot failed");
     }
@@ -146,12 +166,8 @@ program
   .command("content <browserId> [selector]")
   .description("Get page content from a browser")
   .action(async (browserId: string, selector?: string) => {
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: "page.read", params: { action: "content", target: selector ? { css: selector } : undefined } }),
-    });
-    const result = await res.json() as any;
+    const result = await executeViaRest(browserId, "page.read", { action: "content", target: selector ? { css: selector } : undefined }) as any;
+    if (result === null) return; // async mode
     if (!result.success) {
       cliError(result.error ?? "Content fetch failed");
     }
@@ -163,12 +179,8 @@ program
   .command("select <browserId>")
   .description("Get selected text from a browser")
   .action(async (browserId: string) => {
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: "page.read", params: { action: "select" } }),
-    });
-    const result = await res.json() as any;
+    const result = await executeViaRest(browserId, "page.read", { action: "select" }) as any;
+    if (result === null) return; // async mode
     if (!result.success) {
       cliError(result.error ?? "Select text fetch failed");
     }
@@ -180,12 +192,8 @@ program
   .command("tabs <browserId>")
   .description("List all tabs in a browser")
   .action(async (browserId: string) => {
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: "tabs.list", params: {} }),
-    });
-    const result = await res.json() as any;
+    const result = await executeViaRest(browserId, "tabs.list", {}) as any;
+    if (result === null) return; // async mode
     if (!result.success) {
       cliError(result.error ?? "Tabs list failed");
     }
@@ -205,12 +213,8 @@ program
         cliError("Invalid JSON params");
       }
     }
-    const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool, params }),
-    });
-    const result = await res.json();
+    const result = await executeViaRest(browserId, tool, params) as any;
+    if (result === null) return; // async mode
     console.log(JSON.stringify(result, null, 2));
   });
 
@@ -287,19 +291,15 @@ program
           params.target = autoDetectTarget(params.target as string);
         }
 
-        const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tool: "page.read", params: { action, ...params } }),
-        });
-        const result = await res.json() as any;
-        if (!result.success) {
-          cliError(result.error ?? "Page read failed");
+        const res = await executeViaRest(browserId, "page.read", { action, ...params }) as any;
+        if (res === null) return; // async mode
+        if (!res.success) {
+          cliError(res.error ?? "Page read failed");
         }
         if (options.json) {
-          console.log(JSON.stringify(result.data, null, 2));
+          console.log(JSON.stringify(res.data, null, 2));
         } else {
-          console.log(prettyPrint(result.data));
+          console.log(prettyPrint(res.data));
         }
       }),
   )
@@ -328,12 +328,8 @@ program
           delete params.text;
         }
 
-        const res = await apiFetch(`${BASE}/browsers/${browserId}/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tool: "page.act", params: { action, ...params } }),
-        });
-        const result = await res.json() as any;
+        const result = await executeViaRest(browserId, "page.act", { action, ...params }) as any;
+        if (result === null) return; // async mode
         if (!result.success) {
           cliError(result.error ?? "Page act failed");
         }

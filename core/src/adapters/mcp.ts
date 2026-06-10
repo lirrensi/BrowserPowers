@@ -52,6 +52,7 @@ const browsersSchema = z.object({
 const screenshotSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -84,6 +85,7 @@ const pageReadSchema = z.object({
   compact: z.boolean().optional(),
   name: z.string().optional(),
   timeout_ms: z.number().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -122,6 +124,7 @@ const pageActSchema = z.object({
     target: z.object({ css: z.string().optional() }).optional(),
     value: z.string(),
   })).optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -132,6 +135,7 @@ const pageJsSchema = z.object({
   frameId: z.number().optional(),
   code: z.string(),
   timeout_ms: z.number().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -147,6 +151,7 @@ const tabsSchema = z.object({
   snapshot: z.boolean().optional(),
   limit: z.number().optional(),
   offset: z.number().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -158,6 +163,7 @@ const cookiesSchema = z.object({
   url: z.string(),
   name: z.string().optional(),
   value: z.string().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -168,6 +174,7 @@ const windowsSchema = z.object({
   browser_name: z.string().optional(),
   url: z.string().optional(),
   window_id: z.number().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -866,6 +873,12 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("screenshot") }] };
       const parsed = screenshotSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
+
+      if (parsed.mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, "screenshots.capture", {});
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(browser_id, "screenshots.capture", {});
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -932,6 +945,11 @@ export function mountMcpServer(app: Hono): void {
           break;
       }
 
+      if (parsed.mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, command, params);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(browser_id, command, params);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -992,7 +1010,13 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_read") }] };
       const parsed = pageReadSchema.parse(args);
       const resolvedId = await resolveBrowserId(parsed);
-      const { browser_id: _bid, browser_name: _bn, ...pageParams } = parsed;
+      const { browser_id: _bid, browser_name: _bn, mode, ...pageParams } = parsed;
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(resolvedId, "page.read", pageParams);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(resolvedId, "page.read", pageParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -1012,7 +1036,13 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_act") }] };
       const parsed = pageActSchema.parse(args);
       const resolvedId = await resolveBrowserId(parsed);
-      const { browser_id: _bid, browser_name: _bn, ...pageParams } = parsed;
+      const { browser_id: _bid, browser_name: _bn, mode, ...pageParams } = parsed;
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(resolvedId, "page.act", pageParams);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(resolvedId, "page.act", pageParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -1032,7 +1062,13 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_js") }] };
       const parsed = pageJsSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { code, timeout_ms } = parsed;
+      const { code, timeout_ms, mode } = parsed;
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, "page.js", { code, timeout_ms });
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(browser_id, "page.js", { code, timeout_ms });
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -1053,7 +1089,7 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("cookies") }] };
       const parsed = cookiesSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { action, url, name, value } = parsed;
+      const { action, url, name, value, mode } = parsed;
 
       let command: string;
       let params: Record<string, unknown>;
@@ -1077,6 +1113,11 @@ export function mountMcpServer(app: Hono): void {
           break;
       }
 
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, command, params);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
       const result = await commandService.execute(browser_id, command, params);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
@@ -1097,10 +1138,14 @@ export function mountMcpServer(app: Hono): void {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("windows") }] };
       const parsed = windowsSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { action, url, window_id } = parsed;
+      const { action, url, window_id, mode } = parsed;
 
       // Enhanced list: chrome.windows.getAll({ populate: true }) already includes tabs
       if (action === "list") {
+        if (mode === "async") {
+          const { requestId } = await commandService.executeAsync(browser_id, "windows.list", {});
+          return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+        }
         const windowsResult = await commandService.execute(browser_id, "windows.list", {});
         if (!windowsResult.success) {
           return { content: [{ type: "text" as const, text: `Error: ${windowsResult.error}` }], isError: true };
@@ -1129,6 +1174,11 @@ export function mountMcpServer(app: Hono): void {
           command = "windows.close";
           params = { window_id };
           break;
+      }
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, command, params);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
       const result = await commandService.execute(browser_id, command, params);

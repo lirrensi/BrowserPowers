@@ -24,12 +24,16 @@ export type ToolGroup =
 /** Permissions map: toolgroup → permission level */
 export type PermissionProfile = Partial<Record<ToolGroup, Permission>>;
 
+/** Execution mode for a browser: sync waits for result, async returns requestId immediately */
+export type CommandMode = "sync" | "async";
+
 /** A registered browser connection */
 export interface Browser {
   id: string;
   name: string; // user-assigned name, e.g. "Work Chrome"
   capabilities: Capability[];
   permissions: PermissionProfile;
+  commandMode: CommandMode;
   connectedAt: number;
   lastHeartbeat: number;
 }
@@ -55,7 +59,7 @@ export type ExtToCore =
 /** Core → Extension messages */
 export type CoreToExt =
   | { type: "registered"; payload: { browserId: string } }
-  | { type: "execute"; payload: { requestId: string; tool: string; params: Record<string, unknown> } }
+  | { type: "execute"; payload: { requestId: string; tool: string; params: Record<string, unknown>; commandMode: CommandMode } }
   | { type: "heartbeat_ack" }
   | { type: "config_updated"; payload: PermissionProfile }
   | { type: "request_approval"; payload: { requestId: string; tool: string; params: Record<string, unknown>; description: string } }
@@ -69,6 +73,8 @@ export interface RegisterPayload {
   browserId?: string;
   /** API key for core server authentication (optional — only needed when core requires it) */
   authKey?: string;
+  /** Execution mode for this browser ("sync" | "async"). Defaults to server config if omitted. */
+  commandMode?: CommandMode;
 }
 
 
@@ -188,6 +194,10 @@ export interface ServerConfig {
     approvalTimeoutMs?: number;
   };
   queue: QueueConfig;
+  execution: {
+    /** Default execution mode for browsers that don't specify one ("sync" | "async") */
+    commandMode: CommandMode;
+  };
   browsers: Record<string, { name: string; permissions: PermissionProfile }>;
   auth: {
     apiKey: string;  // empty = no auth required

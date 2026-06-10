@@ -99,7 +99,7 @@ export function createWsServer(httpServer: Server): WebSocketServer {
 
       switch (msg.type) {
         case "register": {
-          const { name, capabilities, permissions, browserId: savedId } = msg.payload;
+          const { name, capabilities, permissions, browserId: savedId, commandMode } = msg.payload;
 
           // Validate browser name
           if (typeof name !== "string" || !name.trim()) {
@@ -143,7 +143,7 @@ export function createWsServer(httpServer: Server): WebSocketServer {
             // update the WebSocket reference via register() below.
           }
 
-          registry.register(browserId, name, capabilities, permissions);
+          registry.register(browserId, name, capabilities, permissions, commandMode);
           connections.set(browserId, ws);
 
           // Start draining any queued items for this browser
@@ -315,12 +315,14 @@ export function tryDrain(browserId: string): void {
     }
 
     registry.setBusy(browserId);
+    const browser = registry.get(browserId);
     ws.send(JSON.stringify({
       type: "execute",
       payload: {
         requestId: item.requestId,
         tool: item.tool,
         params: item.params,
+        commandMode: browser?.commandMode ?? "sync",
       },
     } satisfies CoreToExt));
 

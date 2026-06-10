@@ -110,8 +110,9 @@ The **only module** in the codebase that calls `chrome.*` APIs. Maps tool names 
 | `tabs.create` | `chrome.tabs.create()` | |
 | `tabs.close` | `chrome.tabs.remove()` | Closes active tab if no tabId given |
 | `tabs.update` | `chrome.tabs.update()` | Navigate, focus, etc. |
-| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select, console). The `console` action queries the content script's buffer (populated via MAIN world postMessage) — see §10. |
-| `page.act` | `src/v2/page-act.ts` → dispatchActAction | Unified act tool with action dispatch (click, fill, check, select_option, press, scroll, submit, wait_for). Uses structured Target resolution and anchor fast path. |
+| `tabs.navigate` | `chrome.tabs.update()` / `chrome.tabs.create()` | In sync mode, auto-runs compact inspect and includes snapshot in result |
+| `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch |
+| `page.act` | `src/v2/page-act.ts` → dispatchActAction | In sync mode, captures before/after inspect snapshots and computes semantic diff |
 | `page.js` | `src/v2/page-js.ts` → dispatchJsAction | JavaScript execution wrapper — gated escape hatch |
 | `screenshots.capture` | `chrome.tabs.captureVisibleTab()` | Returns base64 PNG |
 | `history.search` | `chrome.history.search()` | |
@@ -135,6 +136,11 @@ routeExecute(request) → execute(tool, params)
   → else → switch(tool) → chrome.* API call
   → return { requestId, success, data } or { requestId, success: false, error }
 ```
+
+**Execution mode enrichment** (when `commandMode === "sync"`):
+- `tabs.navigate`: always runs a compact inspect after page load and includes the snapshot (`{ url, title, anchors }`) in the result
+- `page.act` mutation actions: captures inspect before → executes action → captures inspect after → computes semantic diff via `diffSnapshots()` → attaches diff to result data
+- Non-mutation actions (`wait_for`, dialog operations) and failed actions skip the diff
 
 ### 4. Storage (`src/storage.ts`)
 
@@ -285,6 +291,7 @@ The v2 Page Interaction API is implemented by a set of modules under `src/v2/`. 
 | `src/v2/page-read.ts` | `dispatchReadAction()` | Dispatches read actions (inspect, content, text, html, attr, meta, forms, count, select, console) via `chrome.scripting.executeScript`, stores inspect anchors |
 | `src/v2/page-act.ts` | `dispatchActAction()` | Dispatches act actions (click, fill, check, select_option, press, scroll, submit, wait_for) with anchor fast path and structured target resolution |
 | `src/v2/page-js.ts` | `dispatchJsAction()` | Executes arbitrary JavaScript on the page via `chrome.scripting.executeScript`, wraps result in ActionResult envelope |
+| `src/v2/snapshot-diff.ts` | `diffSnapshots()`, `AnchorSnapshot`, `SnapshotDiff` | Compares two inspect snapshots by semantic key (`role|name|tag|text`), returns added/removed/changed anchors plus top-level url/title changes |
 
 **Architecture notes**:
 - `target-resolver.ts` and `inspector.ts` export string bodies that are injected into the page context via `chrome.scripting.executeScript`. They do NOT run in the service worker.
@@ -464,6 +471,7 @@ src/capability-router.ts
   → src/v2/page-read (dispatchReadAction)
   → src/v2/page-act (dispatchActAction)
   → src/v2/page-js (dispatchJsAction)
+  → src/v2/snapshot-diff (diffSnapshots — for sync-mode post-action diff)
 
 src/v2/page-read.ts
   → src/v2/inspector (inspectFunctionBody)
@@ -477,6 +485,7 @@ src/v2/page-act.ts
 
 src/v2/page-js.ts
   → src/v2/action-result (performed, blocked)
+  → src/v2/snapshot-diff (diffSnapshots — for post-action diff in sync mode)
 
 src/ws-client.ts
   → src/storage (getSettings, getEffectivePermissions)
@@ -566,5 +575,6 @@ The popup and options page provide the same user-facing controls:
 - Site permissions: `extension/src/site-permissions.ts`
 - Safety: `extension/src/safety.ts`
 - Readability: `extension/src/readability.ts`
+- Snapshot diff: `extension/src/v2/snapshot-diff.ts`
 - Types: `extension/src/types.ts`
 - Config: `extension/wxt.config.ts`

@@ -78,6 +78,30 @@ restApp.post("/browsers/:id/execute", async (c) => {
   }
 });
 
+// POST /api/browsers/:id/execute-async — execute a tool asynchronously (accepts UUID or name)
+restApp.post("/browsers/:id/execute-async", async (c) => {
+  try {
+    const browserId = resolveBrowserId(c.req.param("id"));
+    if (!browserId) return c.json({ success: false, error: "Browser not found" }, 404);
+    const { tool, params } = await c.req.json();
+    const { requestId } = await commandService.executeAsync(browserId, tool, params ?? {});
+    return c.json({ requestId, status: "queued" });
+  } catch (err) {
+    return c.json({ success: false, error: (err as Error).message }, 500);
+  }
+});
+
+// GET /api/results/:requestId — poll an async result
+restApp.get("/results/:requestId", async (c) => {
+  try {
+    const requestId = c.req.param("requestId");
+    const pollResult = await commandService.getResult(requestId);
+    return c.json(pollResult);
+  } catch (err) {
+    return c.json({ success: false, error: (err as Error).message }, 500);
+  }
+});
+
 // POST /api/execute-all — execute a tool on ALL browsers
 restApp.post("/execute-all", async (c) => {
   const { tool, params } = await c.req.json();

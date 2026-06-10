@@ -11,6 +11,7 @@
 import { dispatchReadAction } from "./v2/page-read.js";
 import { dispatchActAction } from "./v2/page-act.js";
 import { dispatchJsAction } from "./v2/page-js.js";
+import { diffSnapshots } from "./v2/snapshot-diff.js";
 
 // ═══════════════════════════════════════════
 // Network request ring buffer (#002)
@@ -28,6 +29,12 @@ interface RequestEvent {
 
 const MAX_REQUESTS_PER_TAB = 200;
 const requestBuffer = new Map<number, RequestEvent[]>();
+
+/** Actions that mutate the page — eligible for pre/post snapshot diff in sync mode */
+const MUTATION_ACTIONS = new Set([
+  "click", "fill", "check", "select_option", "press", "scroll", "submit",
+  "type", "smart_click", "fill_form", "drag", "dblclick", "hover",
+]);
 
 function addRequestToBuffer(entry: RequestEvent): void {
   let entries = requestBuffer.get(entry.tabId);
@@ -86,6 +93,7 @@ export interface ExecuteRequest {
   requestId: string;
   tool: string;
   params: Record<string, unknown>;
+  commandMode: "sync" | "async";
 }
 
 export interface ExecuteResult {
@@ -100,7 +108,7 @@ export interface ExecuteResult {
  */
 export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> {
   try {
-    const data = await execute(req.tool, req.params);
+    const data = await execute(req.tool, req.params, req.commandMode);
     return { requestId: req.requestId, success: true, data };
   } catch (err) {
     return {
@@ -111,7 +119,7 @@ export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> 
   }
 }
 
-async function execute(tool: string, params: Record<string, unknown>): Promise<unknown> {
+async function execute(tool: string, params: Record<string, unknown>, commandMode: "sync" | "async"): Promise<unknown> {
   switch (tool) {
     // ══════════════════════════════════════════
     // V2 Page Tools
@@ -126,7 +134,64 @@ async function execute(tool: string, params: Record<string, unknown>): Promise<u
     case "page.act": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       const frameId = params.frameId as number | undefined;
-      return dispatchActAction(params.action as any, params, tabId, frameId);
+      const actAction = params.action as string;
+
+      // In sync mode: capture pre/post inspect snapshots for mutation actions
+      if (commandMode === "sync" && MUTATION_ACTIONS.has(actAction)) {
+        let beforeSnapshot: Record<string, unknown> | undefined;
+        try {
+          const before = await dispatchReadAction("inspect", { compact: true, limit: 30 }, tabId, frameId);
+          if (before.success && before.data) {
+            beforeSnapshot = before.data as Record<string, unknown>;
+          }
+        } catch {
+          // Pre-inspect is best-effort; proceed even if it fails
+        }
+
+        // Execute the action
+        const result = await dispatchActAction(actAction as any, params, tabId, frameId);
+
+        // If action failed or didn't perform, skip post-inspect and diff
+        const actionStatus = result.status;
+        if (actionStatus !== "performed" && actionStatus !== "already_in_desired_state") {
+          return result;
+        }
+
+        // Post-inspect
+        let afterSnapshot: Record<string, unknown> | undefined;
+        try {
+          const after = await dispatchReadAction("inspect", { compact: true, limit: 30 }, tabId, frameId);
+          if (after.success && after.data) {
+            afterSnapshot = after.data as Record<string, unknown>;
+          }
+        } catch {
+          // Post-inspect is best-effort
+        }
+
+        // Compute diff if we have both snapshots
+        if (beforeSnapshot && afterSnapshot) {
+          try {
+            const diff = diffSnapshots(beforeSnapshot.anchors as any[], afterSnapshot.anchors as any[], {
+              urlBefore: beforeSnapshot.url as string,
+              urlAfter: afterSnapshot.url as string,
+              titleBefore: beforeSnapshot.title as string,
+              titleAfter: afterSnapshot.title as string,
+              documentIdBefore: beforeSnapshot.documentId as string,
+              documentIdAfter: afterSnapshot.documentId as string,
+            });
+            result.data = {
+              ...(result.data ?? {}),
+              diff,
+            };
+          } catch {
+            // Diff is best-effort
+          }
+        }
+
+        return result;
+      }
+
+      return dispatchActAction(actAction as any, params, tabId, frameId);
     }
 
     case "page.js": {
@@ -207,8 +272,9 @@ async function execute(tool: string, params: Record<string, unknown>): Promise<u
 
       const result: Record<string, unknown> = { tabId, navigated: true, url, wait_until: waitUntil, elapsed_ms: Date.now() - startTime };
 
-      // Optional snapshot — run compact inspect after navigation and attach anchors
-      if (params.snapshot && tabId) {
+      // Optional snapshot — in sync mode, always run compact inspect after navigation
+      const needsSnapshot = params.snapshot || commandMode === "sync";
+      if (needsSnapshot && tabId) {
         try {
           const snapshotResult = await dispatchReadAction("inspect", { compact: true, limit: 30 }, tabId);
           if (snapshotResult.success && snapshotResult.data) {

@@ -30,6 +30,9 @@ const DEFAULT_CONFIG: ServerConfig = {
     maxDepth: 50,
     defaultTimeoutMs: 120_000,
   },
+  execution: {
+    commandMode: "sync",
+  },
   browsers: {},
   auth: {
     apiKey: "",
@@ -69,6 +72,7 @@ export function loadConfig(): ServerConfig {
     ws: { ...DEFAULT_CONFIG.ws, ...parsed.ws },
     gates: { ...DEFAULT_CONFIG.gates, ...parsed.gates },
     queue: { ...DEFAULT_CONFIG.queue, ...parsed.queue },
+    execution: { ...DEFAULT_CONFIG.execution, ...parsed.execution },
     auth: { ...DEFAULT_CONFIG.auth, ...parsed.auth },
   };
 

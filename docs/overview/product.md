@@ -28,6 +28,7 @@ Instead of ephemeral, headless browser automation (Playwright, Puppeteer, Seleni
 | **Multi-browser** | Connect any number of browsers (Chrome, Firefox, etc.) to one core. Each is an independent identity. |
 | **Permission gates** | Per-browser permissions with simple global controls for browser powers and site-pattern controls for page powers. Users can allow, ask, or deny agents. |
 | **MCP-first** | Full Model Context Protocol server — agents in Claude Desktop, Cursor, and any MCP client can command your browsers directly. |
+| **Sync & Async modes** | Per-browser execution mode: sync returns rich results with auto-snapshot and post-action diffs in one call; async is fire-and-forget with deferred result polling. |
 | **REST API** | HTTP endpoints for browser management and tool execution — integrate from any language. |
 | **CLI** | `browserpowers list`, `navigate`, `screenshot`, `content` — scriptable from your terminal. |
 | **Shared brain** | Agent presets, system prompts, skills, and MCP definitions live on the core. Browsers just toggle what they enable locally. |

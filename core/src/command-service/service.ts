@@ -145,6 +145,71 @@ class CommandServiceImpl implements CommandService {
     }
   }
 
+  async executeAsync(
+    browserId: string,
+    tool: string,
+    params: Record<string, unknown>,
+  ): Promise<{ requestId: string }> {
+    const browser = registry.get(browserId);
+    if (!browser) {
+      throw new Error(`Browser "${browserId}" not found`);
+    }
+
+    // Gate check
+    const gate = checkGate(browser.permissions, tool);
+    if (gate.mode === "deny") {
+      throw new Error(`Gate: ${gate.reason} (mode: ${gate.mode})`);
+    }
+    // "ask" gates require user interaction — cannot be handled asynchronously
+    if (gate.mode === "ask") {
+      throw new Error(`Gate: Tool "${tool}" requires user approval — async mode does not support approval-gated tools. Use sync mode.`);
+    }
+
+    // Capability check
+    const cap = browser.capabilities.find((c: { tool: string }) => c.tool === tool);
+    if (!cap) {
+      throw new Error(`Tool "${tool}" not in browser's capabilities`);
+    }
+
+    // Enqueue request — fire-and-forget
+    const { loadConfig } = await import("../config.js");
+    const config = loadConfig();
+    const rawTimeout = (params.timeout_ms as number) ?? config.queue.defaultTimeoutMs ?? 120_000;
+    const timeoutMs = Math.max(1_000, Math.min(rawTimeout, 300_000));
+    const { timeout_ms, ...cleanParams } = params as Record<string, unknown>;
+
+    const { requestId, promise } = registry.enqueue(browserId, tool, cleanParams, timeoutMs);
+
+    const { tryDrain } = await import("../ws-server.js");
+    tryDrain(browserId);
+
+    // Fire and forget — the promise resolves/rejects and stores the result via registry
+    promise.then(
+      () => {},
+      () => {},
+    );
+
+    return { requestId };
+  }
+
+  async getResult(requestId: string): Promise<{ status: "pending" | "complete" | "error"; result?: ToolResult }> {
+    // Check if request is still pending (in-flight)
+    // The registry stores results only after completion — if it's not in completedResults,
+    // check if it's still in pendingRequests
+    const completed = registry.getResult(requestId);
+    if (completed) {
+      return {
+        status: completed.success ? "complete" : "error",
+        result: completed,
+      };
+    }
+
+    // Not in completed results — could be pending or unknown
+    // We don't have a direct "is pending" check, so we return pending
+    // (the caller can retry; if it's truly unknown, the 5min window will expire)
+    return { status: "pending" };
+  }
+
   async executeAll(
     tool: string,
     params: Record<string, unknown>,

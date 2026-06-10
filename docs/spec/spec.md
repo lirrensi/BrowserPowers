@@ -1550,3 +1550,78 @@ The browser extension includes an optional API Key field in its settings UI unde
 4. User enters the API key in the extension settings
 5. Extension reconnects with the key included in the `register` payload
 6. Core validates the key and proceeds with normal registration
+
+---
+
+### 10. Execution Modes
+
+#### 10.1 Overview
+
+Every browser has a `commandMode` setting: `sync` (default) or `async`. This determines how tool execution results are delivered to callers. The mode is set per-browser in the config (`execution.commandMode`) and can be overridden per-request via the `mode` parameter on MCP tools or the `--async` flag on the CLI.
+
+#### 10.2 Synchronous Mode (Default)
+
+In synchronous mode, tool execution blocks until the result is received from the browser extension:
+
+```
+Caller → execute(browserId, tool, params) → wait → ToolResult
+```
+
+The caller receives the full result in a single response. Additionally, sync mode enriches certain operations:
+
+- **Navigate**: After navigation completes, a compact page inspect is automatically run and the snapshot (URL, title, anchors) is included in the response. No separate `snapshot` flag is needed.
+- **Page Act**: For mutation actions (click, fill, check, select_option, press, scroll, submit, type, smart_click, fill_form, drag, dblclick, hover), the system captures a before/after inspect snapshot, computes a diff by semantic element identity, and includes the diff in the response. The diff shows what anchors were added, removed, or changed (visibility, enabled state, text, etc.) — giving the agent immediate feedback on what the action did to the page.
+
+Sync mode is the recommended mode for MCP agents because it minimizes round-trips: one call, one rich response.
+
+#### 10.3 Asynchronous Mode
+
+In asynchronous mode, tool execution is fire-and-forget:
+
+```
+Caller → executeAsync(browserId, tool, params) → { requestId }
+Caller → getResult(requestId) → { status: "pending" | "complete" | "error", result? }
+```
+
+The `executeAsync` method enqueues the request and returns immediately with a `requestId`. The caller can poll `getResult(requestId)` at any time. Completed results are held for 5 minutes, then auto-purged.
+
+Async mode is useful for:
+- CLI scripting where you don't want to block the terminal
+- Long-running operations where the caller wants to do other work
+- Batch operations where you fire many commands and collect results later
+
+**Limitation**: Async mode rejects tools gated with `ask` permission — user approval cannot be handled asynchronously.
+
+#### 10.4 Interface Support
+
+| Interface | Sync | Async |
+|---|---|---|
+| MCP | Default. Add `mode: "async"` to any tool call. | Returns `⏳ Queued as <requestId>. Poll GET /api/results/<requestId>`. |
+| REST | `POST /browsers/:id/execute` | `POST /browsers/:id/execute-async` → `GET /results/:requestId` |
+| CLI | Default for all commands. | `--async` global flag on all commands. |
+| WebSocket | `execute` message includes `commandMode` field. | Extension does not distinguish — always executes and returns result; mode only affects how core delivers to caller. |
+
+#### 10.5 Auto-Snapshot and Post-Action Diff (Sync Mode Only)
+
+**Navigate auto-snapshot**: When `commandMode` is `sync`, `tabs.navigate` automatically runs a compact inspect (limit=30 elements) after page load completes. The response includes `{ tabId, navigated, url, elapsed_ms, snapshot: { url, title, documentId, anchors: [...] } }`. The manual `snapshot` parameter is still accepted but redundant.
+
+**Post-action diff**: When `commandMode` is `sync`, mutation actions in `page.act` capture the page state before and after the action, then compute a diff:
+
+```json
+{
+  "diff": {
+    "urlChanged": false,
+    "titleChanged": false,
+    "documentIdChanged": false,
+    "anchorsAdded": [{ "role": "alert", "name": "Success", ... }],
+    "anchorsRemoved": [],
+    "anchorsChanged": [
+      { "key": "button|Submit|button|Submit", "changes": { "enabled": { "from": true, "to": false } } }
+    ]
+  }
+}
+```
+
+Elements are matched across snapshots by **semantic key**: `${role ?? tag}|${name ?? ""}|${tag}|${text ?? ""}`. This survives page mutations that change DOM structure or CSS paths as long as the semantic identity remains stable. The diff detects field-level changes: `visible`, `enabled`, `checked`, `selected`, and `text`.
+
+Non-mutation actions (`wait_for`, `dialog_override`, `dialog_respond`, `upload`) skip the diff. Failed actions skip the post-inspect entirely.
