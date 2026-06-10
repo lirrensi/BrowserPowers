@@ -1,3 +1,14 @@
+---
+node_type: adr
+title: "ADR-001 — Page Interaction API v2"
+status: active
+updated: 2026-06-11
+tags: [adr, api-design, page-interaction, mcp, agent-operability]
+links:
+  depends_on: [../../overview/product.md, ../../spec/spec.md]
+  part_of: [../INDEX.md]
+---
+
 # ADR-001 — Page Interaction API v2
 
 ## Status

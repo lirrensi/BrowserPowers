@@ -1,4 +1,16 @@
+---
+node_type: index
+title: BrowserPowers — Architecture Index (old format)
+status: deprecated
+updated: 2026-06-11
+tags: [architecture, deprecated]
+links:
+  supersedes: [../architecture/INDEX.md]
+---
+
 # BrowserPowers — Architecture Index
+
+> **DEPRECATED**: This document is preserved for history. The current version lives at [docs/architecture/INDEX.md](../architecture/INDEX.md).
 
 ## Overview
 

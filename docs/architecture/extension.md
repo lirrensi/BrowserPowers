@@ -1,3 +1,15 @@
+---
+node_type: architecture
+title: BrowserPowers — Browser Extension Architecture
+status: active
+updated: 2026-06-11
+tags: [extension, architecture, wxt, mv3, chrome-extension]
+links:
+  depends_on: [../overview/product.md, ../spec/spec.md]
+  documents: [../../extension/]
+  implemented_by: [../../extension/src/]
+---
+
 # BrowserPowers — Browser Extension Architecture
 
 ## Overview

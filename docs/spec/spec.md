@@ -1,3 +1,14 @@
+---
+node_type: spec
+title: BrowserPowers — Behavioral Specification
+status: active
+updated: 2026-06-11
+tags: [spec, websocket, mcp, rest-api, cli, permissions, configuration, auth]
+links:
+  depends_on: [../overview/product.md, ../reference/glossary.md]
+  implemented_by: [../../core/src/, ../../extension/src/]
+---
+
 # BrowserPowers — Behavioral Specification
 
 ## Abstract

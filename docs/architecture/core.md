@@ -1,3 +1,15 @@
+---
+node_type: architecture
+title: BrowserPowers — Core Server Architecture
+status: active
+updated: 2026-06-11
+tags: [core, architecture, nodejs, hono, websocket]
+links:
+  depends_on: [../overview/product.md, ../spec/spec.md]
+  documents: [../../core/]
+  implemented_by: [../../core/src/]
+---
+
 # BrowserPowers — Core Server Architecture
 
 ## Overview

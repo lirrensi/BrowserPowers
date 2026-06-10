@@ -1,3 +1,14 @@
+---
+node_type: overview
+title: BrowserPowers — Product Overview
+status: active
+updated: 2026-06-11
+tags: [product, overview, browser-automation, ai-agents]
+links:
+  documents: [../../core/, ../../extension/]
+  depends_on: [../reference/glossary.md]
+---
+
 # BrowserPowers — Product Overview
 
 ## Overview
@@ -115,8 +126,8 @@ browserpowers exec-all screenshots.capture
 │       └──────┬──────┘                             │
 └──────────────┼────────────────────────────────────┘
                │  WebSocket (JSON)
-     ┌─────────┼──────────┐
-     │         │          │
+      ┌─────────┼──────────┐
+      │         │          │
 ┌────▼───┐ ┌──▼────┐ ┌──▼────┐
 │ Chrome │ │Firefox│ │ Safari│ ...
 │ Ext.   │ │ Ext.  │ │ Ext.  │
