@@ -306,7 +306,10 @@ export function inspectElements(
   }
 
   const collected: Array<Record<string, unknown>> = [];
-  walkElements(document.body || document.documentElement, collected);
+  const rootEl = document.body ?? document.documentElement;
+  if (rootEl) {
+    walkElements(rootEl, collected);
+  }
 
   const iframes = document.querySelectorAll<HTMLIFrameElement>("iframe");
   for (let fi = 0; fi < iframes.length; fi++) {

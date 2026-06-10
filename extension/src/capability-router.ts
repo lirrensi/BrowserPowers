@@ -119,6 +119,41 @@ export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> 
   }
 }
 
+/** Resolve frame_url or frame_name to a numeric frameId by querying the content script. */
+async function resolveFrameId(tabId: number, params: Record<string, unknown>): Promise<number | undefined> {
+  const frameUrl = params.frame_url as string | undefined;
+  const frameName = params.frame_name as string | undefined;
+  if (!frameUrl && !frameName) return params.frameId as number | undefined;
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      source: "browserpowers",
+      type: "bp:read",
+      action: "frames",
+      params: {},
+    }) as Record<string, unknown>;
+
+    const frames = (response?.frames as Array<Record<string, unknown>>) ?? [];
+    for (const frame of frames) {
+      if (frameUrl && typeof frame.src === "string" && frame.src.includes(frameUrl)) {
+        return frame.index as number;
+      }
+      if (frameName && frame.name === frameName) {
+        return frame.index as number;
+      }
+    }
+    return params.frameId as number | undefined;
+  } catch {
+    return params.frameId as number | undefined;
+  }
+}
+
+/** Strip frame_url/frame_name from params (resolved to frameId above, no longer needed downstream). */
+function stripFrameParams(p: Record<string, unknown>): Record<string, unknown> {
+  const { frame_url: _fu, frame_name: _fn, ...rest } = p as Record<string, unknown>;
+  return rest;
+}
+
 async function execute(tool: string, params: Record<string, unknown>, commandMode: "sync" | "async"): Promise<unknown> {
   switch (tool) {
     // ══════════════════════════════════════════
@@ -127,14 +162,16 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
 
     case "page.read": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
-      const frameId = params.frameId as number | undefined;
-      return dispatchReadAction(params.action as any, params, tabId, frameId);
+      const frameId = await resolveFrameId(tabId, params);
+      const cleanParams = stripFrameParams(params);
+      return dispatchReadAction(cleanParams.action as any, cleanParams, tabId, frameId);
     }
 
     case "page.act": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
-      const frameId = params.frameId as number | undefined;
-      const actAction = params.action as string;
+      const frameId = await resolveFrameId(tabId, params);
+      const cleanParams = stripFrameParams(params);
+      const actAction = cleanParams.action as string;
 
       // In sync mode: capture pre/post inspect snapshots for mutation actions
       if (commandMode === "sync" && MUTATION_ACTIONS.has(actAction)) {
@@ -149,7 +186,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         }
 
         // Execute the action
-        const result = await dispatchActAction(actAction as any, params, tabId, frameId);
+        const result = await dispatchActAction(actAction as any, cleanParams, tabId, frameId);
 
         // If action failed or didn't perform, skip post-inspect and diff
         const actionStatus = result.status;
@@ -191,13 +228,14 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         return result;
       }
 
-      return dispatchActAction(actAction as any, params, tabId, frameId);
+      return dispatchActAction(actAction as any, cleanParams, tabId, frameId);
     }
 
     case "page.js": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
-      const frameId = params.frameId as number | undefined;
-      return dispatchJsAction(params.code as string, tabId, frameId);
+      const frameId = await resolveFrameId(tabId, params);
+      const cleanParams = stripFrameParams(params);
+      return dispatchJsAction(cleanParams.code as string, tabId, frameId);
     }
 
     // ══════════════════════════════════════════
@@ -212,7 +250,9 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         console.warn(`[bp-ext] tabs.list limit ${limit} exceeds max ${MAX_TABS}, capping`);
         limit = MAX_TABS;
       }
-      const results = await chrome.tabs.query(params as chrome.tabs.QueryInfo);
+      // Strip non-QueryInfo fields (limit, offset) before passing to Chrome API
+      const { limit: _skipL, offset: _skipO, ...queryInfo } = params as Record<string, unknown>;
+      const results = await chrome.tabs.query(queryInfo as unknown as chrome.tabs.QueryInfo);
       const totalCount = results.length;
       const sliced = results.slice(offset, offset + limit);
       return {

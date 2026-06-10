@@ -14,6 +14,7 @@ const mockConfig = {
   ws: { path: "/ws", heartbeatIntervalMs: 30_000 },
   gates: { defaultPermission: "ask" as const, approvalTimeoutMs: 60_000 },
   queue: { maxDepth: 50, defaultTimeoutMs: 120_000 },
+  execution: { commandMode: "sync" as const },
   browsers: {} as Record<string, unknown>,
   auth: { apiKey: "" },
 };

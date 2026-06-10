@@ -78,6 +78,8 @@ const pageReadSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
   frameId: z.number().optional(),
+  frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
+  frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
   action: z.enum(["inspect", "content", "text", "html", "attr", "meta", "forms", "count", "select", "summary", "generate_selector"]),
   target: targetSchema.optional(),
   limit: z.number().optional(),
@@ -94,6 +96,8 @@ const pageActSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
   frameId: z.number().optional(),
+  frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
+  frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
   action: z.enum(["click", "fill", "check", "select_option", "press", "scroll", "submit", "wait_for", "type", "smart_click", "fill_form", "upload", "drag", "dblclick", "hover", "dialog_override", "dialog_respond"]),
   target: targetSchema.optional(),
   anchor: z.string().optional(),
@@ -133,6 +137,8 @@ const pageJsSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
   frameId: z.number().optional(),
+  frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
+  frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
   code: z.string(),
   timeout_ms: z.number().optional(),
   mode: z.enum(["sync", "async"]).optional(),
@@ -343,8 +349,6 @@ function formatBrowserList(browsers: unknown, summary = false): string {
     const parts: string[] = [`id: ${b.id ?? "?"}`, `name: ${b.name ?? "?"}`];
     if (capList) parts.push(`capabilities: ${capList}`);
     if (typeof b.lastHeartbeat === "number") parts.push(`connected: ${Date.now() - b.lastHeartbeat}ms`);
-    if (b.activeTabUrl) parts.push(`activeTab: ${b.activeTabUrl}`);
-    if (b.status) parts.push(`status: ${b.status}`);
     return parts.join(" | ");
   }).join("\n");
 }
@@ -507,6 +511,8 @@ function generateToolHelp(toolName: string): string {
       "- `browser_id` (string, optional) — Target browser ID (provide this or browser_name)",
       "- `browser_name` (string, optional) — Target browser name (provide this or browser_id)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
+      "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
+      "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
       "- `action` (enum, required) — What to read: inspect, content, text, html, attr, meta, forms, count, select, summary, generate_selector",
       "- `target` (object, optional) — Structured target describing what to read:",
       "  - `text` (string) — Visible text to match (recommended primary targeting method)",
@@ -591,6 +597,8 @@ function generateToolHelp(toolName: string): string {
       "- `browser_id` (string, optional) — Target browser ID (provide this or browser_name)",
       "- `browser_name` (string, optional) — Target browser name (provide this or browser_id)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
+      "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
+      "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
       "- `action` (enum, required) — Action to perform: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond",
       "- `target` (object, optional) — Element selector: prefer `{ text: \"visible label\" }` for stable targeting",
       "  - `text` (string) — Visible text to match (recommended primary targeting method)",
@@ -634,6 +642,8 @@ function generateToolHelp(toolName: string): string {
       "- `browser_id` (string, optional) — Target browser ID (provide this or browser_name)",
       "- `browser_name` (string, optional) — Target browser name (provide this or browser_id)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
+      "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
+      "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
       "- `code` (string, required) — JavaScript code to execute (must return JSON-serializable value)",
       "- `timeout_ms` (number, optional) — Max wait time in ms (default 120000)",
       "",

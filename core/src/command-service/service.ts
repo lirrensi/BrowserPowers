@@ -43,11 +43,13 @@ class CommandServiceImpl implements CommandService {
       };
     }
 
+    // Load config once — used for approval timeout and queue timeout
+    const { loadConfig } = await import("../config.js");
+    const config = loadConfig();
+
     // If gate is "ask", enter approval flow
     if (gate.mode === "ask") {
       const requestId = `${browserId}:approval:${randomUUID()}`;
-      const { loadConfig } = await import("../config.js");
-      const config = loadConfig();
       const description = `Agent wants to run "${tool}" with params: ${JSON.stringify(params)}`;
       const approvalTimeoutMs = config.gates.approvalTimeoutMs ?? 60_000;
 
@@ -113,8 +115,6 @@ class CommandServiceImpl implements CommandService {
     }
 
     // Enqueue request — will be drained by ws-server when browser is ready
-    const { loadConfig } = await import("../config.js");
-    const config = loadConfig();
     const rawTimeout = (params.timeout_ms as number) ?? config.queue.defaultTimeoutMs ?? 120_000;
     // Clamp timeout to reasonable bounds (1s – 5min) to prevent abuse:
     //   timeout_ms=0  → instant timeout (DoS),

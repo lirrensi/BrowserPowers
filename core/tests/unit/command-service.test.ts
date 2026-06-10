@@ -12,7 +12,10 @@ vi.mock("../../src/config.js", () => ({
     rest: { enabled: true, path: "/api" },
     ws: { path: "/ws", heartbeatIntervalMs: 30_000 },
     gates: { defaultPermission: "ask", approvalTimeoutMs: 1000 },
+    queue: { maxDepth: 100, defaultTimeoutMs: 120_000 },
+    execution: { commandMode: "sync" },
     browsers: {},
+    auth: { apiKey: "" },
   }),
 }));
 

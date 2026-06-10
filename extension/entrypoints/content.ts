@@ -217,50 +217,62 @@ async function handleAct(
 ): Promise<Record<string, unknown>> {
   await ensureReady();
 
-  // Resolve element from anchor/selector or target
-  const resolveEl = (): Element | null => {
-    // Fast path: explicit selector from anchor
-    const sel = params.selector as string | undefined;
-    if (sel) {
-      return document.querySelector(sel);
-    }
-    // Target path: resolve via structured target
-    const target = params.target as Target | undefined;
-    if (target) {
-      const resolution = resolveTarget(target);
-      if (resolution.found && resolution.element) {
-        return resolution.element;
+  /** Try to resolve the element, with a short poll for lazy-loaded content */
+  const resolveEl = async (): Promise<Element | null> => {
+    const attempt = (): Element | null => {
+      const sel = params.selector as string | undefined;
+      if (sel) {
+        const resolution = resolveTarget({ css: sel });
+        return resolution.found ? (resolution.element ?? null) : null;
+      }
+      const target = params.target as Target | undefined;
+      if (target) {
+        const resolution = resolveTarget(target);
+        if (resolution.found && resolution.element) return resolution.element;
       }
       return null;
+    };
+
+    // Try immediately
+    const immediate = attempt();
+    if (immediate) return immediate;
+
+    // Poll briefly (500ms) for dynamically loaded elements
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      const result = attempt();
+      if (result) return result;
     }
+
     return null;
   };
 
   switch (action) {
     case "click": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return clickElement(el);
     }
     case "fill": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       const value = params.value as string;
       if (value === undefined) return { success: false, message: "No value provided" };
       return fillElement(el, value);
     }
     case "check": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return checkElement(el, params.checked as boolean | undefined);
     }
     case "select_option": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return selectOption(el, params.value as string | undefined, params.label as string | undefined);
     }
     case "press": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return pressKeys(el, params.key as string, params.keys as string[] | undefined);
     }
@@ -268,18 +280,18 @@ async function handleAct(
       const direction = (params.direction as string) || "down";
       const amount = params.amount as number | undefined;
       if (direction === "to_element") {
-        const el = resolveEl();
+        const el = await resolveEl();
         return scrollElement(el, direction, amount);
       }
       return scrollElement(null, direction, amount);
     }
     case "submit": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return submitForm(el);
     }
     case "type": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       const text = (params.text as string) ?? (params.value as string);
       const delay = (params.delay as number) ?? 30;
@@ -289,7 +301,7 @@ async function handleAct(
     case "smart_click": {
       const target = params.target as Target | undefined;
       if (!target) return { success: false, message: "Smart click requires a target" };
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return clickElement(el);
     }
@@ -301,7 +313,7 @@ async function handleAct(
       return fillFormFields(fields);
     }
     case "upload": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return uploadFile(
         el,
@@ -311,17 +323,17 @@ async function handleAct(
       );
     }
     case "drag": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return dragElement(el, params.x as number | undefined, params.y as number | undefined);
     }
     case "dblclick": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return dblclickElement(el);
     }
     case "hover": {
-      const el = resolveEl();
+      const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return hoverElement(el);
     }

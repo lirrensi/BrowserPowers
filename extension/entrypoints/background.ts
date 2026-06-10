@@ -44,7 +44,12 @@ async function processNextMessage(): Promise<void> {
   try {
     while (messageQueue.length > 0) {
       const msg = messageQueue.shift()!;
-      await handleCoreMessage(msg);
+      try {
+        await handleCoreMessage(msg);
+      } catch (err) {
+        console.error(`[bp-ext] Error handling core message (${msg?.type ?? "unknown"}):`, (err as Error).message);
+        // Continue processing remaining messages — don't let one bad message deadlock the queue
+      }
     }
   } finally {
     processingMessage = false;
@@ -189,9 +194,12 @@ function init(): void {
   });
 
   // Update onMessage to use FIFO queue
-  onMessage(async (msg: any) => {
+  onMessage((msg: any) => {
     messageQueue.push(msg);
-    processNextMessage();
+    // Fire-and-forget: processNextMessage handles its own errors internally
+    processNextMessage().catch((err) => {
+      console.error("[bp-ext] processNextMessage unexpected rejection:", (err as Error).message);
+    });
   });
 
   // Reconnect when storage changes (user updated settings in popup)
