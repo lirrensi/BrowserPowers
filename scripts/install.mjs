@@ -4,12 +4,16 @@
  * BrowserPowers — One-shot install / update / uninstall.
  *
  * Copies everything to ~/.browserpowers/, installs dependencies,
- * builds the extension, puts CLI on PATH, starts daemon via PM2.
+ * builds the extension, puts CLI on PATH, sets up native auto-start.
+ *
+ * Auto-start uses native OS mechanisms (no external process manager):
+ *   Windows  — Scheduled Task (schtasks)
+ *   macOS    — launchd user agent
+ *   Linux    — systemd user service
  *
  * Prerequisites (script checks these & tells you how to install):
  *   - Node.js >= 18
  *   - pnpm >= 9 (globally)
- *   - PM2 (globally)
  *   - tsx (globally)
  *
  * Usage:
@@ -27,7 +31,7 @@ const IS_LINUX = !IS_WIN && !IS_MAC;
 
 // ── Imports ─────────────────────────────────────────────
 
-import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, chmodSync, unlinkSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { resolve, relative, sep } from "node:path";
@@ -157,6 +161,279 @@ function binName(base) {
   return IS_WIN ? `${base}.cmd` : base;
 }
 
+// ── Native service lifecycle (no external process manager) ──
+
+/**
+ * Stop the running service. Safe to call even if not running.
+ * Used before reinstall (to release file handles) and before uninstall.
+ */
+function stopService() {
+  if (IS_WIN) {
+    // Clean up any leftover PM2-managed instance from a previous install
+    try {
+      execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 });
+    } catch { /* PM2 not installed or process not managed */ }
+
+    // Stop the scheduled task instance (if we created one)
+    try {
+      execSync('schtasks /end /tn "BrowserPowers"', { stdio: "pipe", timeout: 8000 });
+    } catch { /* not running */ }
+
+    // Kill whatever process is on port 4199 (BrowserPowers server port).
+    // This is deterministic — command-line filtering would miss PM2-managed
+    // processes where "browserpowers" only appears in the working directory.
+    try {
+      execSync(
+        `powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 4199 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -First 1; if ($p) { Stop-Process -Id $p -Force }"`,
+        { stdio: "pipe", timeout: 8000 }
+      );
+    } catch { /* no listener */ }
+
+    // Verify port is actually free before proceeding
+    let tries = 0;
+    while (tries < 10) {
+      try {
+        const r = execSync(
+          `powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort 4199 -ErrorAction SilentlyContinue).Count"`,
+          { stdio: "pipe", encoding: "utf-8", timeout: 5000 }
+        );
+        if (r.trim() === "0") break;
+      } catch { break; }
+      try { execSync("powershell -NoProfile -Command Start-Sleep -Milliseconds 500", { stdio: "pipe" }); } catch {}
+      tries++;
+    }
+  } else if (IS_LINUX) {
+    // Clean up leftover PM2-managed instance
+    try { execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 }); } catch {}
+    tryRun("systemctl --user stop browserpowers.service", { timeout: 10000 });
+  } else if (IS_MAC) {
+    try { execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 }); } catch {}
+    try {
+      const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
+      execSync(`launchctl bootout gui/${uid}/com.browserpowers`, { stdio: "pipe", timeout: 8000 });
+    } catch { /* not running */ }
+  }
+}
+
+/**
+ * Remove the service configuration. Called during uninstall.
+ * Stops the service first, then removes the OS-level config.
+ */
+function removeService() {
+  if (IS_WIN) {
+    try { execSync('schtasks /end /tn "BrowserPowers"', { stdio: "pipe", timeout: 5000 }); } catch {}
+    try { execSync('schtasks /delete /tn "BrowserPowers" /f', { stdio: "pipe", timeout: 10000 }); } catch {}
+    // Also clean up Startup folder fallback
+    const startupDir = resolve(
+      process.env.APPDATA || resolve(homedir(), "AppData", "Roaming"),
+      "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+    );
+    const startupScript = resolve(startupDir, "BrowserPowers.cmd");
+    try { unlinkSync(startupScript); } catch { /* not found */ }
+  } else if (IS_LINUX) {
+    tryRun("systemctl --user stop browserpowers.service", { timeout: 5000 });
+    tryRun("systemctl --user disable browserpowers.service", { timeout: 5000 });
+    const unitPath = resolve(homedir(), ".config", "systemd", "user", "browserpowers.service");
+    try { unlinkSync(unitPath); } catch { /* not found */ }
+  } else if (IS_MAC) {
+    try {
+      const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
+      execSync(`launchctl bootout gui/${uid}/com.browserpowers`, { stdio: "pipe", timeout: 5000 });
+    } catch { /* not running */ }
+    const plistPath = resolve(homedir(), "Library", "LaunchAgents", "com.browserpowers.plist");
+    try { unlinkSync(plistPath); } catch { /* not found */ }
+  }
+}
+
+// ── Windows: Scheduled Task ─────────────────────────────
+
+function createWindowsService() {
+  const taskName = "BrowserPowers";
+  const cmdPath = resolve(BP_BIN, "browserpowers.cmd");
+
+  // Remove any stale scheduled task
+  try { execSync(`schtasks /end /tn "${taskName}"`, { stdio: "pipe", timeout: 5000 }); } catch {}
+  try { execSync(`schtasks /delete /tn "${taskName}" /f`, { stdio: "pipe", timeout: 5000 }); } catch {}
+
+  // Try scheduled task first (may need admin)
+  const trValue = cmdPath.includes(" ")
+    ? `cmd.exe /c ""${cmdPath}" serve"`
+    : `"${cmdPath}" serve`;
+
+  const schResult = tryRun(
+    `schtasks /create /tn "${taskName}" /tr ${trValue} /sc onlogon /rl highest /f`,
+    { timeout: 15000 }
+  );
+
+  if (schResult && schResult.error) {
+    // Fallback: Startup folder (no admin required, works for all users)
+    const msg = (schResult.message || "").toLowerCase();
+    if (msg.includes("access") || msg.includes("denied")) {
+      log("  schtasks requires admin — using Startup folder instead.");
+    } else {
+      log(`  ${yellow("⚠ Scheduled task unavailable:")} ${schResult.message.slice(0, 80)}`);
+      log("  Falling back to Startup folder.");
+    }
+
+    const startupDir = resolve(
+      process.env.APPDATA || resolve(homedir(), "AppData", "Roaming"),
+      "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+    );
+    mkdirSync(startupDir, { recursive: true });
+    const startupScript = resolve(startupDir, "BrowserPowers.cmd");
+    const content = [
+      "@echo off",
+      `start "" /B "${cmdPath}" serve`,
+    ].join("\r\n");
+    writeFileSync(startupScript, content, "utf-8");
+    log(`  ${startupScript}`);
+    log("  Startup folder entry created (auto-start at logon).");
+
+    // Start immediately
+    try {
+      execSync(`start "" /B "${cmdPath}" serve`, { stdio: "pipe", timeout: 5000, shell: "cmd.exe" });
+      log("  Service started.");
+    } catch {
+      log(`  ${yellow("  Start manually: browserpowers serve")}`);
+    }
+    return true;
+  }
+
+  log("  Scheduled task created (auto-start at logon).");
+
+  // Start immediately so the user doesn't have to wait for next logon
+  const runResult = tryRun(`schtasks /run /tn "${taskName}"`, { timeout: 10000 });
+  if (runResult && runResult.error) {
+    log(`  ${yellow("  Will start automatically at next logon.")}`);
+  } else {
+    log("  Service started.");
+  }
+
+  return true;
+}
+
+// ── Linux: systemd user service ─────────────────────────
+
+function createLinuxService() {
+  const unitDir = resolve(homedir(), ".config", "systemd", "user");
+  mkdirSync(unitDir, { recursive: true });
+
+  const binPath = resolve(BP_BIN, "browserpowers");
+  const unitPath = resolve(unitDir, "browserpowers.service");
+
+  const unit = `[Unit]
+Description=BrowserPowers Multi-Browser Agent Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${binPath} serve
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
+`;
+
+  writeFileSync(unitPath, unit, "utf-8");
+  log(`  ${unitPath}`);
+
+  // Reload, enable, and start
+  const reload = tryRun("systemctl --user daemon-reload", { timeout: 10000 });
+  if (reload && reload.error) {
+    log(`  ${yellow("⚠ systemd not available. The service unit file has been created.")}`);
+    log(`  ${yellow("  Run manually when ready:")}`);
+    log(`  ${yellow("    systemctl --user daemon-reload")}`);
+    log(`  ${yellow("    systemctl --user enable browserpowers.service")}`);
+    log(`  ${yellow("    systemctl --user start browserpowers.service")}`);
+    return false;
+  }
+
+  const enable = tryRun("systemctl --user enable browserpowers.service", { timeout: 10000 });
+  if (enable && enable.error) {
+    log(`  ${yellow("  Service unit created but enable step had issues.")}`);
+    log(`  ${yellow("  Run: systemctl --user enable browserpowers.service")}`);
+  }
+
+  const start = tryRun("systemctl --user start browserpowers.service", { timeout: 15000 });
+  if (start && start.error) {
+    log(`  ${yellow("⚠ Service unit created but could not start.")}`);
+    log(`  ${yellow("  Run: systemctl --user start browserpowers.service")}`);
+    return false;
+  }
+
+  log("  systemd service enabled and started.");
+  return true;
+}
+
+// ── macOS: launchd user agent ───────────────────────────
+
+function createMacService() {
+  const plistDir = resolve(homedir(), "Library", "LaunchAgents");
+  mkdirSync(plistDir, { recursive: true });
+
+  const binPath = resolve(BP_BIN, "browserpowers");
+  const logPath = resolve(BP_DIR, "core.log");
+  const plistPath = resolve(plistDir, "com.browserpowers.plist");
+
+  const plist = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '    <key>Label</key>',
+    '    <string>com.browserpowers</string>',
+    '    <key>ProgramArguments</key>',
+    '    <array>',
+    `        <string>${binPath}</string>`,
+    '        <string>serve</string>',
+    '    </array>',
+    '    <key>RunAtLoad</key>',
+    '    <true/>',
+    '    <key>KeepAlive</key>',
+    '    <true/>',
+    '    <key>StandardOutPath</key>',
+    `    <string>${logPath}</string>`,
+    '    <key>StandardErrorPath</key>',
+    `    <string>${logPath}</string>`,
+    '</dict>',
+    '</plist>',
+  ].join('\n');
+
+  writeFileSync(plistPath, plist, "utf-8");
+  log(`  ${plistPath}`);
+
+  // Load the agent (modern macOS: bootstrap, fallback: load)
+  try {
+    const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
+    tryRun(`launchctl bootstrap gui/${uid} "${plistPath}"`, { timeout: 10000 });
+  } catch {
+    const load = tryRun(`launchctl load "${plistPath}"`, { timeout: 10000 });
+    if (load && load.error) {
+      log(`  ${yellow("⚠ Could not load launchd agent.")}`);
+      log(`  ${yellow("  Run: launchctl load")} "${plistPath}"`);
+      return false;
+    }
+  }
+
+  log("  launchd agent loaded and started.");
+  return true;
+}
+
+// ── Service setup (platform dispatcher) ─────────────────
+
+function setupService() {
+  if (IS_WIN) {
+    return createWindowsService();
+  } else if (IS_MAC) {
+    return createMacService();
+  } else {
+    return createLinuxService();
+  }
+}
+
 // ── Prerequisite checks ─────────────────────────────────
 // ALL checks run first, collecting every failure.
 // The user gets a complete shopping list, not a whack-a-mole.
@@ -206,17 +483,7 @@ function checkPrerequisites() {
     }
   }
 
-  // ── 3. PM2 ──
-  const pm2Result = tryRun("pm2 --version", { cwd: REPO_DIR });
-  if (pm2Result && pm2Result.error) {
-    failures.push({
-      name: "PM2",
-      detail: "Not found — needed for daemon mode (auto-start on boot)",
-      install: "    pnpm add -g pm2",
-    });
-  }
-
-  // ── 4. tsx ──
+  // ── 3. tsx ──
   const tsxResult = tryRun("tsx --version", { cwd: REPO_DIR });
   if (tsxResult && tsxResult.error) {
     failures.push({
@@ -254,14 +521,6 @@ function copyFilter(src) {
   if (rel.includes("dist"))         return false;
   if (rel.endsWith("pnpm-lock.yaml")) return false;
   return true;
-}
-
-// ── Kill existing daemon ────────────────────────────────
-
-function killDaemon() {
-  try { execSync("pm2 delete browserpowers", { stdio: "pipe" }); } catch {
-    // not running — fine
-  }
 }
 
 // ── Create CLI wrappers ─────────────────────────────────
@@ -328,66 +587,6 @@ function writeCliWrappers(tsxCli, coreEntry) {
   log(`  ${mjsPath}`);
 }
 
-// ── Create PM2 ecosystem config ─────────────────────────
-
-function writeEcosystemConfig() {
-  const ecosystemPath = resolve(BP_DIR, "ecosystem.config.js");
-  // Escape backslashes for JavaScript strings (Windows paths)
-  const escapedCoreDir = BP_CORE.replace(/\\/g, "\\\\");
-  const content = [
-    "module.exports = {",
-    "  apps: [{",
-    "    name: 'browserpowers',",
-    "    script: 'src/index.ts',",
-    `    cwd: '${escapedCoreDir}',`,
-    "    interpreter: 'node',",
-    "    node_args: ['--import=tsx/esm'],",
-    IS_WIN ? "    windowsHide: true," : "    // windowsHide: only relevant on Windows",
-    "  }]",
-    "};",
-  ].join("\n");
-  writeFileSync(ecosystemPath, content, "utf-8");
-  log(`  ${ecosystemPath}`);
-  return ecosystemPath;
-}
-
-// ── Set up PM2 daemon ───────────────────────────────────
-
-function setupDaemon(ecosystemPath) {
-  // Start via PM2 ecosystem config
-  const startResult = tryRun(`pm2 start "${ecosystemPath}"`, { timeout: 15000 });
-  if (startResult && startResult.error) {
-    log(`  ${yellow("⚠ PM2 start failed:")} ${startResult.message.slice(0, 120)}`);
-    log(`  ${yellow("  Start manually:")} pm2 start "${ecosystemPath}"`);
-    return false;
-  }
-  log("  PM2 started.");
-
-  // Save process list
-  tryRun("pm2 save", { timeout: 10000 });
-  log("  PM2 process list saved.");
-
-  // Set up startup (auto-restart on boot)
-  const startupResult = tryRun("pm2 startup", { timeout: 15000 });
-  if (startupResult && startupResult.error) {
-    const msg = (startupResult.message || "").toLowerCase();
-    if (msg.includes("already") || msg.includes("not modified")) {
-      log("  PM2 startup already configured.");
-    } else if (msg.includes("permission") || msg.includes("denied") || msg.includes("sudo") || msg.includes("eacces")) {
-      log(`  ${yellow("⚠ PM2 startup needs sudo on this platform.")}`);
-      log(`  ${yellow("  Run manually:")} pm2 startup`);
-      if (IS_LINUX) log(`  ${yellow("  (you may need: sudo pm2 startup)")}`);
-    } else {
-      log(`  ${yellow("⚠ PM2 startup:")} ${startupResult.message.slice(0, 80)}`);
-      log(`  ${yellow("  Run manually if needed:")} pm2 startup`);
-    }
-  } else {
-    log("  PM2 startup configured (auto-restarts on boot).");
-  }
-
-  return true;
-}
-
 // ── Print done banner ───────────────────────────────────
 
 function printDone(version, extChrome, extFirefox) {
@@ -440,13 +639,21 @@ ${pathHint}
 
      node scripts/install.mjs --uninstall
 
-  ${bold("📊 PM2:")}
+  ${bold("📊 Service:")}
 
-     pm2 status                  Show all PM2 processes
-     pm2 logs browserpowers      Show daemon logs
-     pm2 stop browserpowers      Stop daemon
-     pm2 restart browserpowers   Restart daemon
-`);
+${IS_WIN ? `     browserpowers status                     Check service
+     schtasks /query /tn "BrowserPowers"    Check task (if admin)
+     taskkill /f /fi "imagename eq node.exe" /fi "windowtitle eq *browserpowers*"  Force stop` : IS_MAC ? `     launchctl list | grep browserpowers     Check service status
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browserpowers.plist  Start
+     launchctl bootout gui/$(id -u)/com.browserpowers    Stop
+     tail -f ~/.browserpowers/core.log          View logs` : `     systemctl --user status browserpowers    Check service status
+     systemctl --user stop browserpowers       Stop service
+     systemctl --user start browserpowers      Start service
+     journalctl --user -u browserpowers -f      View logs`}
+
+  ${bold("🔄 Auto-start:")}
+     The service will restart automatically on reboot.
+     To disable: run the uninstall script or remove the service manually.`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -468,9 +675,9 @@ function main() {
   // ── Gate 2: Handle --uninstall ──
   if (isUninstall) {
     console.log(`\n  ${bold("Uninstalling...")}\n`);
-    killDaemon();
-    try { execSync("pm2 unstartup", { stdio: "pipe" }); } catch { /* not set up */ }
-    if (existsSync(BP_DIR)) rmSync(BP_DIR, { recursive: true });
+    stopService();
+    removeService();
+    if (existsSync(BP_DIR)) rmSync(BP_DIR, { recursive: true, maxRetries: 5, retryDelay: 500 });
     console.log(`  Removed ${BP_DIR}\n`);
 
     if (IS_WIN) {
@@ -503,8 +710,8 @@ function main() {
     console.log(`\n  Installing ${green(repoPkg.version)} to ${BP_DIR}\n`);
   }
 
-  // ── Kill existing daemon before touching files ──
-  killDaemon();
+  // ── Stop existing service before touching files ──
+  stopService();
 
   // ── Step 1: Create directories ──
   step(1, "Creating directories");
@@ -515,7 +722,7 @@ function main() {
 
   // ── Step 2: Copy core ──
   step(2, "Copying core");
-  if (existsSync(BP_CORE)) rmSync(BP_CORE, { recursive: true });
+  if (existsSync(BP_CORE)) rmSync(BP_CORE, { recursive: true, maxRetries: 5, retryDelay: 500 });
   cpSync(resolve(REPO_DIR, "core"), BP_CORE, {
     recursive: true,
     filter: copyFilter,
@@ -534,8 +741,8 @@ function main() {
   const EXT_CHROME = BP_EXT;
   const EXT_FIREFOX = resolve(BP_DIR, "extension-firefox");
 
-  if (existsSync(EXT_TMP)) rmSync(EXT_TMP, { recursive: true });
-  if (existsSync(EXT_CHROME)) rmSync(EXT_CHROME, { recursive: true });
+  if (existsSync(EXT_TMP)) rmSync(EXT_TMP, { recursive: true, maxRetries: 3, retryDelay: 300 });
+  if (existsSync(EXT_CHROME)) rmSync(EXT_CHROME, { recursive: true, maxRetries: 3, retryDelay: 300 });
 
   cpSync(resolve(REPO_DIR, "extension"), EXT_TMP, {
     recursive: true,
@@ -565,7 +772,7 @@ function main() {
   }
 
   // Clean up temp
-  rmSync(EXT_TMP, { recursive: true });
+  rmSync(EXT_TMP, { recursive: true, maxRetries: 3, retryDelay: 300 });
   log("  Done.");
 
   // ── Step 5: Create CLI wrappers ──
@@ -598,15 +805,12 @@ function main() {
     console.log(`      source ${rc || "~/.profile"}`);
   }
 
-  // ── Step 6: Set up PM2 daemon ──
-  step(6, "Setting up PM2 daemon");
+  // ── Step 6: Set up auto-start service ──
+  step(6, "Setting up auto-start service");
 
-  const ecosystemPath = writeEcosystemConfig();
-
-  const daemonOk = setupDaemon(ecosystemPath);
-  if (!daemonOk) {
-    log(`  ${yellow("⚠ Daemon setup incomplete. Fix and run:")}`);
-    log(`  ${yellow("  pm2 start")} "${ecosystemPath}"`);
+  const serviceOk = setupService();
+  if (!serviceOk) {
+    log(`  ${yellow("⚠ Auto-start setup incomplete. See instructions above.")}`);
   }
 
   // ── Step 7: Done ──

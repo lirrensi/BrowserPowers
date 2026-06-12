@@ -128,7 +128,6 @@ The install script checks these for you. If anything is missing, it tells you ex
 
 - **Node.js** >= 18
 - **pnpm** >= 9 (globally: `npm install -g pnpm`)
-- **PM2** (globally: `pnpm add -g pm2`)
 - **tsx** (globally: `pnpm add -g tsx`)
 
 ### 2. Install
@@ -137,7 +136,7 @@ The install script checks these for you. If anything is missing, it tells you ex
 node scripts/install.mjs
 ```
 
-This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, **and starts a PM2 daemon that auto-restarts on boot**.
+This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, **and sets up the core server as a native service that auto-starts on boot** (Windows Scheduled Task, macOS launchd agent, or Linux systemd service).
 
 > **That's it.** The core server is already running on `http://127.0.0.1:4199`. You can go straight to loading the extension and connecting your MCP clients.
 
@@ -183,7 +182,12 @@ Click the extension icon in your browser toolbar. The popup shows:
 - **Browser name** — auto-generated (e.g. `quick-fox-a3b2`), editable
 - **Status** — should say **Connected** to `ws://127.0.0.1:4199/ws`
 
-If it shows "Disconnected", check the daemon is running with `pm2 status`.
+If it shows "Disconnected", check the server is running:
+
+- **Windows:** `schtasks /query /tn "BrowserPowers"` or check Task Scheduler
+- **macOS:** `launchctl list | grep browserpowers`
+- **Linux:** `systemctl --user status browserpowers`
+
 
 From the terminal, confirm the browser registered:
 
@@ -223,9 +227,11 @@ auth:
 
 Then restart the daemon:
 
-```bash
-pm2 restart browserpowers
-```
+Then restart the server:
+
+- **Windows:** `schtasks /end /tn "BrowserPowers" && schtasks /run /tn "BrowserPowers"`
+- **macOS:** `launchctl bootout gui/$(id -u)/com.browserpowers && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browserpowers.plist`
+- **Linux:** `systemctl --user restart browserpowers`
 
 Once enabled, all REST, MCP, and WebSocket connections require the key:
 
@@ -347,7 +353,7 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 ## MCP Integration
 
 > **Important:** The core server must be **running** before your MCP client can connect.
-> If you ran the install script, the PM2 daemon already has it running.
+> If you ran the install script, the native service is already running it.
 > If you're in development mode, start it with `pnpm dev` (or `pnpm dev:core`).
 
 BrowserPowers exposes a full Model Context Protocol server. Connect your MCP client to:
