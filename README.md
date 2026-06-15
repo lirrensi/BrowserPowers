@@ -136,7 +136,7 @@ The install script checks these for you. If anything is missing, it tells you ex
 node scripts/install.mjs
 ```
 
-This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, **and sets up the core server as a native service that auto-starts on boot** (Windows Scheduled Task, macOS launchd agent, or Linux systemd service).
+This copies everything to `~/.browserpowers/`, installs dependencies, builds the extension for Chrome and Firefox, puts `browserpowers` on your PATH, **and registers `browserpowers start` to run at every logon** (HKCU Run key on Windows, LaunchAgent on macOS, XDG autostart on Linux).
 
 > **That's it.** The core server is already running on `http://127.0.0.1:4199`. You can go straight to loading the extension and connecting your MCP clients.
 
@@ -184,9 +184,10 @@ Click the extension icon in your browser toolbar. The popup shows:
 
 If it shows "Disconnected", check the server is running:
 
-- **Windows:** `schtasks /query /tn "BrowserPowers"` or check Task Scheduler
+- **Any platform:** `browserpowers status` — if the API responds, the daemon is up. If not, run `browserpowers start`.
+- **Windows:** the installer writes an HKCU Run key. Inspect with `reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v BrowserPowers`
 - **macOS:** `launchctl list | grep browserpowers`
-- **Linux:** `systemctl --user status browserpowers`
+- **Linux:** `cat ~/.config/autostart/browserpowers.desktop`
 
 
 From the terminal, confirm the browser registered:
@@ -227,11 +228,11 @@ auth:
 
 Then restart the daemon:
 
-Then restart the server:
+```bash
+browserpowers restart
+```
 
-- **Windows:** `schtasks /end /tn "BrowserPowers" && schtasks /run /tn "BrowserPowers"`
-- **macOS:** `launchctl bootout gui/$(id -u)/com.browserpowers && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browserpowers.plist`
-- **Linux:** `systemctl --user restart browserpowers`
+That's it — same on every platform. It kills whatever is on port 4199, then runs `browserpowers start` again.
 
 Once enabled, all REST, MCP, and WebSocket connections require the key:
 
@@ -293,7 +294,10 @@ Once loaded, click the extension icon to open the popup. You can:
 ## CLI Reference
 
 ```bash
-browserpowers serve                        # Start the core server (default command)
+browserpowers serve                        # Start the core server (foreground, default)
+browserpowers start                        # Start the daemon detached, then exit
+                                            #   (same command the OS runs at logon)
+browserpowers restart                      # Stop the running daemon, then start a fresh one
 browserpowers status                       # Check daemon status and connected browsers
 browserpowers list                         # List all connected browsers
 browserpowers init                         # Interactive first-time setup wizard

@@ -4,17 +4,17 @@
  * BrowserPowers — One-shot install / update / uninstall.
  *
  * Copies everything to ~/.browserpowers/, installs dependencies,
- * builds the extension, puts CLI on PATH, sets up native auto-start.
+ * builds the extension, puts CLI on PATH.
  *
- * Auto-start uses native OS mechanisms (no external process manager):
- *   Windows  — Scheduled Task (schtasks)
- *   macOS    — launchd user agent
- *   Linux    — systemd user service
+ * Auto-start is the OS running `browserpowers start` at user logon.
+ * The mechanism differs per platform; the command is the same.
+ *   Windows — HKCU\...\Run → "<wrapper>" start
+ *   Linux   — XDG autostart (.desktop)
+ *   macOS   — LaunchAgent (plist)
  *
- * Prerequisites (script checks these & tells you how to install):
- *   - Node.js >= 18
- *   - pnpm >= 9 (globally)
- *   - tsx (globally)
+ * Background process strategy (no console window, survives parent exit):
+ *   Windows — `cmd.exe /c start /b "" <node> ...` (the only native mechanism)
+ *   Unix    — `spawn` with `detached: true`
  *
  * Usage:
  *   node scripts/install.mjs              fresh install or update
@@ -32,9 +32,9 @@ const IS_LINUX = !IS_WIN && !IS_MAC;
 // ── Imports ─────────────────────────────────────────────
 
 import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, chmodSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
-import { homedir, platform } from "node:os";
-import { resolve, relative, sep } from "node:path";
+import { execSync, spawn } from "node:child_process";
+import { homedir } from "node:os";
+import { resolve, relative } from "node:path";
 
 // ── Paths ───────────────────────────────────────────────
 
@@ -43,6 +43,7 @@ const BP_DIR = resolve(homedir(), ".browserpowers");
 const BP_CORE = resolve(BP_DIR, "core");
 const BP_EXT = resolve(BP_DIR, "extension");
 const BP_BIN = resolve(BP_DIR, "bin");
+const BP_BIN_BROWSERPOWERS = resolve(BP_BIN, IS_WIN ? "browserpowers.cmd" : "browserpowers");
 const PKG_CORE = resolve(REPO_DIR, "core", "package.json");
 
 // ── ANSI styling (minimal, safe) ────────────────────────
@@ -161,223 +162,117 @@ function binName(base) {
   return IS_WIN ? `${base}.cmd` : base;
 }
 
-// ── Native service lifecycle (no external process manager) ──
+// ── Stop / remove ───────────────────────────────────────
 
-/**
- * Stop the running service. Safe to call even if not running.
- * Used before reinstall (to release file handles) and before uninstall.
- */
-function stopService() {
+function isPortBusy(port = 4199) {
+  try {
+    const r = execSync(
+      `powershell -NoProfile -Command "[bool](Get-NetTCPConnection -LocalPort ${port} -EA SilentlyContinue)"`,
+      { stdio: "pipe", encoding: "utf-8", timeout: 5000 }
+    );
+    return r.trim().toLowerCase() === "true";
+  } catch { return false; }
+}
+
+/** Kill whatever process is on the BrowserPowers port. Never throws. */
+function killServerOnPort(port = 4199) {
   if (IS_WIN) {
-    // Clean up any leftover PM2-managed instance from a previous install
-    try {
-      execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 });
-    } catch { /* PM2 not installed or process not managed */ }
-
-    // Stop the scheduled task instance (if we created one)
-    try {
-      execSync('schtasks /end /tn "BrowserPowers"', { stdio: "pipe", timeout: 8000 });
-    } catch { /* not running */ }
-
-    // Kill whatever process is on port 4199 (BrowserPowers server port).
-    // This is deterministic — command-line filtering would miss PM2-managed
-    // processes where "browserpowers" only appears in the working directory.
     try {
       execSync(
-        `powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 4199 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -First 1; if ($p) { Stop-Process -Id $p -Force }"`,
+        `powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort ${port} -EA SilentlyContinue | Select-Object -ExpandProperty OwningProcess -First 1; if ($p) { Stop-Process -Id $p -Force }"`,
         { stdio: "pipe", timeout: 8000 }
       );
     } catch { /* no listener */ }
 
-    // Verify port is actually free before proceeding
+    // Wait for the port to actually be free.
     let tries = 0;
     while (tries < 10) {
       try {
         const r = execSync(
-          `powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort 4199 -ErrorAction SilentlyContinue).Count"`,
+          `powershell -NoProfile -Command "[bool](Get-NetTCPConnection -LocalPort ${port} -EA SilentlyContinue)"`,
           { stdio: "pipe", encoding: "utf-8", timeout: 5000 }
         );
-        if (r.trim() === "0") break;
+        if (r.trim().toLowerCase() !== "true") break;
       } catch { break; }
-      try { execSync("powershell -NoProfile -Command Start-Sleep -Milliseconds 500", { stdio: "pipe" }); } catch {}
+      try { execSync(`powershell -NoProfile -Command Start-Sleep -Milliseconds 500`, { stdio: "pipe" }); } catch {}
       tries++;
     }
-  } else if (IS_LINUX) {
-    // Clean up leftover PM2-managed instance
-    try { execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 }); } catch {}
-    tryRun("systemctl --user stop browserpowers.service", { timeout: 10000 });
-  } else if (IS_MAC) {
-    try { execSync("pm2 delete browserpowers", { stdio: "pipe", timeout: 5000 }); } catch {}
-    try {
-      const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
-      execSync(`launchctl bootout gui/${uid}/com.browserpowers`, { stdio: "pipe", timeout: 8000 });
-    } catch { /* not running */ }
+  } else {
+    try { execSync(`fuser -k ${port}/tcp 2>/dev/null || lsof -ti:${port} | xargs kill -9 2>/dev/null || true`, { stdio: "pipe", timeout: 5000 }); } catch {}
   }
 }
 
-/**
- * Remove the service configuration. Called during uninstall.
- * Stops the service first, then removes the OS-level config.
- */
-function removeService() {
+/** Stop the running service. Used before reinstall and before uninstall. */
+function stopService() {
+  killServerOnPort();
+}
+
+/** Remove the OS-level auto-start entry. The CLI binary stays; only the logon trigger is removed. */
+function removeAutoStart() {
   if (IS_WIN) {
-    try { execSync('schtasks /end /tn "BrowserPowers"', { stdio: "pipe", timeout: 5000 }); } catch {}
-    try { execSync('schtasks /delete /tn "BrowserPowers" /f', { stdio: "pipe", timeout: 10000 }); } catch {}
-    // Also clean up Startup folder fallback
-    const startupDir = resolve(
-      process.env.APPDATA || resolve(homedir(), "AppData", "Roaming"),
-      "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+    tryRun(
+      `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "BrowserPowers" /f`
     );
-    const startupScript = resolve(startupDir, "BrowserPowers.cmd");
-    try { unlinkSync(startupScript); } catch { /* not found */ }
   } else if (IS_LINUX) {
-    tryRun("systemctl --user stop browserpowers.service", { timeout: 5000 });
-    tryRun("systemctl --user disable browserpowers.service", { timeout: 5000 });
-    const unitPath = resolve(homedir(), ".config", "systemd", "user", "browserpowers.service");
-    try { unlinkSync(unitPath); } catch { /* not found */ }
+    const desktopPath = resolve(homedir(), ".config", "autostart", "browserpowers.desktop");
+    try { unlinkSync(desktopPath); } catch { /* not found */ }
   } else if (IS_MAC) {
     try {
       const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
-      execSync(`launchctl bootout gui/${uid}/com.browserpowers`, { stdio: "pipe", timeout: 5000 });
+      execSync(`launchctl bootout gui/${uid}/com.browserpowers`, { stdio: "pipe", timeout: 8000 });
     } catch { /* not running */ }
     const plistPath = resolve(homedir(), "Library", "LaunchAgents", "com.browserpowers.plist");
     try { unlinkSync(plistPath); } catch { /* not found */ }
   }
 }
 
-// ── Windows: Scheduled Task ─────────────────────────────
+// ── Auto-start: the OS runs `browserpowers start` at logon ──
 
-function createWindowsService() {
-  const taskName = "BrowserPowers";
-  const cmdPath = resolve(BP_BIN, "browserpowers.cmd");
-
-  // Remove any stale scheduled task
-  try { execSync(`schtasks /end /tn "${taskName}"`, { stdio: "pipe", timeout: 5000 }); } catch {}
-  try { execSync(`schtasks /delete /tn "${taskName}" /f`, { stdio: "pipe", timeout: 5000 }); } catch {}
-
-  // Try scheduled task first (may need admin)
-  const trValue = cmdPath.includes(" ")
-    ? `cmd.exe /c ""${cmdPath}" serve"`
-    : `"${cmdPath}" serve`;
-
-  const schResult = tryRun(
-    `schtasks /create /tn "${taskName}" /tr ${trValue} /sc onlogon /rl highest /f`,
-    { timeout: 15000 }
+/**
+ * Windows: HKCU\...\Run key fires `<browserpowers.cmd> start` at logon.
+ * Idempotent — `reg add /f` overwrites the same value.
+ */
+function createWindowsAutoStart() {
+  const regValue = `"${BP_BIN_BROWSERPOWERS}" start`;
+  // Escape inner double quotes for the reg /d argument
+  const regData = regValue.replace(/"/g, '\\"');
+  mustRun(
+    `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" ` +
+    `/v "BrowserPowers" /t REG_SZ /d "${regData}" /f`
   );
-
-  if (schResult && schResult.error) {
-    // Fallback: Startup folder (no admin required, works for all users)
-    const msg = (schResult.message || "").toLowerCase();
-    if (msg.includes("access") || msg.includes("denied")) {
-      log("  schtasks requires admin — using Startup folder instead.");
-    } else {
-      log(`  ${yellow("⚠ Scheduled task unavailable:")} ${schResult.message.slice(0, 80)}`);
-      log("  Falling back to Startup folder.");
-    }
-
-    const startupDir = resolve(
-      process.env.APPDATA || resolve(homedir(), "AppData", "Roaming"),
-      "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
-    );
-    mkdirSync(startupDir, { recursive: true });
-    const startupScript = resolve(startupDir, "BrowserPowers.cmd");
-    const content = [
-      "@echo off",
-      `start "" /B "${cmdPath}" serve`,
-    ].join("\r\n");
-    writeFileSync(startupScript, content, "utf-8");
-    log(`  ${startupScript}`);
-    log("  Startup folder entry created (auto-start at logon).");
-
-    // Start immediately
-    try {
-      execSync(`start "" /B "${cmdPath}" serve`, { stdio: "pipe", timeout: 5000, shell: "cmd.exe" });
-      log("  Service started.");
-    } catch {
-      log(`  ${yellow("  Start manually: browserpowers serve")}`);
-    }
-    return true;
-  }
-
-  log("  Scheduled task created (auto-start at logon).");
-
-  // Start immediately so the user doesn't have to wait for next logon
-  const runResult = tryRun(`schtasks /run /tn "${taskName}"`, { timeout: 10000 });
-  if (runResult && runResult.error) {
-    log(`  ${yellow("  Will start automatically at next logon.")}`);
-  } else {
-    log("  Service started.");
-  }
-
+  log(`  HKCU Run: ${regValue}`);
   return true;
 }
 
-// ── Linux: systemd user service ─────────────────────────
-
-function createLinuxService() {
-  const unitDir = resolve(homedir(), ".config", "systemd", "user");
-  mkdirSync(unitDir, { recursive: true });
-
-  const binPath = resolve(BP_BIN, "browserpowers");
-  const unitPath = resolve(unitDir, "browserpowers.service");
-
-  const unit = `[Unit]
-Description=BrowserPowers Multi-Browser Agent Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${binPath} serve
-Restart=always
-RestartSec=5
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=default.target
-`;
-
-  writeFileSync(unitPath, unit, "utf-8");
-  log(`  ${unitPath}`);
-
-  // Reload, enable, and start
-  const reload = tryRun("systemctl --user daemon-reload", { timeout: 10000 });
-  if (reload && reload.error) {
-    log(`  ${yellow("⚠ systemd not available. The service unit file has been created.")}`);
-    log(`  ${yellow("  Run manually when ready:")}`);
-    log(`  ${yellow("    systemctl --user daemon-reload")}`);
-    log(`  ${yellow("    systemctl --user enable browserpowers.service")}`);
-    log(`  ${yellow("    systemctl --user start browserpowers.service")}`);
-    return false;
-  }
-
-  const enable = tryRun("systemctl --user enable browserpowers.service", { timeout: 10000 });
-  if (enable && enable.error) {
-    log(`  ${yellow("  Service unit created but enable step had issues.")}`);
-    log(`  ${yellow("  Run: systemctl --user enable browserpowers.service")}`);
-  }
-
-  const start = tryRun("systemctl --user start browserpowers.service", { timeout: 15000 });
-  if (start && start.error) {
-    log(`  ${yellow("⚠ Service unit created but could not start.")}`);
-    log(`  ${yellow("  Run: systemctl --user start browserpowers.service")}`);
-    return false;
-  }
-
-  log("  systemd service enabled and started.");
+/**
+ * Linux: XDG autostart .desktop file fires `browserpowers start` at desktop logon.
+ */
+function createLinuxAutoStart() {
+  const autostartDir = resolve(homedir(), ".config", "autostart");
+  mkdirSync(autostartDir, { recursive: true });
+  const desktopPath = resolve(autostartDir, "browserpowers.desktop");
+  const desktop = [
+    "[Desktop Entry]",
+    "Type=Application",
+    "Name=BrowserPowers",
+    `Exec=${BP_BIN_BROWSERPOWERS} start`,
+    "X-GNOME-Autostart-enabled=true",
+    "NoDisplay=false",
+    "Terminal=false",
+  ].join("\n");
+  writeFileSync(desktopPath, desktop, "utf-8");
+  chmodSync(desktopPath, 0o644);
+  log(`  ${desktopPath}`);
   return true;
 }
 
-// ── macOS: launchd user agent ───────────────────────────
-
-function createMacService() {
+/**
+ * macOS: LaunchAgent plist fires `browserpowers start` at logon.
+ */
+function createMacAutoStart() {
   const plistDir = resolve(homedir(), "Library", "LaunchAgents");
   mkdirSync(plistDir, { recursive: true });
-
-  const binPath = resolve(BP_BIN, "browserpowers");
-  const logPath = resolve(BP_DIR, "core.log");
   const plistPath = resolve(plistDir, "com.browserpowers.plist");
-
   const plist = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
@@ -387,21 +282,14 @@ function createMacService() {
     '    <string>com.browserpowers</string>',
     '    <key>ProgramArguments</key>',
     '    <array>',
-    `        <string>${binPath}</string>`,
-    '        <string>serve</string>',
+    `        <string>${BP_BIN_BROWSERPOWERS}</string>`,
+    '        <string>start</string>',
     '    </array>',
     '    <key>RunAtLoad</key>',
     '    <true/>',
-    '    <key>KeepAlive</key>',
-    '    <true/>',
-    '    <key>StandardOutPath</key>',
-    `    <string>${logPath}</string>`,
-    '    <key>StandardErrorPath</key>',
-    `    <string>${logPath}</string>`,
     '</dict>',
     '</plist>',
   ].join('\n');
-
   writeFileSync(plistPath, plist, "utf-8");
   log(`  ${plistPath}`);
 
@@ -413,25 +301,17 @@ function createMacService() {
     const load = tryRun(`launchctl load "${plistPath}"`, { timeout: 10000 });
     if (load && load.error) {
       log(`  ${yellow("⚠ Could not load launchd agent.")}`);
-      log(`  ${yellow("  Run: launchctl load")} "${plistPath}"`);
+      log(`  ${yellow("  Run manually: launchctl load")} "${plistPath}"`);
       return false;
     }
   }
-
-  log("  launchd agent loaded and started.");
   return true;
 }
 
-// ── Service setup (platform dispatcher) ─────────────────
-
-function setupService() {
-  if (IS_WIN) {
-    return createWindowsService();
-  } else if (IS_MAC) {
-    return createMacService();
-  } else {
-    return createLinuxService();
-  }
+function createAutoStart() {
+  if (IS_WIN) return createWindowsAutoStart();
+  if (IS_MAC)  return createMacAutoStart();
+  return createLinuxAutoStart();
 }
 
 // ── Prerequisite checks ─────────────────────────────────
@@ -478,7 +358,7 @@ function checkPrerequisites() {
       failures.push({
         name: "pnpm >= 9",
         detail: `Found: ${pnpmVer}`,
-        install: "    npm install -g pnpm@latest",
+        install: "    pnpm add -g pnpm@latest",
       });
     }
   }
@@ -599,11 +479,13 @@ function printDone(version, extChrome, extFirefox) {
 
   ${bold("📋 CLI:")}
 
-     ${binName("browserpowers")} status        Check daemon + connected browsers
-     ${binName("browserpowers")} serve         Run server in foreground
-     ${binName("browserpowers")} list          List connected browsers
-     ${binName("browserpowers")} page read     Read page content
-     ${binName("browserpowers")} page act      Interact with pages
+     ${binName("browserpowers")} start          Start daemon (background) — same command the OS runs at logon
+     ${binName("browserpowers")} restart        Stop & restart the daemon
+     ${binName("browserpowers")} stop           Stop the daemon
+     ${binName("browserpowers")} serve          Run server in foreground
+     ${binName("browserpowers")} list           List connected browsers
+     ${binName("browserpowers")} page read      Read page content
+     ${binName("browserpowers")} page act       Interact with pages
 
   ${bold("🌐 Chrome Extension:")}
 
@@ -639,28 +521,23 @@ ${pathHint}
 
      node scripts/install.mjs --uninstall
 
-  ${bold("📊 Service:")}
-
-${IS_WIN ? `     browserpowers status                     Check service
-     schtasks /query /tn "BrowserPowers"    Check task (if admin)
-     taskkill /f /fi "imagename eq node.exe" /fi "windowtitle eq *browserpowers*"  Force stop` : IS_MAC ? `     launchctl list | grep browserpowers     Check service status
-     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browserpowers.plist  Start
-     launchctl bootout gui/$(id -u)/com.browserpowers    Stop
-     tail -f ~/.browserpowers/core.log          View logs` : `     systemctl --user status browserpowers    Check service status
-     systemctl --user stop browserpowers       Stop service
-     systemctl --user start browserpowers      Start service
-     journalctl --user -u browserpowers -f      View logs`}
-
   ${bold("🔄 Auto-start:")}
-     The service will restart automatically on reboot.
-     To disable: run the uninstall script or remove the service manually.`);
+
+     The OS runs ${bold('browserpowers start')} at every logon.
+     The same command works manually — if the server dies, just run it again.
+     ${IS_WIN
+       ? `(HKCU\\...\\Run → "${BP_BIN_BROWSERPOWERS}" start)`
+       : IS_MAC
+         ? `(LaunchAgent ~/Library/LaunchAgents/com.browserpowers.plist)`
+         : `(XDG autostart ~/.config/autostart/browserpowers.desktop)`}
+  `);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  MAIN
 // ═══════════════════════════════════════════════════════════
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const isUninstall = args.includes("--uninstall");
   const isForce = args.includes("--force");
@@ -676,7 +553,7 @@ function main() {
   if (isUninstall) {
     console.log(`\n  ${bold("Uninstalling...")}\n`);
     stopService();
-    removeService();
+    removeAutoStart();
     if (existsSync(BP_DIR)) rmSync(BP_DIR, { recursive: true, maxRetries: 5, retryDelay: 500 });
     console.log(`  Removed ${BP_DIR}\n`);
 
@@ -805,16 +682,46 @@ function main() {
     console.log(`      source ${rc || "~/.profile"}`);
   }
 
-  // ── Step 6: Set up auto-start service ──
-  step(6, "Setting up auto-start service");
-
-  const serviceOk = setupService();
-  if (!serviceOk) {
-    log(`  ${yellow("⚠ Auto-start setup incomplete. See instructions above.")}`);
+  // ── Step 6: Register auto-start (OS runs `browserpowers start` at logon) ──
+  step(6, "Registering auto-start");
+  const autoStartOk = createAutoStart();
+  if (!autoStartOk) {
+    log(`  ${yellow("⚠ Auto-start registration incomplete. See instructions above.")}`);
   }
 
-  // ── Step 7: Done ──
-  step(7, "Installation complete");
+  // ── Step 7: Start the server in background ──
+  step(7, "Starting daemon");
+  if (IS_WIN) {
+    // `start /b` creates a background process that survives when this script exits.
+    spawn("cmd.exe", [
+      "/c", "start", "/b", "",
+      process.execPath, tsxCli, coreEntry, "serve",
+    ], {
+      windowsHide: true,
+      stdio: "ignore",
+      cwd: BP_CORE,
+    }).unref();
+  } else {
+    spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
+      detached: true,
+      stdio: "ignore",
+      cwd: BP_CORE,
+    }).unref();
+  }
+  // Brief poll
+  log("  Waiting for daemon to come up...");
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    if (isPortBusy()) { break; }
+  }
+  if (isPortBusy()) {
+    log(`  ${green("Daemon started.")}`);
+  } else {
+    log(`  ${yellow("Daemon may still be starting. Run 'browserpowers start' to retry.")}`);
+  }
+
+
+  // ── Done ──
   printDone(repoPkg.version, EXT_CHROME, EXT_FIREFOX);
 }
 
