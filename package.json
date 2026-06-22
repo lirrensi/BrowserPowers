@@ -36,9 +36,9 @@
         "test:e2e": "playwright test"
     },
     "devDependencies": {
-        "@playwright/test": "^1.60.0",
+        "@playwright/test": "^1.61.0",
         "get-port": "^7.2.0",
-        "vitest": "^4.1.7",
+        "vitest": "^4.1.9",
         "ws": "^8.21.0"
     },
     "pnpm": {
