@@ -105,17 +105,21 @@ async function startDetached(): Promise<void> {
 
   if (process.platform === "win32") {
     if (existsSync(launcherExe)) {
-      try {
-        execSync(
-          `"${launcherExe}" "${process.execPath}" "${tsxCli}" "${coreEntry}" serve`,
-          { stdio: "ignore", timeout: 10000 }
-        );
-        // Launcher exits immediately; daemon binds async. Poll a moment.
-        for (let i = 0; i < 12; i++) {
-          await sleep(250);
-          if (await isPortBusy(config.port)) break;
-        }
-      } catch { /* launcher failed — fall through */ }
+      // Launcher is a GUI binary — spawn without shell to avoid
+      // cmd.exe quoting issues. stdio:ignore + detached means
+      // the launcher runs and exits independently.
+      const child = spawn(
+        launcherExe,
+        [process.execPath, tsxCli, coreEntry, "serve"],
+        { stdio: "ignore" }
+      );
+      child.on("error", () => {});
+      child.unref();
+      // Launcher exits immediately; daemon binds async.
+      for (let i = 0; i < 12; i++) {
+        await sleep(250);
+        if (await isPortBusy(config.port)) break;
+      }
     }
     if (!(await isPortBusy(config.port))) {
       // Fallback to direct spawn if launcher is missing
