@@ -18,7 +18,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { createServer } from "node:http";
-import { writeFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
@@ -68,7 +68,9 @@ function resolvePaths() {
   const coreEntry = fileURLToPath(import.meta.url);
   const coreDir = resolve(dirname(coreEntry), "..");
   const tsxCli = resolve(coreDir, "node_modules", "tsx", "dist", "cli.mjs");
-  return { coreEntry, coreDir, tsxCli };
+  // launcher.exe is compiled once, committed to repo
+  const launcherExe = resolve(coreDir, "launcher", "launcher.exe");
+  return { coreEntry, coreDir, tsxCli, launcherExe };
 }
 
 // ── Windows Task Scheduler helpers ──────────────────────
@@ -87,14 +89,11 @@ function stopWindowsTask(name: string): void {
 /**
  * Start the server in a background process that survives its parent.
  *
- * Direct spawn — never uses the scheduled task for manual start/restart.
- * The Task Scheduler `-Hidden` flag is unreliable on manual `Start-ScheduledTask`
- * invocation (can flash a visible console). Direct Node.js spawn with
- * `windowsHide: true` uses `CREATE_NO_WINDOW` at the OS level — the window
- * is never created, not hidden after the fact.
- *
- * The scheduled task is ONLY for logon auto-start; the task action itself
- * uses a .ps1 launcher with CreateNoWindow = $true (see scripts/install.mjs).
+ * Windows: uses launcher.exe, a compiled GUI-subsystem binary that spawns
+ *          the daemon via Win32 CreateProcess(CREATE_NO_WINDOW).  Because
+ *          the launcher itself is /SUBSYSTEM:WINDOWS, Windows physically
+ *          cannot give it a console — zero window, guaranteed.
+ * Unix:    standard detached spawn.
  */
 async function startDetached(): Promise<void> {
   if (await isPortBusy(config.port)) {
@@ -102,15 +101,42 @@ async function startDetached(): Promise<void> {
     process.exit(0);
   }
 
-  const { coreEntry, coreDir, tsxCli } = resolvePaths();
-  const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
-    detached: true,
-    windowsHide: process.platform === "win32",
-    stdio: "ignore",
-    cwd: coreDir,
-  });
-  child.on("error", () => {});
-  child.unref();
+  const { coreEntry, coreDir, tsxCli, launcherExe } = resolvePaths();
+
+  if (process.platform === "win32") {
+    if (existsSync(launcherExe)) {
+      try {
+        execSync(
+          `"${launcherExe}" "${process.execPath}" "${tsxCli}" "${coreEntry}" serve`,
+          { stdio: "ignore", timeout: 10000 }
+        );
+        // Launcher exits immediately; daemon binds async. Poll a moment.
+        for (let i = 0; i < 12; i++) {
+          await sleep(250);
+          if (await isPortBusy(config.port)) break;
+        }
+      } catch { /* launcher failed — fall through */ }
+    }
+    if (!(await isPortBusy(config.port))) {
+      // Fallback to direct spawn if launcher is missing
+      const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
+        detached: true,
+        windowsHide: true,
+        stdio: "ignore",
+        cwd: coreDir,
+      });
+      child.on("error", () => {});
+      child.unref();
+    }
+  } else {
+    const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
+      detached: true,
+      stdio: "ignore",
+      cwd: coreDir,
+    });
+    child.on("error", () => {});
+    child.unref();
+  }
 
   // Poll port to confirm it came up. Max 5s.
   for (let i = 0; i < 20; i++) {
