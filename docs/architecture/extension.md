@@ -297,69 +297,124 @@ The v2 Page Interaction API is implemented by a set of modules under `src/v2/`. 
 - `target-resolver.ts` and `inspector.ts` export string bodies that are injected into the page context via `chrome.scripting.executeScript`. They do NOT run in the service worker.
 - `action-result.ts`, `anchor-manager.ts`, `page-read.ts`, `page-act.ts`, and `page-js.ts` run in the service worker.
 - All action functions return `ActionResult` envelopes from `action-result.ts`.
-- Console capture (`page.read({ action: "console" })`) uses a different flow — see §10 below.
+- Console capture (`page.read({ action: "console" })`) uses the CDP layer — see §11 below.
 
 ---
 
-### 10. Console Capture
+### 11. CDP Layer (`src/cdp.ts`)
 
-Console capture demonstrates the core MV3 challenge with page instrumentation and how BrowserPowers solves it.
+The CDP layer is the privileged surface for `page.js` and console capture. It uses the `chrome.debugger` extension API — the same protocol Playwright, Puppeteer, and React DevTools use — to evaluate JavaScript on the page and to subscribe to console events from the browser's debugger, not from the page's JS context.
 
-#### 10.1 The Problem
+#### 11.1 Why CDP
 
-Manifest V3 content scripts run in an **isolated world** — they share the DOM with the page but have a separate JavaScript execution context. Overriding `console.log` in the content script only intercepts calls from the content script itself, not from the page's main world. There is no API to retroactively read a page's console history.
+The previous goal (ExecutionVerdict) preserved two execution surfaces: the content script's isolated world (no page variables, no page CSP) and `executeScript({ world: "MAIN" })` (page variables but page CSP applies). Page CSP can block MAIN-world injection, and the isolated world cannot see page variables. CDP is the only Chrome surface that:
 
-Additionally:
-- **CSP blocks inline `<script>` tags** injected by content scripts on sites like YouTube.
-- **The service worker can suspend** after ~30s of inactivity, losing any state it held.
+- Has full access to the page's JS variables (frameworks, libraries, app state)
+- Is NOT subject to the page's CSP — the debugger runs in the browser's privileged context, not the page's JS context
+- Works from inside an extension (no browser restart, no `--remote-debugging-port`)
 
-#### 10.2 The Architecture
+The cost: one-time `"debugger"` permission prompt at install/upgrade, a yellow "BrowserPowers is debugging this browser" infobar on attached tabs, and a DevTools lock on the same tab.
 
-```
-document_start:
-  Content script fires (always alive, never sleeps)
-    ├── chrome.runtime.sendMessage({ type: "injectMainWorldConsoleCapture" })
-    │     → wakes service worker
-    │     → SW: chrome.scripting.executeScript({ world: "MAIN", func: initOverride })
-    │       (bypasses CSP — extension privilege)
-    │
-    └── window.addEventListener("message")
-          ← receives entries from MAIN world via postMessage
+#### 11.2 The Three Execution Worlds
 
-MAIN world (after init):
-  console.log / warn / error / info / debug
-    ├── pushes to __bpConsoleBuffer (in-memory fallback)
-    ├── window.postMessage({ source: "bp-console", entry: { level, messages, timestamp, stack? } }, "*")
-    │     → content script receives → consoleBuffer.push(entry)
-    └── calls original console method (preserves normal behavior)
+| World | Where it runs | Page variables? | Page CSP applies? | Used by |
+|---|---|---|---|---|
+| **isolated** | Content script | No | No (extension CSP) | `page.act`, `page.read` (DOM-based), `RUNTIME_SELFTEST`, the `page.js` fallback when CDP attach is denied |
+| **cdp** | Browser debugger | Yes | **No** (privileged) | `page.js` (primary), `page.read action=console` |
+| **main** | Page's MAIN realm | Yes | Yes | Reserved for future; currently unused. `capture.js` was the only consumer; deleted when CDP took over console capture. |
 
-On page.read({ action: "console" }):
-  Service worker → chrome.tabs.sendMessage(tabId, "console", { limit, offset })
-    → content script returns consoleBuffer.slice(−(offset+limit), −offset)
-    → no executeScript round-trip on every query
-```
+Every script path BrowserPowers uses is CSP-immune. `page.js` additionally has full page-variable access.
 
-#### 10.3 Key Properties
+#### 11.3 Module: `extension/src/cdp.ts`
 
-| Property | Detail |
+Single owner of the CDP layer. Service-worker-only — the content script does not have access to `chrome.debugger`.
+
+**Module-level state** (Maps keyed by tabId):
+
+| State | Purpose |
 |---|---|
-| **No data loss** | Content script (always alive) holds the buffer. Service worker suspension does not lose entries. |
-| **CSP-proof** | `chrome.scripting.executeScript({ world: "MAIN" })` runs with extension privileges, bypassing page CSP. |
-| **Fast queries** | Buffer is in the content script's memory — queries are direct `sendMessage` round-trips, not executeScript injections. |
-| **Forwarded from MAIN world** | Each console call is `postMessage`'d from MAIN world → isolated world. The buffer in `window.__bpConsoleBuffer` on the MAIN world is a fallback. |
-| **Capacity** | Ring buffer of 500 entries (oldest dropped). Cleared on page navigation (new content script instance). |
+| `attached: Map<tabId, { version, attachedAt, attachedFor }>` | Currently-attached tabs |
+| `consoleBuffer: Map<tabId, ConsoleEntry[]>` | 500-entry ring buffer per tab |
+| `cmdQueues: Map<tabId, Promise>` | Per-tab command serialization |
 
-#### 10.4 Known Limitation
+**Public API**:
 
-There is a ~1–5ms race window at `document_start`. The content script sends the wake-up message to the service worker asynchronously. Any synchronous inline `<script>` tags in the page's `<head>` that execute before the service worker injects the override will not be captured. This is a fundamental MV3 limitation — no API exists to retroactively read console history. In practice, this affects very few entries: most modern web apps load scripts asynchronously or after the initial HTML parse.
+| Function | Purpose |
+|---|---|
+| `init()` | Idempotent. Registers `chrome.debugger.onEvent`, `chrome.debugger.onDetach`, `chrome.webNavigation.onCommitted` (top-frame auto-detach), `chrome.tabs.onRemoved` (cleanup). No attach happens here — attach is lazy. |
+| `ensureAttached(tabId, reason)` | Lazy attach. Returns `{ attached: true, version }` on success or `{ attached: false, error, reason }` on failure. Never throws. |
+| `detach(tabId)` | Detach from a tab. Idempotent. |
+| `getState(tabId)` | Inspect state — `{ attached, version?, attachedAt?, attachedFor?, consoleBufferSize, lastEntry? }`. Cheap (no I/O). |
+| `runtimeEvaluate(tabId, expression, opts?)` | Send `Runtime.evaluate` via CDP. Lazy-attach on first call. Returns `{ value, exceptionDetails, durationMs, ok }`. Commands serialized per tab. |
+| `getConsoleBuffer(tabId, limit, offset)` | Read console buffer (offset measured from end). Returns `{ entries, totalCount }`. |
 
-#### 10.5 Implementation Files
+**Auto-detach policy**:
+
+- **Top-frame navigation** (`chrome.webNavigation.onCommitted` with `frameId === 0`) — detach. SPA in-tab navigation is unaffected.
+- **Tab close** (`chrome.tabs.onRemoved`) — clean up `attached`, `consoleBuffer`, and `cmdQueues` entries.
+- **No idle timeout.** A long-running agent should not be surprised by a detach.
+- **DevTools lock** — if the user opens DevTools on an attached tab, our attach is rejected with "Another debugger is already attached." The page.js call falls back to the content-script `new Function` path with a clear verdict.
+
+**Console capture event flow**:
+
+```
+chrome.debugger.onEvent(source, method, params)
+  ├─ "Runtime.consoleAPICalled"  → push entry { level, messages, timestamp, stack? }
+  ├─ "Runtime.exceptionThrown"   → push entry { level: "error", messages: [description] }
+  └─ "Log.entryAdded"            → push entry { level, messages: [text] }
+```
+
+#### 11.4 `page.js` Path
+
+`extension/src/v2/page-js.ts::dispatchJsAction(code, tabId, frameId?)`:
+
+1. Reject early if `frameId` is non-zero — CDP path is top-frame only. Returns verdict `{ world: "main", path: "cdp.runtime.attach", error: { name: "FRAMES_NOT_SUPPORTED_IN_CDP_PATH" } }`.
+2. Lazy-attach via `ensureAttached(tabId, "page.js")`.
+3. On attach failure, fall back to the content-script `new Function` path. The fallback returns the existing `ExecutionVerdict` with `world: "isolated"`, `path: "isolated.newFunction"`, and the response data carries `_fallback: "isolated"` + `_cdpAttachError` for caller visibility.
+4. On attach success, call `runtimeEvaluate(tabId, code)`. Map the result:
+   - Success: `{ executed: true, world: "main", value: <CDP value>, durationMs, path: "cdp.runtime.evaluate" }`
+   - Exception: `{ executed: false, world: "main", error: { name, message, line, column }, durationMs, path: "cdp.runtime.evaluate" }`
+   - Attach failure: `{ executed: false, world: "main", path: "cdp.runtime.attach" }`
+
+#### 11.5 Console Capture Path
+
+`extension/src/v2/page-read.ts::consoleRead(params, tabId, frameId?)`:
+
+- Reads `getConsoleBuffer(tabId, limit, offset)` directly. No content-script round-trip.
+- Returns `{ entries, totalCount, source: "cdp" }`.
+
+`extension/src/v2/page-read.ts::runtimeStatus(tabId, frameId?)`:
+
+- Reads the content-script's local state via `sendReadMessage(tabId, "runtime_status", {})`.
+- Merges in `getCdpState(tabId)` under the `cdp` key, including the CDP `consoleCapture` block (`status: "ready" | "not-attached"`, `source: "cdp"`, `bufferSize`).
+- Surfaces the `cdp.attached === true` assertion for any caller that has used a CDP-needing action since the attach.
+
+#### 11.6 ExecutionVerdict Contract for CDP
+
+| Path string | World | Meaning |
+|---|---|---|
+| `cdp.runtime.evaluate` | `"main"` | Successful or failed `Runtime.evaluate` — page variables accessible, no page CSP |
+| `cdp.runtime.attach` | `"main"` | Attach failed; if no fallback was possible, this is the verdict |
+| `isolated.newFunction` | `"isolated"` | Content-script fallback for `page.js` when CDP attach is denied (page variables NOT accessible) |
+| `isolated.elClick` and friends | `"isolated"` | Content-script act actions (unchanged) |
+
+The `world: "main"` literal in the verdict now means **CDP-driven** (not MAIN-world `executeScript`). The previous meaning is no longer in use — `capture.js` was the only consumer and has been retired.
+
+#### 11.7 Playwright / E2E Notes
+
+Playwright-launched Chrome may need `--enable-unsafe-experimental-debugger-extension` if the extension is loaded unpacked. With the standard MV3 manifest `"debugger"` permission declared and the extension loaded from `.output/chrome-mv3`, the prompt is shown the first time CDP attach is requested and is granted for the session. If the e2e tests fail with "permission denied for debugger", add the flag to `playwright.config.ts` and `e2e/fixtures.ts`.
+
+#### 11.8 Implementation Files
 
 | File | Role |
 |---|---|
-| `entrypoints/background.ts` | Handles `injectMainWorldConsoleCapture` message; injects MAIN world override via `executeScript({ world: "MAIN" })` |
-| `entrypoints/content.ts` | Module-scope postMessage listener; buffers entries; handles `console` read action; sends wake-up at document_start |
-| `src/v2/page-read.ts` | `consoleRead()` dispatches `sendReadMessage` to content script buffer |
+| `extension/wxt.config.ts` | Declares `"debugger"` in `manifest.permissions` |
+| `extension/src/cdp.ts` | The CDP layer — attach/detach/runtimeEvaluate/consoleBuffer module |
+| `extension/entrypoints/background.ts` | Side-effect import of `cdp.ts` to register listeners at SW startup |
+| `extension/src/v2/page-js.ts` | `dispatchJsAction` — CDP primary, content-script `new Function` fallback |
+| `extension/src/v2/page-read.ts` | `consoleRead` (from `cdp.getConsoleBuffer`); `runtimeStatus` (merges `cdp` block) |
+| `extension/entrypoints/content.ts` | No longer owns console capture; keeps `RUNTIME_SELFTEST` + `handleJs` (fallback) |
+| `extension/src/types.ts` | `ExecutionVerdict.world` comment disambiguates "isolated" vs "main" (CDP-driven) |
 
 ---
 
@@ -472,6 +527,17 @@ src/capability-router.ts
   → src/v2/page-act (dispatchActAction)
   → src/v2/page-js (dispatchJsAction)
   → src/v2/snapshot-diff (diffSnapshots — for sync-mode post-action diff)
+
+entrypoints/background.ts
+  → src/cdp (side-effect: register chrome.debugger.onEvent / onDetach listeners
+    and webNavigation / tabs.onRemoved auto-detach hooks; attach is lazy)
+
+src/v2/page-js.ts
+  → src/cdp (ensureAttached, runtimeEvaluate)
+  → entrypoints/content.ts (handleJs fallback path via chrome.tabs.sendMessage)
+
+src/v2/page-read.ts
+  → src/cdp (getState, getConsoleBuffer)
 
 src/v2/page-read.ts
   → src/v2/inspector (inspectFunctionBody)

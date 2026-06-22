@@ -28,6 +28,10 @@ export default defineConfig({
       "webRequest",
       "alarms",
       "contextMenus",
+      // Required for chrome.debugger — gives page.js and console capture
+      // DevTools-level access on the page, bypassing page CSP. The user is
+      // prompted once at install/upgrade.
+      "debugger",
     ],
     host_permissions: ["<all_urls>"],
   },

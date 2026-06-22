@@ -4,7 +4,8 @@
  *          Anchors are per-tab, per-inspect-session with documentId staleness detection.
  * OWNS: Anchor storage, retrieval, and invalidation for fast follow-up actions.
  * EXPORTS: setAnchors, getAnchor, getDocumentId, clearAnchors, clearAllAnchors
- * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 2c)
+ * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 2c),
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md §2.8
  */
 
 import type { Target } from "../types.js";
@@ -14,6 +15,14 @@ interface AnchorEntry {
   documentId: string;
   tabId: number;
   target: Target;
+  /** Optional chain of shadow host tag names leading to the anchor. */
+  shadowPath?: string[];
+}
+
+export interface StoredAnchor {
+  selector: string;
+  target: Target;
+  shadowPath?: string[];
 }
 
 const tabAnchors = new Map<number, Map<string, AnchorEntry>>();
@@ -24,7 +33,7 @@ const tabAnchors = new Map<number, Map<string, AnchorEntry>>();
 export function setAnchors(
   tabId: number,
   documentId: string,
-  anchors: Array<{ anchor: string; target: Target; selector: string }>,
+  anchors: Array<{ anchor: string; target: Target; selector: string; shadowPath?: string[] }>,
 ): void {
   const map = new Map<string, AnchorEntry>();
   for (const a of anchors) {
@@ -33,6 +42,7 @@ export function setAnchors(
       documentId,
       tabId,
       target: a.target,
+      shadowPath: a.shadowPath,
     });
   }
   tabAnchors.set(tabId, map);
@@ -46,13 +56,13 @@ export function getAnchor(
   tabId: number,
   anchorId: string,
   documentId?: string,
-): { selector: string; target: Target } | null {
+): StoredAnchor | null {
   const map = tabAnchors.get(tabId);
   if (!map) return null;
   const entry = map.get(anchorId);
   if (!entry) return null;
   if (documentId !== undefined && entry.documentId !== documentId) return null; // stale
-  return { selector: entry.selector, target: entry.target };
+  return { selector: entry.selector, target: entry.target, shadowPath: entry.shadowPath };
 }
 
 /**

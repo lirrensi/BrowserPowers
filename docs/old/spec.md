@@ -44,7 +44,6 @@ BrowserPowers solves this by making each real browser a first-class participant.
 - Ephemeral browser creation (no Playwright/Puppeteer-style browser spawning)
 - Cloud-hosted browser farm
 - Graphical observability dashboard (configuration file only)
-- Native browser automation without extension (no CDP/DevTools Protocol directly)
 - Standalone LLM inference (core routes to external LLM APIs only)
 
 ---

@@ -43,7 +43,6 @@ BrowserPowers solves this by making each real browser a first-class participant.
 - Ephemeral browser creation (no Playwright/Puppeteer-style browser spawning)
 - Cloud-hosted browser farm
 - Graphical observability dashboard (configuration file only)
-- Native browser automation without extension (no CDP/DevTools Protocol directly)
 - Standalone LLM inference (core routes to external LLM APIs only)
 
 ---
@@ -584,10 +583,10 @@ Aliased as `browser_select` for backward compatibility.
 
 Retrieve captured console output from the page. Intercepts `console.log`, `console.warn`, `console.error`, `console.info`, `console.debug`, uncaught exceptions (`window.onerror`), and unhandled promise rejections (`unhandledrejection`). Entries are buffered in memory (max 500) and returned on demand.
 
-**Architecture note**: MV3 content scripts run in an isolated world — overriding `console.log` there does NOT intercept the page's console calls. Instead, the service worker injects a console override into the page's MAIN world via `chrome.scripting.executeScript({ world: "MAIN" })`. Each captured entry is forwarded to the content script via `window.postMessage`, where it is buffered. This means:
-- The capture works on all pages regardless of Content Security Policy (CSP).
-- The buffer survives service worker suspension because the content script is always alive.
-- There is a ~1–5ms race window at page load: synchronous inline `<script>` tags that execute before the service worker injects the override may not be captured. This is a fundamental MV3 limitation — no API exists to retroactively read console history.
+**Architecture note**: BrowserPowers uses the Chrome DevTools Protocol via the `chrome.debugger` extension API to give scripts full DevTools-level access on any page, regardless of page CSP. Console capture is driven by the CDP `Runtime.consoleAPICalled` event (with `Runtime.exceptionThrown` and `Log.entryAdded` as supplements). The SW lazily attaches `chrome.debugger` to each tab on first `page.js` or `page.read action=console` call, enables the Runtime and Log domains, and buffers entries (max 500) in module-level memory. This means:
+- The capture is NOT subject to the page's CSP — the debugger runs in the browser's privileged context, not the page's JS context. The `consoleCapture.status: "ready"` in `page.read action=runtime_status` reflects the CDP attach state.
+- The buffer is held in the service worker; entries are read on demand via `getConsoleBuffer(tabId, limit, offset)`.
+- The first attach to a tab shows Chrome's "BrowserPowers is debugging this browser" infobar; auto-detach happens on top-frame navigation and on tab close.
 
 | Field | Type | Description |
 |---|---|---|

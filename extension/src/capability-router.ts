@@ -3,15 +3,19 @@
  * PURPOSE: Maps tool calls from the core into chrome.* API calls.
  *          v2: page tools dispatch to page-read/page-act/page-js v2 modules.
  *          Non-page tools (tabs, windows, history, bookmarks, etc.) unchanged.
+ *          Every chrome.scripting.executeScript call site is wrapped with an
+ *          ExecutionVerdict: world, durationMs, value, error.
  * OWNS: Single routing layer between WebSocket commands and browser APIs.
  * EXPORTS: routeExecute, ExecuteRequest, ExecuteResult
- * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 3)
+ * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 3),
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md §2.7
  */
 
 import { dispatchReadAction } from "./v2/page-read.js";
 import { dispatchActAction } from "./v2/page-act.js";
 import { dispatchJsAction } from "./v2/page-js.js";
 import { diffSnapshots } from "./v2/snapshot-diff.js";
+import type { ExecutionVerdict } from "./types.js";
 
 // ═══════════════════════════════════════════
 // Network request ring buffer (#002)
@@ -101,6 +105,62 @@ export interface ExecuteResult {
   success: boolean;
   data?: unknown;
   error?: string;
+  /** Additive — every chrome.scripting.executeScript call site emits one of these. */
+  executionVerdict?: ExecutionVerdict;
+}
+
+/**
+ * Run a chrome.scripting.executeScript call wrapped with timing + verdict
+ * construction. The default world is isolated; pass `world: "MAIN"` for
+ * surface that genuinely needs MAIN (we currently have zero such call sites).
+ */
+async function runExecuteScript(
+  opts: {
+    tabId: number;
+    frameId?: number;
+    // Chrome's executeScript API types the func as (...args: any[]) => any.
+    // We mirror that here so callers can pass any concrete signature.
+    func: (...args: any[]) => any;
+    args?: unknown[];
+    callSite: string; // for the verdict's `path` field
+    world?: "isolated" | "main";
+  },
+): Promise<{ result: unknown; verdict: ExecutionVerdict }> {
+  const world: "isolated" | "main" = opts.world ?? "isolated";
+  const start = performance.now();
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: opts.tabId, ...(opts.frameId !== undefined ? { frameIds: [opts.frameId] } : {}) },
+      func: opts.func,
+      args: (opts.args ?? []) as any[],
+      // Only set the world field if we actually need MAIN. Isolated is the
+      // default and is the right default — page CSP only applies to MAIN.
+      ...(world === "main" ? { world: "MAIN" as const } : {}),
+    });
+    const result = (results && results[0]) ? results[0].result : undefined;
+    return {
+      result,
+      verdict: {
+        executed: true,
+        world,
+        value: result,
+        durationMs: performance.now() - start,
+        path: `sw.executeScript.${world}.${opts.callSite}`,
+      },
+    };
+  } catch (e) {
+    const err = e as Error;
+    return {
+      result: undefined,
+      verdict: {
+        executed: false,
+        world,
+        durationMs: performance.now() - start,
+        path: `sw.executeScript.${world}.${opts.callSite}`,
+        error: { name: err.name || "Error", message: err.message || String(e) },
+      },
+    };
+  }
 }
 
 /**
@@ -108,8 +168,13 @@ export interface ExecuteResult {
  */
 export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> {
   try {
-    const data = await execute(req.tool, req.params, req.commandMode);
-    return { requestId: req.requestId, success: true, data };
+    const out = await execute(req.tool, req.params, req.commandMode);
+    return {
+      requestId: req.requestId,
+      success: true,
+      data: out.data,
+      executionVerdict: out.executionVerdict,
+    };
   } catch (err) {
     return {
       requestId: req.requestId,
@@ -154,7 +219,11 @@ function stripFrameParams(p: Record<string, unknown>): Record<string, unknown> {
   return rest;
 }
 
-async function execute(tool: string, params: Record<string, unknown>, commandMode: "sync" | "async"): Promise<unknown> {
+async function execute(
+  tool: string,
+  params: Record<string, unknown>,
+  commandMode: "sync" | "async",
+): Promise<{ data: unknown; executionVerdict?: ExecutionVerdict }> {
   switch (tool) {
     // ══════════════════════════════════════════
     // V2 Page Tools
@@ -164,7 +233,14 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       const frameId = await resolveFrameId(tabId, params);
       const cleanParams = stripFrameParams(params);
-      return dispatchReadAction(cleanParams.action as any, cleanParams, tabId, frameId);
+      const result = await dispatchReadAction(cleanParams.action as any, cleanParams, tabId, frameId);
+      // The runtimeStatus field is additive — every content-script response
+      // carries the isolated-world self-test verdict so callers can prove the
+      // script is alive and able to evaluate JS.
+      return {
+        data: result,
+        executionVerdict: result.executionVerdict ?? result.runtimeStatus,
+      };
     }
 
     case "page.act": {
@@ -191,7 +267,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         // If action failed or didn't perform, skip post-inspect and diff
         const actionStatus = result.status;
         if (actionStatus !== "performed" && actionStatus !== "already_in_desired_state") {
-          return result;
+          return { data: result, executionVerdict: result.executionVerdict };
         }
 
         // Post-inspect
@@ -225,17 +301,19 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
           }
         }
 
-        return result;
+        return { data: result, executionVerdict: result.executionVerdict };
       }
 
-      return dispatchActAction(actAction as any, cleanParams, tabId, frameId);
+      const actResult = await dispatchActAction(actAction as any, cleanParams, tabId, frameId);
+      return { data: actResult, executionVerdict: actResult.executionVerdict };
     }
 
     case "page.js": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       const frameId = await resolveFrameId(tabId, params);
       const cleanParams = stripFrameParams(params);
-      return dispatchJsAction(cleanParams.code as string, tabId, frameId);
+      const result = await dispatchJsAction(cleanParams.code as string, tabId, frameId);
+      return { data: result, executionVerdict: result.executionVerdict };
     }
 
     // ══════════════════════════════════════════
@@ -256,16 +334,18 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const totalCount = results.length;
       const sliced = results.slice(offset, offset + limit);
       return {
-        tabs: sliced,
-        totalCount,
-        truncated: totalCount > limit,
-        limit,
-        offset,
+        data: {
+          tabs: sliced,
+          totalCount,
+          truncated: totalCount > limit,
+          limit,
+          offset,
+        },
       };
     }
 
     case "tabs.create":
-      return chrome.tabs.create(params as chrome.tabs.CreateProperties);
+      return { data: await chrome.tabs.create(params as chrome.tabs.CreateProperties) };
 
     case "tabs.navigate": {
       // Navigate to URL — in existing tab if tabId given, else creates new tab
@@ -283,7 +363,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         tab = await chrome.tabs.create({ url, active: params.active !== false });
       }
       const tabId = tab.id;
-      if (!tabId) return { tabId: null, navigated: true, url, wait_until: waitUntil, elapsed_ms: 0 };
+      if (!tabId) return { data: { tabId: null, navigated: true, url, wait_until: waitUntil, elapsed_ms: 0 } };
 
       const startTime = Date.now();
 
@@ -329,19 +409,19 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         }
       }
 
-      return result;
+      return { data: result };
     }
 
     case "tabs.goBack": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       await chrome.tabs.goBack(tabId);
-      return { navigated: true, direction: "back" };
+      return { data: { navigated: true, direction: "back" } };
     }
 
     case "tabs.goForward": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       await chrome.tabs.goForward(tabId);
-      return { navigated: true, direction: "forward" };
+      return { data: { navigated: true, direction: "forward" } };
     }
 
     case "tabs.close": {
@@ -351,13 +431,13 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tab?.id) await chrome.tabs.remove(tab.id);
       }
-      return { closed: true };
+      return { data: { closed: true } };
     }
 
     case "tabs.update": {
       const { tabId, ...updateProps } = params as any;
       const targetId = tabId ?? (await getActiveTabId());
-      return chrome.tabs.update(targetId, updateProps);
+      return { data: await chrome.tabs.update(targetId, updateProps) };
     }
 
     // ══════════════════════════════════════════
@@ -371,7 +451,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         { format: "png" },
       );
       const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-      return { base64, format: "png" };
+      return { data: { base64, format: "png" } };
     }
 
     // ══════════════════════════════════════════
@@ -386,7 +466,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         ...(params.startTime ? { startTime: params.startTime as number } : {}),
         ...(params.endTime ? { endTime: params.endTime as number } : {}),
       };
-      return chrome.history.search(query);
+      return { data: await chrome.history.search(query) };
     }
 
     case "history.delete": {
@@ -401,7 +481,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       } else {
         throw new Error("Specify `url` to delete a single entry or `delete_all: true` to wipe all history.");
       }
-      return { deleted: true };
+      return { data: { deleted: true } };
     }
 
     // ══════════════════════════════════════════
@@ -412,11 +492,11 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const limit = (params.limit as number) ?? 100;
       const offset = (params.offset as number) ?? 0;
       const results = await chrome.bookmarks.search(params as chrome.bookmarks.BookmarkSearchQuery);
-      return results.slice(offset, offset + limit);
+      return { data: results.slice(offset, offset + limit) };
     }
 
     case "bookmarks.create":
-      return chrome.bookmarks.create(params as chrome.bookmarks.BookmarkCreateArg);
+      return { data: await chrome.bookmarks.create(params as chrome.bookmarks.BookmarkCreateArg) };
 
     case "bookmarks.delete": {
       const id = params.id as string;
@@ -428,7 +508,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       } else {
         throw new Error("bookmarks.delete requires either 'id' (single bookmark) or 'tree' (subtree root). Calling without params does NOT wipe all bookmarks.");
       }
-      return { deleted: true };
+      return { data: { deleted: true } };
     }
 
     // ══════════════════════════════════════════
@@ -441,13 +521,13 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
         ...(params as chrome.downloads.DownloadQuery),
         limit,
       };
-      return chrome.downloads.search(query);
+      return { data: await chrome.downloads.search(query) };
     }
 
     case "downloads.open": {
       const downloadId = params.downloadId as number;
       if (downloadId) await chrome.downloads.open(downloadId);
-      return { opened: true };
+      return { data: { opened: true } };
     }
 
     // ══════════════════════════════════════════
@@ -470,7 +550,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       }
 
       const sliced = entries.slice(0, limit);
-      return { requests: sliced };
+      return { data: { requests: sliced } };
     }
 
     // ══════════════════════════════════════════
@@ -482,8 +562,10 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       if (keys) {
         const tabId = (params.tabId as number) ?? (await getActiveTabId());
         const frameId = params.frameId as number | undefined;
-        const results = await chrome.scripting.executeScript({
-          target: { tabId, ...(frameId !== undefined ? { frameIds: [frameId] } : {}) },
+        const { result, verdict } = await runExecuteScript({
+          tabId,
+          frameId,
+          callSite: "storage.get",
           func: (k: string | string[]) => {
             const keysArr = Array.isArray(k) ? k : [k];
             const result: Record<string, unknown> = {};
@@ -492,23 +574,25 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
           },
           args: [keys],
         });
-        return results[0]?.result;
+        return { data: result, executionVerdict: verdict };
       }
-      return {};
+      return { data: {} };
     }
 
     case "storage.set": {
       const data = params.data as Record<string, string>;
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       const frameId = params.frameId as number | undefined;
-      await chrome.scripting.executeScript({
-        target: { tabId, ...(frameId !== undefined ? { frameIds: [frameId] } : {}) },
+      const { result, verdict } = await runExecuteScript({
+        tabId,
+        frameId,
+        callSite: "storage.set",
         func: (d: Record<string, string>) => {
           for (const [key, val] of Object.entries(d)) localStorage.setItem(key, val);
         },
         args: [data],
       });
-      return { stored: true };
+      return { data: { stored: true, writeResult: result }, executionVerdict: verdict };
     }
 
     // ══════════════════════════════════════════
@@ -517,26 +601,26 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
 
     case "windows.list": {
       const results = await chrome.windows.getAll({ populate: true });
-      return results;
+      return { data: results };
     }
 
     case "windows.create": {
       const createParams: chrome.windows.CreateData = {};
       if (params.url) createParams.url = params.url as string;
-      return chrome.windows.create(createParams);
+      return { data: await chrome.windows.create(createParams) };
     }
 
     case "windows.focus": {
       const windowId = params.window_id as number;
       await chrome.windows.update(windowId, { focused: true });
-      return { focused: true };
+      return { data: { focused: true } };
     }
 
     case "windows.close": {
       const windowId = params.window_id as number;
       if (!windowId) throw new Error("windows.close requires a 'window_id' parameter");
       await chrome.windows.remove(windowId);
-      return { closed: true };
+      return { data: { closed: true } };
     }
 
     // ══════════════════════════════════════════
@@ -547,7 +631,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const url = params.url as string;
       const name = params.name as string;
       const cookie = await chrome.cookies.get({ url, name });
-      return cookie ?? { error: "Cookie not found" };
+      return { data: cookie ?? { error: "Cookie not found" } };
     }
 
     case "cookies.set": {
@@ -555,14 +639,14 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const name = params.name as string;
       const value = params.value as string;
       const cookie = await chrome.cookies.set({ url, name, value });
-      return cookie;
+      return { data: cookie };
     }
 
     case "cookies.remove": {
       const url = params.url as string;
       const name = params.name as string;
       await chrome.cookies.remove({ url, name });
-      return { removed: true };
+      return { data: { removed: true } };
     }
 
     case "cookies.list": {
@@ -570,7 +654,7 @@ async function execute(tool: string, params: Record<string, unknown>, commandMod
       const offset = (params.offset as number) ?? 0;
       const url = params.url as string;
       const cookies = await chrome.cookies.getAll({ url });
-      return cookies.slice(offset, offset + limit);
+      return { data: cookies.slice(offset, offset + limit) };
     }
 
     default:

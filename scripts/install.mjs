@@ -1,19 +1,24 @@
 #!/usr/bin/env node
 
+// FILE: scripts/install.mjs
+// PURPOSE: One-shot BrowserPowers install / update / uninstall with hidden OS auto-start.
+// OWNS: Repo-to-home artifact install, CLI wrapper creation, and daemon startup.
+// EXPORTS: none (side-effect CLI script)
+// DOCS: docs/spec/installer-hard-spec.md
+
 /**
  * BrowserPowers — One-shot install / update / uninstall.
  *
- * Copies everything to ~/.browserpowers/, installs dependencies,
- * builds the extension, puts CLI on PATH.
+ * Kills any old daemon on port 4199, installs dependencies,
+ * builds the extension, copies it to ~/.browserpowers/, puts CLI on PATH,
+ * and starts the daemon in background.
  *
- * Auto-start is the OS running `browserpowers start` at user logon.
- * The mechanism differs per platform; the command is the same.
- *   Windows — HKCU\...\Run → "<wrapper>" start
- *   Linux   — XDG autostart (.desktop)
- *   macOS   — LaunchAgent (plist)
+ * Registers hidden OS-level auto-start so BrowserPowers starts on user
+ * logon (Windows: user-scoped Task Scheduler task; macOS: LaunchAgent;
+ * Linux: XDG autostart).
  *
  * Background process strategy (no console window, survives parent exit):
- *   Windows — `cmd.exe /c start /b "" <node> ...` (the only native mechanism)
+ *   Windows — user-scoped Task Scheduler task with Hidden = true
  *   Unix    — `spawn` with `detached: true`
  *
  * Usage:
@@ -31,7 +36,7 @@ const IS_LINUX = !IS_WIN && !IS_MAC;
 
 // ── Imports ─────────────────────────────────────────────
 
-import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, chmodSync, unlinkSync, renameSync } from "node:fs";
 import { execSync, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve, relative } from "node:path";
@@ -41,6 +46,7 @@ import { resolve, relative } from "node:path";
 const REPO_DIR = process.cwd();
 const BP_DIR = resolve(homedir(), ".browserpowers");
 const BP_CORE = resolve(BP_DIR, "core");
+const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core lives in the repo (pnpm workspace) and runs from there
 const BP_EXT = resolve(BP_DIR, "extension");
 const BP_BIN = resolve(BP_DIR, "bin");
 const BP_BIN_BROWSERPOWERS = resolve(BP_BIN, IS_WIN ? "browserpowers.cmd" : "browserpowers");
@@ -61,6 +67,74 @@ function green(s)   { return `${GREEN}${s}${RESET}`; }
 function yellow(s)  { return `${YELLOW}${s}${RESET}`; }
 function cyan(s)    { return `${CYAN}${s}${RESET}`; }
 
+// ── Cleanup & signal handling ────────────────────────────
+// The script must always exit — never get stuck in an incomplete state.
+// Any uncaught error, signal, or rejected promise triggers cleanup of
+// the partial install temp dir and an explicit non-zero exit. There are
+// no retry loops and no unbounded polls; the user re-runs after fixing
+// whatever went wrong.
+
+const BP_EXT_TMP = resolve(BP_DIR, ".ext-tmp");
+const BP_STAGING_CHROME = resolve(BP_DIR, ".extension-staging-chrome");
+const BP_STAGING_FIREFOX = resolve(BP_DIR, ".extension-staging-firefox");
+
+function cleanupPartial() {
+  for (const p of [BP_EXT_TMP, BP_STAGING_CHROME, BP_STAGING_FIREFOX]) {
+    if (existsSync(p)) {
+      try { rmSync(p, { recursive: true, maxRetries: 5, retryDelay: 300, force: true }); } catch {}
+    }
+  }
+}
+
+/**
+ * Atomically replace `targetPath` with `stagingPath`. The browser keeps a
+ * valid reference at `targetPath` throughout — the old version is moved
+ * aside (`.old`) only after the new one is fully staged, and restored on
+ * any failure. The extension path is therefore never missing.
+ */
+function atomicSwapDir(stagingPath, targetPath) {
+  const oldBackup = targetPath + ".old";
+  if (existsSync(oldBackup)) {
+    try { rmSync(oldBackup, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch {}
+  }
+  if (existsSync(targetPath)) {
+    try {
+      renameSync(targetPath, oldBackup);
+    } catch {
+      // If rename is blocked (Chrome holding the dir), fall back to rm —
+      // there's a microsecond window where the path is missing, but
+      // Chrome reloads the extension the moment it reappears.
+      rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    }
+  }
+  try {
+    renameSync(stagingPath, targetPath);
+  } catch (err) {
+    // Restore from backup so the browser's reference stays valid.
+    if (existsSync(oldBackup)) {
+      try { renameSync(oldBackup, targetPath); } catch {}
+    }
+    throw err;
+  }
+  if (existsSync(oldBackup)) {
+    try { rmSync(oldBackup, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch {}
+  }
+}
+
+let exiting = false;
+function exitWithCleanup(code, reason) {
+  if (exiting) process.exit(code);
+  exiting = true;
+  if (reason) console.error(`\n  ${red("✖")} ${reason}\n`);
+  cleanupPartial();
+  process.exit(code);
+}
+
+process.on("SIGINT",  () => exitWithCleanup(130, "Interrupted (SIGINT)"));
+process.on("SIGTERM", () => exitWithCleanup(143, "Terminated (SIGTERM)"));
+process.on("uncaughtException", (err) => exitWithCleanup(1, `Uncaught exception: ${err && err.message ? err.message : String(err)}`));
+process.on("unhandledRejection", (reason) => exitWithCleanup(1, `Unhandled rejection: ${reason}`));
+
 // ── Helpers ─────────────────────────────────────────────
 
 function readJson(path) {
@@ -72,28 +146,48 @@ function log(...args) {
 }
 
 function step(num, msg) {
-  console.log(`\n  ${bold(`[${num}/7] ${msg}`)}`);
+  console.log(`\n  ${bold(`[${num}/6] ${msg}`)}`);
   console.log(`  ${"-".repeat(msg.length + 6)}`);
 }
 
 function fatal(message) {
-  console.error(`\n  ${red("✖")} ${message}\n`);
+  if (!exiting) {
+    console.error(`\n  ${red("✖")} ${message}\n`);
+    cleanupPartial();
+  }
   process.exit(1);
 }
 
 /**
- * Run a shell command, capturing output. Fails with a clear message on error.
- * The error does NOT exit the process — caller decides.
+ * Run a shell command. Fails with a clear message on error — does NOT exit
+ * the process; caller decides. Supports `inheritStdio: true` so the user
+ * sees live output for long-running commands (builds, installs) instead of
+ * the script appearing hung. Default timeout is 10 min — long enough for
+ * WXT's first-run build, short enough that a genuine hang still surfaces.
  */
+const DEFAULT_RUN_TIMEOUT_MS = 60_000;
+
 function tryRun(cmd, opts = {}) {
-  const cwd = opts.cwd || BP_DIR;
+  const { inheritStdio, timeoutMs, ...execOpts } = opts;
+  const cwd = execOpts.cwd || BP_DIR;
   log(`  $ ${cyan(cmd)}`);
   try {
-    return execSync(cmd, { cwd, stdio: "pipe", timeout: 120000, encoding: "utf-8", ...opts });
+    return execSync(cmd, {
+      cwd,
+      stdio: inheritStdio ? "inherit" : "pipe",
+      timeout: timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
+      encoding: "utf-8",
+      ...execOpts,
+    });
   } catch (err) {
-    const stderr = (err.stderr || "").toString().trim();
-    const stdout = (err.stdout || "").toString().trim();
-    return { error: true, message: stderr || stdout || err.message, stderr, stdout };
+    const e = err;
+    const stderr = (e.stderr || "").toString().trim();
+    const stdout = (e.stdout || "").toString().trim();
+    const signal = e.signal ? ` (signal: ${e.signal})` : "";
+    const message = e.killed
+      ? `Process killed${signal} after ${timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS}ms — likely timeout`
+      : (stderr || stdout || e.message || String(err));
+    return { error: true, message, stderr, stdout };
   }
 }
 
@@ -184,9 +278,8 @@ function killServerOnPort(port = 4199) {
       );
     } catch { /* no listener */ }
 
-    // Wait for the port to actually be free.
-    let tries = 0;
-    while (tries < 10) {
+    // Wait for the port to actually be free. Bounded: 10 tries × 500ms = 5s max.
+    for (let tries = 0; tries < 10; tries++) {
       try {
         const r = execSync(
           `powershell -NoProfile -Command "[bool](Get-NetTCPConnection -LocalPort ${port} -EA SilentlyContinue)"`,
@@ -195,7 +288,6 @@ function killServerOnPort(port = 4199) {
         if (r.trim().toLowerCase() !== "true") break;
       } catch { break; }
       try { execSync(`powershell -NoProfile -Command Start-Sleep -Milliseconds 500`, { stdio: "pipe" }); } catch {}
-      tries++;
     }
   } else {
     try { execSync(`fuser -k ${port}/tcp 2>/dev/null || lsof -ti:${port} | xargs kill -9 2>/dev/null || true`, { stdio: "pipe", timeout: 5000 }); } catch {}
@@ -207,11 +299,14 @@ function stopService() {
   killServerOnPort();
 }
 
-/** Remove the OS-level auto-start entry. The CLI binary stays; only the logon trigger is removed. */
+// ── Auto-start: the OS runs the daemon at user logon ──
+// The daemon must start automatically, with no visible window on Windows.
+
+/** Remove the OS-level auto-start entry. Used during uninstall. */
 function removeAutoStart() {
   if (IS_WIN) {
     tryRun(
-      `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "BrowserPowers" /f`
+      `powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName 'BrowserPowers' -Confirm:$false -EA SilentlyContinue"`
     );
   } else if (IS_LINUX) {
     const desktopPath = resolve(homedir(), ".config", "autostart", "browserpowers.desktop");
@@ -226,26 +321,51 @@ function removeAutoStart() {
   }
 }
 
-// ── Auto-start: the OS runs `browserpowers start` at logon ──
-
 /**
- * Windows: HKCU\...\Run key fires `<browserpowers.cmd> start` at logon.
- * Idempotent — `reg add /f` overwrites the same value.
+ * Windows: user-scoped Task Scheduler task that runs the daemon at logon.
+ * The task is configured with Hidden = true so no console window appears.
  */
 function createWindowsAutoStart() {
-  const regValue = `"${BP_BIN_BROWSERPOWERS}" start`;
-  // Escape inner double quotes for the reg /d argument
-  const regData = regValue.replace(/"/g, '\\"');
-  mustRun(
-    `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" ` +
-    `/v "BrowserPowers" /t REG_SZ /d "${regData}" /f`
+  // Clean up legacy auto-start artifacts (VBS launcher + HKCU Run key) if an
+  // old install left them behind, so they cannot trigger a missing file.
+  tryRun(
+    `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "BrowserPowers" /f`
   );
-  log(`  HKCU Run: ${regValue}`);
-  return true;
+  const legacyVbs = resolve(BP_BIN, "browserpowers.vbs");
+  if (existsSync(legacyVbs)) {
+    try { unlinkSync(legacyVbs); } catch {}
+  }
+
+  const tsxCli = resolve(BP_CORE_REPO, "node_modules", "tsx", "dist", "cli.mjs");
+  const coreEntry = resolve(BP_CORE_REPO, "src", "index.ts");
+  const nodePath = process.execPath;
+
+  // Build a temporary PowerShell script so the registration command is readable.
+  const psSingleQuote = (s) => `'${s.replace(/'/g, "''")}'`;
+  const psContent = [
+    `$node = ${psSingleQuote(nodePath)}`,
+    `$tsx = ${psSingleQuote(tsxCli)}`,
+    `$entry = ${psSingleQuote(coreEntry)}`,
+    `$arg = '"' + $tsx + '" "' + $entry + '" serve'`,
+    `$action = New-ScheduledTaskAction -Execute $node -Argument $arg`,
+    `$trigger = New-ScheduledTaskTrigger -AtLogon -User "$env:USERNAME"`,
+    `$settings = New-ScheduledTaskSettingsSet -Hidden`,
+    `Register-ScheduledTask -TaskName "BrowserPowers" -Action $action -Trigger $trigger -Settings $settings -Force`,
+  ].join("\n");
+
+  const tmpPs1 = resolve(BP_DIR, ".register-task.ps1");
+  writeFileSync(tmpPs1, psContent, "utf-8");
+  try {
+    mustRun(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmpPs1}"`, { cwd: BP_DIR });
+    log(`  Scheduled task: BrowserPowers`);
+    return true;
+  } finally {
+    try { unlinkSync(tmpPs1); } catch {}
+  }
 }
 
 /**
- * Linux: XDG autostart .desktop file fires `browserpowers start` at desktop logon.
+ * Linux: XDG autostart .desktop file fires the daemon at desktop logon.
  */
 function createLinuxAutoStart() {
   const autostartDir = resolve(homedir(), ".config", "autostart");
@@ -267,7 +387,7 @@ function createLinuxAutoStart() {
 }
 
 /**
- * macOS: LaunchAgent plist fires `browserpowers start` at logon.
+ * macOS: LaunchAgent plist fires the daemon at logon.
  */
 function createMacAutoStart() {
   const plistDir = resolve(homedir(), "Library", "LaunchAgents");
@@ -293,7 +413,6 @@ function createMacAutoStart() {
   writeFileSync(plistPath, plist, "utf-8");
   log(`  ${plistPath}`);
 
-  // Load the agent (modern macOS: bootstrap, fallback: load)
   try {
     const uid = execSync("id -u", { encoding: "utf-8", timeout: 5000 }).trim();
     tryRun(`launchctl bootstrap gui/${uid} "${plistPath}"`, { timeout: 10000 });
@@ -479,10 +598,10 @@ function printDone(version, extChrome, extFirefox) {
 
   ${bold("📋 CLI:")}
 
-     ${binName("browserpowers")} start          Start daemon (background) — same command the OS runs at logon
+     ${binName("browserpowers")} start          Start daemon in background (no visible window)
      ${binName("browserpowers")} restart        Stop & restart the daemon
      ${binName("browserpowers")} stop           Stop the daemon
-     ${binName("browserpowers")} serve          Run server in foreground
+     ${binName("browserpowers")} serve          Run server in foreground (for debugging)
      ${binName("browserpowers")} list           List connected browsers
      ${binName("browserpowers")} page read      Read page content
      ${binName("browserpowers")} page act       Interact with pages
@@ -523,13 +642,8 @@ ${pathHint}
 
   ${bold("🔄 Auto-start:")}
 
-     The OS runs ${bold('browserpowers start')} at every logon.
-     The same command works manually — if the server dies, just run it again.
-     ${IS_WIN
-       ? `(HKCU\\...\\Run → "${BP_BIN_BROWSERPOWERS}" start)`
-       : IS_MAC
-         ? `(LaunchAgent ~/Library/LaunchAgents/com.browserpowers.plist)`
-         : `(XDG autostart ~/.config/autostart/browserpowers.desktop)`}
+     BrowserPowers starts automatically on logon.
+     To disable, run: node scripts/install.mjs --uninstall
   `);
 }
 
@@ -575,11 +689,7 @@ async function main() {
   const isUpdate = existingVersion !== null;
   const versionChanged = existingVersion && existingVersion !== repoPkg.version;
 
-  if (isUpdate && !versionChanged && !isForce) {
-    console.log(`\n  BrowserPowers ${repoPkg.version} already installed at ${BP_DIR}`);
-    console.log(`  Run with ${cyan("--force")} to re-copy and restart.\n`);
-    process.exit(0);
-  }
+
 
   if (isUpdate && versionChanged) {
     console.log(`\n  Updating: ${yellow(existingVersion)} → ${green(repoPkg.version)}\n`);
@@ -597,66 +707,91 @@ async function main() {
   log(`  ${BP_DIR}`);
   log(`  ${BP_BIN}`);
 
-  // ── Step 2: Copy core ──
-  step(2, "Copying core");
-  if (existsSync(BP_CORE)) rmSync(BP_CORE, { recursive: true, maxRetries: 5, retryDelay: 500 });
-  cpSync(resolve(REPO_DIR, "core"), BP_CORE, {
-    recursive: true,
-    filter: copyFilter,
-  });
-  log(`  core/ → ${BP_CORE}`);
+  // ── Global hard exit cap ──
+  // No matter what happens, the installer is killed and exits after 60s.
+  // This timer fires on the event loop; a synchronous execSync cannot be
+  // interrupted mid-flight, but every execSync below is capped at 60s as
+  // well, so the worst-case total runtime is bounded.
+  setTimeout(() => {
+    console.error(`\n  ${red("✖")} Install timed out after 60 seconds — exiting hard.\n`);
+    cleanupPartial();
+    process.exit(124);
+  }, 60_000).unref();
 
-  // ── Step 3: Install core deps ──
-  step(3, "Installing core dependencies");
-  mustRun("pnpm install --no-frozen-lockfile --ignore-scripts", { cwd: BP_CORE });
+  // ── Step 2: Install core deps in the repo (where the pnpm workspace works) ──
+  // The repo is a pnpm workspace (`pnpm-workspace.yaml` with `core` + `extension`).
+  // Copying `core/` to `~/.browserpowers/core/` and running pnpm install there is
+  // a no-op on pnpm 11 (it reports "Already up to date" without installing). So
+  // the core stays in the repo and runs from there. The CLI wrapper and the
+  // daemon spawn both point at the repo's core paths.
+  step(2, "Installing core dependencies (in workspace)");
+  mustRun("pnpm install --no-frozen-lockfile", { cwd: BP_CORE_REPO, inheritStdio: true });
   log("  Done.");
 
-  // ── Step 4: Copy & build extension ──
-  step(4, "Building extension for Chrome and Firefox");
+  // ── Step 3: Build extension in-place, then atomically swap into place ──
+  // The repo is a pnpm workspace (`pnpm-workspace.yaml` with `core` + `extension`).
+  // Building inside the repo keeps pnpm in its native workspace context. The
+  // built `.output/chrome-mv3` and `.output/firefox-mv2` are staged under
+  // `~/.browserpowers/`, then atomically swapped onto the canonical extension
+  // paths. The browser's reference to those paths stays valid throughout —
+  // the old extension is moved aside only after the new one is fully staged,
+  // and restored on any failure. There is a single canonical path per
+  // browser; uninstall + reinstall always replaces it cleanly.
+  step(3, "Building extension for Chrome and Firefox");
 
-  const EXT_TMP = resolve(BP_DIR, ".ext-tmp");
+  const EXT_REPO = resolve(REPO_DIR, "extension");
   const EXT_CHROME = BP_EXT;
   const EXT_FIREFOX = resolve(BP_DIR, "extension-firefox");
 
-  if (existsSync(EXT_TMP)) rmSync(EXT_TMP, { recursive: true, maxRetries: 3, retryDelay: 300 });
-  if (existsSync(EXT_CHROME)) rmSync(EXT_CHROME, { recursive: true, maxRetries: 3, retryDelay: 300 });
+  log("  Installing extension dependencies (in workspace)...");
+  mustRun("pnpm install --no-frozen-lockfile", { cwd: EXT_REPO, inheritStdio: true });
 
-  cpSync(resolve(REPO_DIR, "extension"), EXT_TMP, {
-    recursive: true,
-    filter: copyFilter,
-  });
-
-  log("  Installing extension dependencies...");
-  mustRun("pnpm install --no-frozen-lockfile --ignore-scripts", { cwd: EXT_TMP });
-
-  // Build Chrome MV3
+  // ── Chrome MV3 ──
   log("  Building Chrome MV3...");
-  mustRun("pnpm build:chrome", { cwd: EXT_TMP });
-  const chromeBuilt = resolve(EXT_TMP, ".output", "chrome-mv3");
-  if (existsSync(chromeBuilt)) {
-    cpSync(chromeBuilt, EXT_CHROME, { recursive: true });
-    log(`  → ${EXT_CHROME} (manifest.json at root)`);
+  mustRun("pnpm run build:chrome", { cwd: EXT_REPO, inheritStdio: true });
+  const chromeBuilt = resolve(EXT_REPO, ".output", "chrome-mv3");
+  if (!existsSync(chromeBuilt)) {
+    fatal(`Chrome build did not produce expected output at ${chromeBuilt}`);
   }
+  if (existsSync(BP_STAGING_CHROME)) {
+    rmSync(BP_STAGING_CHROME, { recursive: true, force: true, maxRetries: 3, retryDelay: 300 });
+  }
+  try {
+    cpSync(chromeBuilt, BP_STAGING_CHROME, { recursive: true });
+  } catch (err) {
+    cleanupPartial();
+    fatal(`Failed to stage Chrome extension: ${err && err.message ? err.message : String(err)}`);
+  }
+  atomicSwapDir(BP_STAGING_CHROME, EXT_CHROME);
+  log(`  → ${EXT_CHROME} (manifest.json at root)`);
 
-  // Build Firefox MV2
+  // ── Firefox MV2 ──
   log("  Building Firefox MV2...");
-  mustRun("pnpm build:firefox", { cwd: EXT_TMP });
-  const ffBuilt = resolve(EXT_TMP, ".output", "firefox-mv2");
-  if (existsSync(ffBuilt)) {
-    mkdirSync(EXT_FIREFOX, { recursive: true });
-    cpSync(ffBuilt, EXT_FIREFOX, { recursive: true });
-    log(`  → ${EXT_FIREFOX} (manifest.json at root)`);
+  mustRun("pnpm run build:firefox", { cwd: EXT_REPO, inheritStdio: true });
+  const ffBuilt = resolve(EXT_REPO, ".output", "firefox-mv2");
+  if (!existsSync(ffBuilt)) {
+    fatal(`Firefox build did not produce expected output at ${ffBuilt}`);
   }
+  if (existsSync(BP_STAGING_FIREFOX)) {
+    rmSync(BP_STAGING_FIREFOX, { recursive: true, force: true, maxRetries: 3, retryDelay: 300 });
+  }
+  try {
+    cpSync(ffBuilt, BP_STAGING_FIREFOX, { recursive: true });
+  } catch (err) {
+    cleanupPartial();
+    fatal(`Failed to stage Firefox extension: ${err && err.message ? err.message : String(err)}`);
+  }
+  atomicSwapDir(BP_STAGING_FIREFOX, EXT_FIREFOX);
+  log(`  → ${EXT_FIREFOX} (manifest.json at root)`);
 
-  // Clean up temp
-  rmSync(EXT_TMP, { recursive: true, maxRetries: 3, retryDelay: 300 });
   log("  Done.");
 
-  // ── Step 5: Create CLI wrappers ──
-  step(5, "Creating CLI wrapper");
+  // ── Step 4: Create CLI wrappers ──
+  step(4, "Creating CLI wrapper");
 
-  const tsxCli = resolve(BP_CORE, "node_modules", "tsx", "dist", "cli.mjs");
-  const coreEntry = resolve(BP_CORE, "src", "index.ts");
+  // Core runs from the repo (where pnpm's workspace context works).
+  const tsxCli = resolve(BP_CORE_REPO, "node_modules", "tsx", "dist", "cli.mjs");
+  const coreEntry = resolve(BP_CORE_REPO, "src", "index.ts");
   writeCliWrappers(tsxCli, coreEntry);
 
   // PATH hint
@@ -682,47 +817,28 @@ async function main() {
     console.log(`      source ${rc || "~/.profile"}`);
   }
 
-  // ── Step 6: Register auto-start (OS runs `browserpowers start` at logon) ──
-  step(6, "Registering auto-start");
+  // ── Step 5: Register hidden auto-start ──
+  step(5, "Registering auto-start");
   const autoStartOk = createAutoStart();
   if (!autoStartOk) {
     log(`  ${yellow("⚠ Auto-start registration incomplete. See instructions above.")}`);
   }
 
-  // ── Step 7: Start the server in background ──
-  step(7, "Starting daemon");
-  if (IS_WIN) {
-    // `start /b` creates a background process that survives when this script exits.
-    spawn("cmd.exe", [
-      "/c", "start", "/b", "",
-      process.execPath, tsxCli, coreEntry, "serve",
-    ], {
-      windowsHide: true,
-      stdio: "ignore",
-      cwd: BP_CORE,
-    }).unref();
-  } else {
-    spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
-      detached: true,
-      stdio: "ignore",
-      cwd: BP_CORE,
-    }).unref();
-  }
-  // Brief poll
-  log("  Waiting for daemon to come up...");
-  for (let i = 0; i < 20; i++) {
-    await new Promise((r) => setTimeout(r, 250));
-    if (isPortBusy()) { break; }
-  }
-  if (isPortBusy()) {
-    log(`  ${green("Daemon started.")}`);
-  } else {
-    log(`  ${yellow("Daemon may still be starting. Run 'browserpowers start' to retry.")}`);
-  }
-
+  // ── Step 6: Start the server in background via the installed CLI wrapper ──
+  // Reuse `browserpowers start` so the same cross-platform detached start
+  // logic runs. The CLI polls the port for up to 5 s and then exits, so the
+  // installer does not need an additional fixed wait (and avoids double-
+  // waiting). On Windows the wrapper runs in the installer's console context,
+  // so no new window is created.
+  step(6, "Starting daemon");
+  mustRun(`"${BP_BIN_BROWSERPOWERS}" start`, { cwd: BP_DIR, windowsHide: true });
+  log(`  ${green("Install complete — daemon started.")}`);
 
   // ── Done ──
   printDone(repoPkg.version, EXT_CHROME, EXT_FIREFOX);
+
+  // Explicit exit. The script must never rely on implicit process shutdown.
+  process.exit(0);
 }
 
 main();

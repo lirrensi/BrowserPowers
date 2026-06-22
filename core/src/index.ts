@@ -1,3 +1,9 @@
+// FILE: core/src/index.ts
+// PURPOSE: BrowserPowers CLI entry point: serve, start/stop/restart daemon, and run CLI commands.
+// OWNS: Process-mode dispatch, detached daemon lifecycle, and graceful server startup.
+// EXPORTS: none (side-effect entry point)
+// DOCS: docs/spec/installer-hard-spec.md
+
 import { createServer } from "node:http";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -52,11 +58,55 @@ function resolvePaths() {
   return { coreEntry, coreDir, tsxCli };
 }
 
+// ── Windows Task Scheduler helpers ──────────────────────
+
+/** Escape a task name for safe use in a PowerShell single-quoted string. */
+function psTaskName(name: string): string {
+  return name.replace(/'/g, "''");
+}
+
+/** Returns true if a scheduled task with the given name exists. */
+function windowsTaskExists(name: string): boolean {
+  const safeName = psTaskName(name);
+  try {
+    execSync(
+      `powershell -NoProfile -Command "$t = Get-ScheduledTask -TaskName '${safeName}' -EA SilentlyContinue; if ($t) { exit 0 } else { exit 1 }"`,
+      { stdio: "pipe", encoding: "utf-8", timeout: 5000, windowsHide: true }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Start a scheduled task by name. Best-effort; never throws. */
+function startWindowsTask(name: string): void {
+  const safeName = psTaskName(name);
+  try {
+    execSync(
+      `powershell -NoProfile -Command "Start-ScheduledTask -TaskName '${safeName}'"`,
+      { stdio: "pipe", timeout: 8000, windowsHide: true }
+    );
+  } catch { /* task may not exist or may not be startable */ }
+}
+
+/** Stop a scheduled task by name. Best-effort; never throws. */
+function stopWindowsTask(name: string): void {
+  const safeName = psTaskName(name);
+  try {
+    execSync(
+      `powershell -NoProfile -Command "Stop-ScheduledTask -TaskName '${safeName}' -EA SilentlyContinue"`,
+      { stdio: "pipe", timeout: 8000, windowsHide: true }
+    );
+  } catch { /* task may not exist or may not be running */ }
+}
+
 /**
  * Start the server in a background process that survives its parent.
  *
- * Windows: `cmd.exe /c start /b "" <node> ...` — the only native mechanism that
- *          creates a windowless child process NOT tied to the parent's lifetime.
+ * Windows: user-scoped Task Scheduler task `BrowserPowers` is started with
+ *          `Start-ScheduledTask`; falls back to a hidden direct spawn if the
+ *          task has not been registered yet.
  * Unix:    standard `detached: true` spawn — works natively on POSIX.
  */
 async function startDetached(): Promise<void> {
@@ -64,19 +114,24 @@ async function startDetached(): Promise<void> {
     console.log(`BrowserPowers is already running on port ${config.port}.`);
     process.exit(0);
   }
-  const { coreEntry, coreDir, tsxCli } = resolvePaths();
 
   if (process.platform === "win32") {
-    // `start /b` runs without a new window and the launched process outlives cmd.exe.
-    spawn("cmd.exe", [
-      "/c", "start", "/b", "",
-      process.execPath, tsxCli, coreEntry, "serve",
-    ], {
-      stdio: "ignore",
-      windowsHide: true,
-      cwd: coreDir,
-    }).unref();
+    if (windowsTaskExists("BrowserPowers")) {
+      startWindowsTask("BrowserPowers");
+    } else {
+      console.warn("Warning: BrowserPowers scheduled task not found; starting directly.");
+      const { coreEntry, coreDir, tsxCli } = resolvePaths();
+      const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
+        detached: true,
+        windowsHide: true,
+        stdio: "ignore",
+        cwd: coreDir,
+      });
+      child.on("error", () => {});
+      child.unref();
+    }
   } else {
+    const { coreEntry, coreDir, tsxCli } = resolvePaths();
     const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
       detached: true,
       stdio: "ignore",
@@ -124,11 +179,17 @@ function killServerOnPort(port: number): void {
 }
 
 async function restartDetached(): Promise<void> {
+  if (process.platform === "win32") {
+    stopWindowsTask("BrowserPowers");
+  }
   killServerOnPort(config.port);
   await startDetached();
 }
 
 async function stopDetached(): Promise<void> {
+  if (process.platform === "win32") {
+    stopWindowsTask("BrowserPowers");
+  }
   killServerOnPort(config.port);
   // Wait for port to actually free.
   for (let i = 0; i < 20; i++) {

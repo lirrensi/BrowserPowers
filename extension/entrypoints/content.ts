@@ -2,9 +2,17 @@
  * FILE: extension/entrypoints/content.ts
  * PURPOSE: Persistent content script entrypoint — handles all DOM interaction messages from
  *          the service worker by dispatching to real TypeScript functions in content-actions.ts.
+ *          Runs a RUNTIME_SELFTEST at document_start and attaches the verdict to every response.
+ *          Also owns the isolated-world `handleJs` (the fallback path for `page.js` when the
+ *          CDP attach is denied) and the `runtime_status` builder for the local surface state.
+ *          The MAIN-world console capture surface (a small JS file that piped entries through
+ *          a shared DOM `<meta>` element + MutationObserver) was retired when CDP took over
+ *          console capture — see plan_cdp-max-authority_2026-06-22.md.
  * OWNS: Message dispatch hub for bp:read, bp:act, bp:js messages in the page context.
  * EXPORTS: WXT content script via defineContentScript (global)
- * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md
+ * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
+ *       .agents/reports/plan_cdp-max-authority_2026-06-22.md
  */
 
 import {
@@ -48,50 +56,43 @@ import {
   generateSelector,
 } from "../src/v2/content-actions";
 import type { Target, ActResult } from "../src/v2/content-actions";
+import type { ExecutionVerdict } from "../src/types.js";
 
-// ── Console Capture Buffer ──
-// The MAIN world override (from capture.js, registered via
-// registerContentScripts({ world: "MAIN" })) writes entries to a shared DOM
-// <meta id="__bp_pipe"> via data-e attribute. The content script watches this
-// element via MutationObserver — the DOM is genuinely shared between worlds.
-// This bypasses broken postMessage and executeScript({ world: "MAIN" }) paths.
+// ── Runtime Self-Test ──
+// Synchronous, document_start — proves the content script's isolated world can
+// actually evaluate JS. The verdict rides on every response so callers can
+// detect a broken isolated world (e.g. extension CSP somehow denied eval).
+const RUNTIME_SELFTEST: ExecutionVerdict = ((): ExecutionVerdict => {
+  const start = performance.now();
+  try {
+    const sum = new Function("a", "b", "return a + b")(2, 3);
+    if (sum !== 5) throw new Error("new Function returned " + sum);
+    return {
+      executed: true,
+      world: "isolated",
+      value: 5,
+      durationMs: performance.now() - start,
+      path: "selftest.newFunction",
+    };
+  } catch (e) {
+    return {
+      executed: false,
+      world: "isolated",
+      error: { name: "SelfTestError", message: String(e) },
+      durationMs: performance.now() - start,
+      path: "selftest.newFunction",
+    };
+  }
+})();
 
-const CONSOLE_MAX = 500;
-const consoleBuffer: Array<{ level: string; messages: unknown[]; timestamp: number; stack?: string }> = [];
+const CONTENT_SCRIPT_REGISTERED_AT = Date.now();
 
-// Set up pipe element and observer at module scope (runs at document_start).
-// The pipe is created early so capture.js (MAIN world, document_start) can
-// find it when it runs.
-if (typeof MutationObserver !== 'undefined') {
-  const pipe = document.createElement('meta');
-  pipe.id = '__bp_pipe';
-  (document.head || document.documentElement).appendChild(pipe);
-  const obs = new MutationObserver(() => {
-    const raw = pipe.getAttribute('data-e');
-    if (!raw) return;
-    try {
-      const entry = JSON.parse(raw);
-      consoleBuffer.push(entry);
-      if (consoleBuffer.length > CONSOLE_MAX) {
-        consoleBuffer.splice(0, consoleBuffer.length - CONSOLE_MAX);
-      }
-    } catch { /* malformed JSON — skip */ }
-  });
-  obs.observe(pipe, { attributes: true, attributeFilter: ['data-e'] });
-}
-
-// ── Console Entry Type ──
-interface ConsoleEntry { level: string; messages: unknown[]; timestamp: number; stack?: string; }
+// ── Content Script WXT Definition ──
 
 export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
   main() {
-    // Console capture is handled by capture.js (registered via
-    // registerContentScripts({ world: "MAIN" })) which overrides console in the
-    // page's MAIN world and pipes entries via a shared DOM <meta> element.
-    // The MutationObserver at module scope (above) buffers them.
-
     chrome.runtime.onMessage.addListener(
       (
         message: { source: string; type: string; action?: string; params?: Record<string, unknown> },
@@ -101,7 +102,12 @@ export default defineContentScript({
         if (message.source !== "browserpowers") return false;
 
         handleMessage(message).then(sendResponse).catch((err) => {
-          sendResponse({ success: false, message: `Content script error: ${(err as Error).message}`, errorCode: "CONTENT_SCRIPT_ERROR" });
+          sendResponse({
+            success: false,
+            message: `Content script error: ${(err as Error).message}`,
+            errorCode: "CONTENT_SCRIPT_ERROR",
+            runtimeStatus: RUNTIME_SELFTEST,
+          });
         });
         return true; // keep channel open for async
       },
@@ -118,6 +124,11 @@ function ensureReady(): Promise<void> {
   });
 }
 
+/** Wrap a response envelope so the runtime self-test rides on every reply. */
+function withRuntimeStatus(envelope: Record<string, unknown>): Record<string, unknown> {
+  return { ...envelope, runtimeStatus: RUNTIME_SELFTEST };
+}
+
 // ── Message Handler ──
 
 async function handleMessage(
@@ -126,16 +137,18 @@ async function handleMessage(
   try {
     switch (message.type) {
       case "bp:read":
-        return handleRead(message.action || "", message.params || {});
+        return withRuntimeStatus(await handleRead(message.action || "", message.params || {}));
       case "bp:act":
-        return handleAct(message.action || "", message.params || {});
+        return withRuntimeStatus(await handleAct(message.action || "", message.params || {}));
       case "bp:js":
-        return handleJs(message.params || {});
+        return withRuntimeStatus(await handleJs(message.params || {}));
+      case "bp:runtime_status":
+        return withRuntimeStatus(buildRuntimeStatus());
       default:
-        return { success: false, message: `Unknown message type: ${message.type}`, errorCode: "UNKNOWN_TYPE" };
+        return withRuntimeStatus({ success: false, message: `Unknown message type: ${message.type}`, errorCode: "UNKNOWN_TYPE" });
     }
   } catch (err) {
-    return { success: false, message: `Handler error: ${(err as Error).message}`, errorCode: "HANDLER_ERROR" };
+    return withRuntimeStatus({ success: false, message: `Handler error: ${(err as Error).message}`, errorCode: "HANDLER_ERROR" });
   }
 }
 
@@ -198,12 +211,15 @@ async function handleRead(
       return generateSelector(css);
     }
     case "console": {
-      const limit = (params.limit as number) ?? 50;
-      const offset = (params.offset as number) ?? 0;
-      const totalCount = consoleBuffer.length;
-      const entries = consoleBuffer.slice(-(offset + limit), -(offset) || undefined);
-      return { entries, totalCount };
+      // Console capture moved to the SW-side CDP module. This action is
+      // kept here as a defensive no-op so older callers still get a 200-shaped
+      // response if they happen to call it through the content-script path.
+      // The service worker should handle `page.read action=console` itself;
+      // it never reaches here in the current build.
+      return { entries: [], totalCount: 0, source: "deprecated", _hint: "console is served by the SW CDP layer" };
     }
+    case "runtime_status":
+      return buildRuntimeStatus();
     default:
       return { success: false, message: `Unknown read action: ${action}`, errorCode: "UNKNOWN_ACTION" };
   }
@@ -221,13 +237,14 @@ async function handleAct(
   const resolveEl = async (): Promise<Element | null> => {
     const attempt = (): Element | null => {
       const sel = params.selector as string | undefined;
+      const shadowPath = params.shadowPath as string[] | undefined;
       if (sel) {
-        const resolution = resolveTarget({ css: sel });
+        const resolution = resolveTarget({ css: sel }, shadowPath);
         return resolution.found ? (resolution.element ?? null) : null;
       }
       const target = params.target as Target | undefined;
       if (target) {
-        const resolution = resolveTarget(target);
+        const resolution = resolveTarget(target, shadowPath);
         if (resolution.found && resolution.element) return resolution.element;
       }
       return null;
@@ -364,12 +381,14 @@ async function handleAct(
       // Element conditions
       const sel = params.selector as string | undefined;
       const target = params.target as Target | undefined;
+      const shadowPath = params.shadowPath as string[] | undefined;
 
       if (sel) {
         return waitForElement(sel, condition, timeout, pollInterval);
       }
       if (target) {
-        return waitForTarget(target, condition, timeout, pollInterval);
+        const t: Target = shadowPath ? { ...target, shadowPath } : target;
+        return waitForTarget(t, condition, timeout, pollInterval);
       }
       // No selector or target — just wait
       await new Promise((r) => setTimeout(r, timeout));
@@ -387,8 +406,14 @@ async function handleJs(params: Record<string, unknown>): Promise<Record<string,
   await ensureReady();
   const code = params.code as string | undefined;
   if (!code) {
-    return { success: false, message: "No code provided", errorCode: "MISSING_PARAM" };
+    return {
+      success: false,
+      message: "No code provided",
+      errorCode: "MISSING_PARAM",
+      executionVerdict: { executed: false, world: "isolated", durationMs: 0, path: "isolated.newFunction" },
+    };
   }
+  const start = performance.now();
   try {
     const result = new Function(code)();
     // Try to serialize — if it fails, return type info
@@ -402,8 +427,69 @@ async function handleJs(params: Record<string, unknown>): Promise<Record<string,
         hint: result === null ? "null" : result?.constructor?.name || typeof result,
       };
     }
-    return { success: true, data: { result: serialized } };
+    return {
+      success: true,
+      data: { result: serialized },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        value: serialized,
+        durationMs: performance.now() - start,
+        path: "isolated.newFunction",
+      },
+    };
   } catch (err) {
-    return { success: false, message: `JavaScript execution failed: ${(err as Error).message}`, errorCode: "JS_EXECUTION_ERROR" };
+    const e = err as Error;
+    return {
+      success: false,
+      message: `JavaScript execution failed: ${e.message}`,
+      errorCode: "JS_EXECUTION_ERROR",
+      executionVerdict: {
+        executed: false,
+        world: "isolated",
+        durationMs: performance.now() - start,
+        path: "isolated.newFunction",
+        error: { name: e.name || "Error", message: e.message, line: (e as any).lineNumber, column: (e as any).columnNumber },
+      },
+    };
   }
+}
+
+// ── Runtime Status Builder ──
+
+/**
+ * Build the full surface state for `page.read action=runtime_status` and
+ * `bp:runtime_status`. Reports:
+ *   - contentScript: self-test + when we registered
+ *   - isolatedWorld: does `new Function` work? does DOM access work?
+ *   - executeScriptPaths: the SW-side executeScript call sites the SW owns
+ *   - registeredSurfaces: every world we have a presence in
+ *
+ * Note: console capture used to live here (driven by the MAIN-world
+ * capture script + DOM-pipe MutationObserver). It has been moved to the
+ * SW-side CDP layer (extension/src/cdp.ts) and is now merged into the
+ * response under the `cdp` block by page-read.ts. The `consoleCapture`
+ * field is kept on the SW-side response only.
+ */
+function buildRuntimeStatus(): Record<string, unknown> {
+  return {
+    contentScript: {
+      alive: true,
+      selfTest: RUNTIME_SELFTEST,
+      registeredAt: CONTENT_SCRIPT_REGISTERED_AT,
+    },
+    isolatedWorld: {
+      newFunctionWorks: RUNTIME_SELFTEST.executed,
+      domAccessWorks: document.querySelector('html') !== null,
+    },
+    // SW-side call sites — the verdict contract says "world: isolated" is
+    // the default. The SW surfaces these through its own verdict field.
+    executeScriptPaths: [
+      { name: 'storage.get', world: 'isolated', registeredAt: CONTENT_SCRIPT_REGISTERED_AT },
+      { name: 'storage.set', world: 'isolated', registeredAt: CONTENT_SCRIPT_REGISTERED_AT },
+    ],
+    registeredSurfaces: [
+      'isolated:content-script',
+    ],
+  };
 }

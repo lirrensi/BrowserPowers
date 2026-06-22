@@ -3,10 +3,11 @@
  * PURPOSE: Build ActionResult envelope objects for page interaction API v2.
  * OWNS: ActionResult construction helpers — one function per status.
  * EXPORTS: performed, alreadyInDesiredState, notPerformed, ambiguous, blocked, anchorStaleError, ActionResultOpts
- * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 2a)
+ * DOCS: agent_chat/plan_adr001_v2_2026-05-12.md (Phase 2a),
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md
  */
 
-import type { ActionResult } from "../types.js";
+import type { ActionResult, ExecutionVerdict } from "../types.js";
 
 export interface ActionResultOpts {
   targetSummary?: string;
@@ -15,6 +16,10 @@ export interface ActionResultOpts {
   recoverable?: boolean;
   suggestions?: string[];
   data?: Record<string, unknown>;
+  /** Additive — content-script ExecutionVerdict when present. */
+  executionVerdict?: ExecutionVerdict;
+  /** Additive — content-script runtime self-test when present. */
+  runtimeStatus?: ExecutionVerdict;
 }
 
 function build(
@@ -34,6 +39,8 @@ function build(
     recoverable: opts?.recoverable,
     suggestions: opts?.suggestions,
     data: opts?.data,
+    executionVerdict: opts?.executionVerdict,
+    runtimeStatus: opts?.runtimeStatus,
   };
 }
 

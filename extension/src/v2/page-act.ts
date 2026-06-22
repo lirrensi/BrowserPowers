@@ -3,14 +3,17 @@
  * PURPOSE: Dispatch act actions (click, fill, check, select_option, press, scroll, submit, wait_for,
  *          type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond)
  *          via chrome.tabs.sendMessage to the persistent content script.
+ *          Surfaces the content-script ExecutionVerdict at the top level of
+ *          the ActionResult and forwards shadowPath from anchors.
  * OWNS: page.act dispatch — each act action implementation in the service worker.
  * EXPORTS: dispatchActAction
- * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md
+ * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md
  */
 
 import { getAnchor } from "./anchor-manager.js";
 import { performed, notPerformed, ambiguous, blocked } from "./action-result.js";
-import type { ActionResult, Target } from "../types.js";
+import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
 type ActAction =
   | "click" | "fill" | "check" | "select_option" | "press" | "scroll" | "submit"
@@ -52,6 +55,18 @@ export async function dispatchActAction(
 
 // ── Helper: send act message to content script ──
 
+/** Extract the ExecutionVerdict and runtimeStatus from a content-script response. */
+function extractVerdicts(response: Record<string, unknown> | null | undefined): {
+  executionVerdict?: ExecutionVerdict;
+  runtimeStatus?: ExecutionVerdict;
+} {
+  if (!response) return {};
+  return {
+    executionVerdict: response.executionVerdict as ExecutionVerdict | undefined,
+    runtimeStatus: response.runtimeStatus as ExecutionVerdict | undefined,
+  };
+}
+
 async function sendActMessage(
   tabId: number,
   action: string,
@@ -76,12 +91,16 @@ async function sendActMessage(
         });
       }
 
+      const { executionVerdict, runtimeStatus } = extractVerdicts(response);
+
       // Map content script response to ActionResult
       if (response.errorCode === "ANCHOR_STALE") {
         return blocked(action, response.message as string, {
           errorCode: "ANCHOR_STALE",
           recoverable: true,
           suggestions: ["Run page.read with action=inspect again", "Use a semantic target instead"],
+          executionVerdict,
+          runtimeStatus,
         });
       }
       if (response.blocked) {
@@ -93,6 +112,8 @@ async function sendActMessage(
             "Close any modals, popups, or spinners first",
             "Run page.read with action=inspect to see current elements",
           ],
+          executionVerdict,
+          runtimeStatus,
         });
       }
       if (response.errorCode === "AMBIGUOUS_TARGET") {
@@ -101,17 +122,23 @@ async function sendActMessage(
           recoverable: true,
           evidence: { matchedCount: response.matchCount },
           suggestions: ["Run page.read with action=inspect to choose an anchor", "Refine the target"],
+          executionVerdict,
+          runtimeStatus,
         });
       }
       if (response.errorCode === "TARGET_NOT_FOUND" || response.success === false) {
         return notPerformed(action, response.message as string, {
           errorCode: response.errorCode as string | undefined,
+          executionVerdict,
+          runtimeStatus,
         });
       }
 
       return performed(action, (response.message as string) || `${action} completed`, {
         evidence: response.evidence as Record<string, unknown>,
         data: response,
+        executionVerdict,
+        runtimeStatus,
       });
     } catch (err) {
       const msg = (err as Error).message || String(err);
@@ -155,7 +182,12 @@ function resolveTargetParams(
   if (anchor) {
     const entry = getAnchor(tabId, anchor);
     if (!entry) return "STALE";
-    return { selector: entry.selector };
+    const params: Record<string, unknown> = { selector: entry.selector };
+    // Forward shadow path so the content script can resolve shadow-DOM targets.
+    if (entry.shadowPath && entry.shadowPath.length > 0) {
+      params.shadowPath = entry.shadowPath;
+    }
+    return params;
   }
   if (target) {
     return { target };

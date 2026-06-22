@@ -4,6 +4,7 @@
  *          content script at document_start, replacing the fragile string-body injection pattern.
  * OWNS: Target resolution, inspection, act actions, dialog control, wait conditions, read operations.
  * EXPORTS: resolveTarget, inspectElements, listFrames,
+ *          walkShadowPath, getShadowHostChain,
  *          clickElement, fillElement, checkElement, selectOption, pressKeys,
  *          scrollElement, submitForm, typeText, uploadFile, dragElement,
  *          dblclickElement, hoverElement, dialogOverride, dialogRespond,
@@ -12,10 +13,15 @@
  *          readContent, readTexts, readHtml, readAttr, readMeta, readForms,
  *          countElements, selectText, readSummary, generateSelector,
  *          initConsoleCapture, getConsoleEntries
- * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md
+ * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md
  */
 
 // ── Types ──
+
+import type { ExecutionVerdict } from "../types.js";
+
+export type { ExecutionVerdict } from "../types.js";
 
 export interface Target {
   css?: string;
@@ -25,6 +31,10 @@ export interface Target {
   label?: string;
   placeholder?: string;
   testId?: string;
+  /** Optional Playwright-style ">>"-separated chain (e.g. "my-app >> .btn-save"). */
+  cssChain?: string[];
+  /** Optional explicit shadow host chain (tag names) leading to a target inside a shadow root. */
+  shadowPath?: string[];
 }
 
 export interface ActResult {
@@ -34,6 +44,8 @@ export interface ActResult {
   errorCode?: string;
   blocked?: boolean;
   matchCount?: number;
+  /** Additive — every act path emits an ExecutionVerdict. */
+  executionVerdict?: ExecutionVerdict;
 }
 
 export interface InspectResult {
@@ -50,6 +62,8 @@ export interface ResolutionResult {
   matchCount?: number;
   found: boolean;
   error?: string;
+  /** Which resolution strategy produced this result. */
+  pathTaken?: "shadow-walk" | "css-chain" | "css-flat" | "text" | "anchor" | "role" | "label" | "placeholder" | "testId";
 }
 
 export interface FrameInfo {
@@ -70,23 +84,134 @@ function cssEscape(value: string): string {
   return value.replace(/[\\"\]>+~:]/g, '\\$&');
 }
 
+// ── Shadow-DOM Helpers ──
+
+/**
+ * Walk a host-chain of shadow roots to find an element matching `leafSelector`.
+ * `path` is an array of CSS selectors — each one resolves the next shadow host
+ * in the chain. The leaf is then resolved with `leafSelector`.
+ *
+ * Example: walkShadowPath(["my-app", "inner-card"], "button.btn-save")
+ *   → finds document.querySelector("my-app").shadowRoot.querySelector("inner-card").shadowRoot.querySelector("button.btn-save")
+ *
+ * Returns null if any host is missing or its shadowRoot is closed.
+ */
+export function walkShadowPath(path: string[], leafSelector: string): Element | null {
+  if (!path || path.length === 0) return null;
+  let scope: Document | ShadowRoot = document;
+  // Walk the host chain. The last entry of `path` is the deepest host
+  // whose shadow root we should query with the leaf selector.
+  for (let i = 0; i < path.length; i++) {
+    const sel = path[i];
+    const host: Element | null = scope.querySelector(sel);
+    if (!host) return null;
+    if (i === path.length - 1) {
+      // Last host: query its shadow root (if any) OR fall through to leaf
+      if (host.shadowRoot) {
+        return host.shadowRoot.querySelector(leafSelector);
+      }
+      // No shadow on last host — query the host subtree directly
+      return host.querySelector(leafSelector);
+    }
+    // Intermediate host: must have a shadow root
+    if (!host.shadowRoot) return null;
+    scope = host.shadowRoot;
+  }
+  return null;
+}
+
+/**
+ * Build the shadow-host chain for a given element: starts with the element itself,
+ * then walks up through every ShadowRoot.host, ending at the top-level element
+ * (the one whose root is the document).
+ *
+ * Example: a button inside <my-app> inside <body> in MAIN world →
+ *   [button, my-app, body, html]
+ */
+export function getShadowHostChain(el: Element): Element[] {
+  const chain: Element[] = [el];
+  let node: Node | null = el;
+  while (node) {
+    const root = node.getRootNode();
+    if (root instanceof ShadowRoot) {
+      const host = root.host as Element;
+      chain.push(host);
+      node = host;
+    } else {
+      break;
+    }
+  }
+  return chain;
+}
+
 // ── Target Resolution ──
 
-export function resolveTarget(target: Target): ResolutionResult {
+export function resolveTarget(target: Target, anchorShadowPath?: string[]): ResolutionResult {
   if (!target) return { found: false, error: "No target or anchor provided" };
 
-  const candidates: Array<{ element: Element; source: string; summary: string }> = [];
+  // 1. Explicit shadow path on the Target object itself
+  const effectiveShadowPath = target.shadowPath && target.shadowPath.length > 0
+    ? target.shadowPath
+    : anchorShadowPath && anchorShadowPath.length > 0
+      ? anchorShadowPath
+      : undefined;
 
-  function collect(selector: string, source: string): void {
+  // 2. Playwright-style ">>" chain in target.cssChain
+  if (target.cssChain && target.cssChain.length > 0) {
+    const chain = target.cssChain.map((s) => s.trim()).filter((s) => s.length > 0);
+    if (chain.length > 0) {
+      const leaf = chain[chain.length - 1];
+      const hosts = chain.slice(0, -1);
+      const el = walkShadowPath(hosts, leaf);
+      if (el) {
+        return {
+          element: el,
+          source: "css-chain",
+          summary: chain.join(" >> "),
+          matchCount: 1,
+          found: true,
+          pathTaken: "css-chain",
+        };
+      }
+    }
+  }
+
+  // 3. Shadow path resolution
+  if (effectiveShadowPath && target.css) {
+    const el = walkShadowPath(effectiveShadowPath, target.css);
+    if (el) {
+      return {
+        element: el,
+        source: "shadow-walk",
+        summary: [...effectiveShadowPath, target.css].join(" >> "),
+        matchCount: 1,
+        found: true,
+        pathTaken: "shadow-walk",
+      };
+    }
+    // Shadow walk failed — fall through to flat fallback, but record the path we tried.
+    const flat = resolveTargetFlat(target, "css-flat");
+    if (flat.found) return { ...flat, pathTaken: "css-flat" };
+    return flat;
+  }
+
+  // 4. Flat fallback (the existing logic)
+  return resolveTargetFlat(target, "css-flat");
+}
+
+function resolveTargetFlat(target: Target, defaultPathTaken: ResolutionResult["pathTaken"]): ResolutionResult {
+  const candidates: Array<{ element: Element; source: string; summary: string; pathTaken: ResolutionResult["pathTaken"] }> = [];
+
+  function collect(selector: string, source: string, pathTaken: ResolutionResult["pathTaken"]): void {
     try {
       const els = document.querySelectorAll(selector);
       for (let i = 0; i < els.length; i++) {
-        candidates.push({ element: els[i], source, summary: selector });
+        candidates.push({ element: els[i], source, summary: selector, pathTaken });
         // Penetrate open shadow roots
         if (els[i].shadowRoot) {
           const shadowEls = els[i].shadowRoot!.querySelectorAll(selector);
           for (let j = 0; j < shadowEls.length; j++) {
-            candidates.push({ element: shadowEls[j], source: source + "(shadow)", summary: selector });
+            candidates.push({ element: shadowEls[j], source: source + "(shadow)", summary: selector, pathTaken });
           }
         }
       }
@@ -97,7 +222,7 @@ export function resolveTarget(target: Target): ResolutionResult {
           if (frames[f].contentDocument) {
             const frameEls = frames[f].contentDocument!.querySelectorAll(selector);
             for (let k = 0; k < frameEls.length; k++) {
-              candidates.push({ element: frameEls[k], source, summary: selector });
+              candidates.push({ element: frameEls[k], source, summary: selector, pathTaken });
             }
           }
         } catch (_) { /* cross-origin */ }
@@ -105,20 +230,20 @@ export function resolveTarget(target: Target): ResolutionResult {
     } catch (_) { /* invalid selector */ }
   }
 
-  if (target.css) collect(target.css, "css");
+  if (target.css) collect(target.css, "css", "css-flat");
   if (target.role) {
     const roleSel = `[role="${cssEscape(target.role)}"]`;
-    collect(roleSel, "role");
+    collect(roleSel, "role", "role");
   }
   if (target.label) {
-    collect(`[aria-label="${cssEscape(target.label)}"]`, "label");
-    collect(`[aria-labelledby="${cssEscape(target.label)}"]`, "label");
+    collect(`[aria-label="${cssEscape(target.label)}"]`, "label", "label");
+    collect(`[aria-labelledby="${cssEscape(target.label)}"]`, "label", "label");
   }
   if (target.placeholder) {
-    collect(`[placeholder="${cssEscape(target.placeholder)}"]`, "placeholder");
+    collect(`[placeholder="${cssEscape(target.placeholder)}"]`, "placeholder", "placeholder");
   }
   if (target.testId) {
-    collect(`[data-testid="${cssEscape(target.testId)}"]`, "testId");
+    collect(`[data-testid="${cssEscape(target.testId)}"]`, "testId", "testId");
   }
   if (target.text) {
     const clickables = document.querySelectorAll(
@@ -128,13 +253,13 @@ export function resolveTarget(target: Target): ResolutionResult {
     for (let ci = 0; ci < clickables.length; ci++) {
       const textContent = (clickables[ci].textContent || "").trim().toLowerCase();
       if (textContent.includes(t)) {
-        candidates.push({ element: clickables[ci], source: "text", summary: "text:" + target.text });
+        candidates.push({ element: clickables[ci], source: "text", summary: "text:" + target.text, pathTaken: "text" });
       }
     }
   }
 
   if (candidates.length === 0) {
-    return { found: false, error: "No element matched target", matchCount: 0 };
+    return { found: false, error: "No element matched target", matchCount: 0, pathTaken: defaultPathTaken };
   }
 
   // Deduplicate by element reference
@@ -164,6 +289,7 @@ export function resolveTarget(target: Target): ResolutionResult {
         summary: named[0].summary,
         matchCount: named.length,
         found: true,
+        pathTaken: named[0].pathTaken,
       };
     }
   }
@@ -174,6 +300,7 @@ export function resolveTarget(target: Target): ResolutionResult {
     summary: unique[0].summary,
     matchCount: unique.length,
     found: true,
+    pathTaken: unique[0].pathTaken,
   };
 }
 
@@ -245,7 +372,7 @@ export function inspectElements(
     return { css: tag + (el.className ? "." + el.className.trim().split(/\s+/).join(".") : "") };
   }
 
-  function getAnchorInfo(el: Element, compact: boolean): Record<string, unknown> {
+  function getAnchorInfo(el: Element, compact: boolean, pathStack: string[]): Record<string, unknown> {
     const tag = el.tagName.toLowerCase();
     const role = el.getAttribute("role");
     const type = el.getAttribute("type");
@@ -256,6 +383,13 @@ export function inspectElements(
 
     anchorIndex++;
     const id = "a" + anchorIndex;
+
+    // The leaf selector is what getTarget() produces. The shadow path is the
+    // chain of HOST tag names leading to this element (the element's own tag
+    // is NOT in the path — it's the leaf, identified by the existing
+    // `target.css`). Together: `walkShadowPath(shadowPath, target.css)`.
+    const leafTarget = getTarget(el);
+    const shadowPath = pathStack.length > 0 ? [...pathStack] : undefined;
 
     if (!compact) {
       const visible = !!(htmlEl.offsetParent !== null || tag === "a");
@@ -277,7 +411,8 @@ export function inspectElements(
       if (enabled !== undefined) info.enabled = enabled;
       if (checked !== undefined) info.checked = checked;
       if (selected !== undefined) info.selected = selected;
-      info.target = getTarget(el);
+      info.target = leafTarget;
+      if (shadowPath) info.shadowPath = shadowPath;
       return info;
     }
 
@@ -286,21 +421,26 @@ export function inspectElements(
       tag,
       text: text || undefined,
     };
-    info.target = getTarget(el);
+    info.target = leafTarget;
+    if (shadowPath) info.shadowPath = shadowPath;
     return info;
   }
 
-  function walkElements(root: Node, collected: Array<Record<string, unknown>>): void {
+  function walkElements(root: Node, collected: Array<Record<string, unknown>>, pathStack: string[]): void {
     if (collected.length >= maxAnchors) return;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
     let node: Node | null;
     while ((node = walker.nextNode()) && collected.length < maxAnchors) {
       const el = node as Element;
       if (isInteractable(el)) {
-        collected.push(getAnchorInfo(el, isCompact));
+        collected.push(getAnchorInfo(el, isCompact, pathStack));
       }
       if ((el as HTMLElement).shadowRoot) {
-        walkElements((el as HTMLElement).shadowRoot!, collected);
+        // Enter shadow root: push this host's tag, recurse, pop on return.
+        const hostTag = el.tagName.toLowerCase();
+        pathStack.push(hostTag);
+        walkElements((el as HTMLElement).shadowRoot!, collected, pathStack);
+        pathStack.pop();
       }
     }
   }
@@ -308,7 +448,7 @@ export function inspectElements(
   const collected: Array<Record<string, unknown>> = [];
   const rootEl = document.body ?? document.documentElement;
   if (rootEl) {
-    walkElements(rootEl, collected);
+    walkElements(rootEl, collected, []);
   }
 
   const iframes = document.querySelectorAll<HTMLIFrameElement>("iframe");
@@ -316,7 +456,7 @@ export function inspectElements(
     if (collected.length >= maxAnchors) break;
     try {
       if (iframes[fi].contentDocument && iframes[fi].contentDocument!.body) {
-        walkElements(iframes[fi].contentDocument!.body, collected);
+        walkElements(iframes[fi].contentDocument!.body, collected, []);
       }
     } catch (_) { /* cross-origin */ }
   }
@@ -373,6 +513,7 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
   if ((el as HTMLInputElement).disabled) return Promise.resolve({ success: false, message: "Element is disabled" });
 
   return new Promise((resolve) => {
+    const start = performance.now();
     el.scrollIntoView({ behavior: "instant", block: "center" });
     setTimeout(() => {
       const rect = el.getBoundingClientRect();
@@ -380,11 +521,30 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
       const cy = rect.top + rect.height / 2;
       const topEl = document.elementFromPoint(cx, cy);
 
-      if (topEl && !isDescendantOrSelf(topEl, el) && !isDescendantOrSelf(el, topEl)) {
+      // Shadow-aware actionability gate.
+      // Acceptable if:
+      //   - topEl === el (exact hit)
+      //   - topEl is a descendant of el (light-DOM overlay within our element)
+      //   - topEl is in el's shadow-host chain (target is inside a shadow root;
+      //     host is the topmost visible hit) — this is the common case for
+      //     custom elements that host the real interactive control.
+      //   - el is a descendant of topEl, AND topEl is interactable (existing
+      //     conservative behaviour for clickable wrappers).
+      const chain = getShadowHostChain(el);
+      const hostChain = new Set(chain);
+      const gateOk = !!topEl && (
+        topEl === el
+        || isDescendantOrSelf(topEl, el)
+        || hostChain.has(topEl)
+        || (isDescendantOrSelf(el, topEl) && isInteractableForGate(topEl))
+      );
+
+      if (topEl && !gateOk) {
         const topHtml = topEl as HTMLElement;
         const topTag = topHtml.tagName.toLowerCase();
         const topRole = topHtml.getAttribute("role") || "";
         const topClass = (topHtml.className || "").toString().slice(0, 50);
+        const durationMs = performance.now() - start;
         resolve({
           success: false,
           message: "Click intercepted by overlay",
@@ -397,22 +557,97 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
             targetCenterY: Math.round(cy),
           },
           blocked: true,
+          executionVerdict: {
+            executed: false,
+            world: "isolated",
+            durationMs,
+            path: "isolated.elClick",
+            error: { name: "ClickBlocked", message: `Overlay ${topTag} covers target ${el.tagName.toLowerCase()}` },
+          },
         });
         return;
       }
 
-      (el as HTMLElement).click();
-      resolve({
-        success: true,
-        message: `Clicked ${el.tagName.toLowerCase()}${el.textContent ? ' "' + el.textContent.trim().slice(0, 30) + '"' : ""}`,
-        evidence: { tag: el.tagName.toLowerCase(), text: (el.textContent || "").trim().slice(0, 100) },
-      });
+      // Install a one-shot capture-phase click listener that records whether
+      // the event reached the target. We dispatch a composed MouseEvent first
+      // (so listeners inside shadow roots see it), then fall back to el.click()
+      // which fires its own (non-composed) click.
+      let eventFired = false;
+      const onCapture = (ev: Event): void => {
+        if (ev.type === "click" && (ev.target === el || (ev.target && chain.includes(ev.target as Element)))) {
+          eventFired = true;
+        }
+      };
+      // Capture phase: gets the event before the target. `composed: true` lets
+      // it traverse shadow boundaries.
+      document.addEventListener("click", onCapture, { capture: true, once: false });
+
+      try {
+        // 1) Synthetic composed dispatch — reaches listeners inside shadow roots.
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, composed: true }));
+        // 2) Native click() — synthesises a non-composed event through the
+        // element's normal event path. Belt-and-braces for non-shadow cases.
+        (el as HTMLElement).click();
+      } catch (e) {
+        document.removeEventListener("click", onCapture, { capture: true });
+        const durationMs = performance.now() - start;
+        resolve({
+          success: false,
+          message: `Click dispatch failed: ${(e as Error).message}`,
+          errorCode: "CLICK_FAILED",
+          executionVerdict: {
+            executed: false,
+            world: "isolated",
+            durationMs,
+            path: "isolated.elClick",
+            error: { name: (e as Error).name || "Error", message: (e as Error).message || String(e) },
+          },
+        });
+        return;
+      }
+
+      // Flush synchronous event delivery before removing the probe.
+      setTimeout(() => {
+        document.removeEventListener("click", onCapture, { capture: true });
+        const durationMs = performance.now() - start;
+        resolve({
+          success: true,
+          message: `Clicked ${el.tagName.toLowerCase()}${el.textContent ? ' "' + el.textContent.trim().slice(0, 30) + '"' : ""}`,
+          evidence: { tag: el.tagName.toLowerCase(), text: (el.textContent || "").trim().slice(0, 100) },
+          executionVerdict: {
+            executed: true,
+            world: "isolated",
+            eventFired,
+            domMutated: true,
+            durationMs,
+            path: "isolated.elClick",
+          },
+        });
+      }, 0);
     }, clickDelayMs ?? 100);
   });
 }
 
+/** Minimal interactability check used by the click gate (lighter than the
+ *  inspect-time isInteractable — only what we need to accept wrappers). */
+function isInteractableForGate(el: Element): boolean {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "button" || tag === "a" || tag === "summary" || tag === "label") return true;
+  const role = el.getAttribute("role") || "";
+  if (role === "button" || role === "link" || role === "checkbox" || role === "radio") return true;
+  if (el.hasAttribute("onclick") || el.hasAttribute("tabindex")) return true;
+  return false;
+}
+
 export function fillElement(el: Element, value: string): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.nativeSetter" },
+    };
+  }
   const input = el as HTMLInputElement;
 
   // Bypass React controlled input protection
@@ -427,23 +662,61 @@ export function fillElement(el: Element, value: string): ActResult {
 
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  return { success: true, message: `Filled with value`, evidence: { tag: el.tagName.toLowerCase() } };
+  const valueMatched = input.value === value;
+  return {
+    success: true,
+    message: `Filled with value`,
+    evidence: { tag: el.tagName.toLowerCase() },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      value: input.value,
+      valueMatched,
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.nativeSetter",
+    },
+  };
 }
 
 export function checkElement(el: Element, checked?: boolean): ActResult {
+  const start = performance.now();
   const input = el as HTMLInputElement;
   if (!el || (input.type !== "checkbox" && input.type !== "radio")) {
-    return { success: false, message: "Not a checkbox/radio" };
+    return {
+      success: false,
+      message: "Not a checkbox/radio",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
   }
   const newState = checked !== undefined ? checked : !input.checked;
   input.checked = newState;
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  return { success: true, message: `${newState ? "Checked" : "Unchecked"} ${input.name || "element"}`, evidence: { checked: newState } };
+  return {
+    success: true,
+    message: `${newState ? "Checked" : "Unchecked"} ${input.name || "element"}`,
+    evidence: { checked: newState },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      value: newState,
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
+  };
 }
 
 export function selectOption(el: Element, value?: string, label?: string): ActResult {
+  const start = performance.now();
   const select = el as HTMLSelectElement;
-  if (!el || select.tagName !== "SELECT") return { success: false, message: "Not a SELECT element" };
+  if (!el || select.tagName !== "SELECT") {
+    return {
+      success: false,
+      message: "Not a SELECT element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   let option: HTMLOptionElement | undefined;
   if (value !== undefined) {
     option = Array.from(select.options).find((o) => o.value === value);
@@ -451,18 +724,48 @@ export function selectOption(el: Element, value?: string, label?: string): ActRe
   if (!option && label !== undefined) {
     option = Array.from(select.options).find((o) => (o.textContent || "").trim() === label);
   }
-  if (!option) return { success: false, message: "Option not found" };
+  if (!option) {
+    return {
+      success: false,
+      message: "Option not found",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   option.selected = true;
   select.dispatchEvent(new Event("change", { bubbles: true }));
-  return { success: true, message: `Selected option '${(option.textContent || "").trim()}'` };
+  return {
+    success: true,
+    message: `Selected option '${(option.textContent || "").trim()}'`,
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      value: option.value,
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
+  };
 }
 
 export function pressKeys(el: Element, key?: string, keys?: string[]): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   (el as HTMLElement).focus();
 
   const keyList = keys || (key ? [key] : []);
-  if (keyList.length === 0) return { success: false, message: "No key specified" };
+  if (keyList.length === 0) {
+    return {
+      success: false,
+      message: "No key specified",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
 
   const modMap: Record<string, number> = { Control: 0, Alt: 1, Shift: 2, Meta: 3 };
   const modFlags = [false, false, false, false];
@@ -487,29 +790,93 @@ export function pressKeys(el: Element, key?: string, keys?: string[]): ActResult
   el.dispatchEvent(new KeyboardEvent("keydown", init));
   el.dispatchEvent(new KeyboardEvent("keypress", init));
   el.dispatchEvent(new KeyboardEvent("keyup", init));
-  return { success: true, message: `Pressed keys: ${keyList.join("+")}`, evidence: { keys: keyList } };
+  return {
+    success: true,
+    message: `Pressed keys: ${keyList.join("+")}`,
+    evidence: { keys: keyList },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
+  };
 }
 
 export function scrollElement(el: Element | null, direction: string, amount?: number): ActResult {
+  const start = performance.now();
   if (el) {
     el.scrollIntoView({ behavior: "smooth", block: "center" });
-    return { success: true, message: "Scrolled to element", evidence: { newPosition: window.scrollY } };
+    return {
+      success: true,
+      message: "Scrolled to element",
+      evidence: { newPosition: window.scrollY },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        domMutated: true,
+        durationMs: performance.now() - start,
+        path: "isolated.scrollIntoView",
+      },
+    };
   }
   const px = amount || window.innerHeight;
   window.scrollBy({ top: direction === "up" ? -px : px, behavior: "smooth" });
-  return { success: true, message: `Scrolled ${direction || "down"}`, evidence: { newPosition: window.scrollY } };
+  return {
+    success: true,
+    message: `Scrolled ${direction || "down"}`,
+    evidence: { newPosition: window.scrollY },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.scrollBy",
+    },
+  };
 }
 
 export function submitForm(el: Element): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.form.submit" },
+    };
+  }
   const form = el.tagName === "FORM" ? (el as HTMLFormElement) : el.closest<HTMLFormElement>("form");
-  if (!form) return { success: false, message: "No form found" };
+  if (!form) {
+    return {
+      success: false,
+      message: "No form found",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.form.submit" },
+    };
+  }
   form.submit();
-  return { success: true, message: "Form submitted" };
+  return {
+    success: true,
+    message: "Form submitted",
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.form.submit",
+    },
+  };
 }
 
 export function typeText(el: Element, text: string, delay: number): Promise<ActResult> {
-  if (!el || !text) return Promise.resolve({ success: false, message: "No element or text" });
+  if (!el || !text) {
+    return Promise.resolve({
+      success: false,
+      message: "No element or text",
+      executionVerdict: { executed: false, world: "isolated", durationMs: 0, path: "isolated.nativeSetter" },
+    });
+  }
+  const start = performance.now();
   const chars = text.split("");
   let i = 0;
   const htmlEl = el as HTMLInputElement;
@@ -524,7 +891,21 @@ export function typeText(el: Element, text: string, delay: number): Promise<ActR
       if (i >= chars.length) {
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
-        resolve({ success: true, message: `Typed ${chars.length} characters`, evidence: { charCount: chars.length } });
+        const valueMatched = htmlEl.value === text || htmlEl.value.endsWith(text);
+        resolve({
+          success: true,
+          message: `Typed ${chars.length} characters`,
+          evidence: { charCount: chars.length },
+          executionVerdict: {
+            executed: true,
+            world: "isolated",
+            value: htmlEl.value,
+            valueMatched,
+            domMutated: true,
+            durationMs: performance.now() - start,
+            path: "isolated.nativeSetter",
+          },
+        });
         return;
       }
       const ch = chars[i++];
@@ -550,9 +931,14 @@ export function typeText(el: Element, text: string, delay: number): Promise<ActR
 }
 
 export function uploadFile(el: Element, fileData: string, fileName?: string, fileType?: string): ActResult {
+  const start = performance.now();
   const input = el as HTMLInputElement;
   if (!el || input.tagName !== "INPUT" || input.type !== "file") {
-    return { success: false, message: "Not a file input element" };
+    return {
+      success: false,
+      message: "Not a file input element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fileInput" },
+    };
   }
   try {
     const dt = new DataTransfer();
@@ -564,14 +950,42 @@ export function uploadFile(el: Element, fileData: string, fileName?: string, fil
     dt.items.add(new File([blob], fileName || "file"));
     input.files = dt.files;
     input.dispatchEvent(new Event("change", { bubbles: true }));
-    return { success: true, message: `File uploaded: ${fileName || "file"}` };
+    return {
+      success: true,
+      message: `File uploaded: ${fileName || "file"}`,
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        value: fileName || "file",
+        domMutated: true,
+        durationMs: performance.now() - start,
+        path: "isolated.fileInput",
+      },
+    };
   } catch (e) {
-    return { success: false, message: `Upload failed: ${(e as Error).message || e}` };
+    return {
+      success: false,
+      message: `Upload failed: ${(e as Error).message || e}`,
+      executionVerdict: {
+        executed: false,
+        world: "isolated",
+        durationMs: performance.now() - start,
+        path: "isolated.fileInput",
+        error: { name: (e as Error).name || "Error", message: (e as Error).message || String(e) },
+      },
+    };
   }
 }
 
 export function dragElement(el: Element, x?: number, y?: number): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
@@ -585,27 +999,70 @@ export function dragElement(el: Element, x?: number, y?: number): ActResult {
     success: true,
     message: `Dragged to (${Math.round(dx)}, ${Math.round(dy)})`,
     evidence: { fromX: Math.round(cx), fromY: Math.round(cy), toX: Math.round(dx), toY: Math.round(dy) },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
   };
 }
 
 export function dblclickElement(el: Element): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
   el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, clientX: cx, clientY: cy }));
-  return { success: true, message: `Double-clicked ${el.tagName.toLowerCase()}`, evidence: { tag: el.tagName.toLowerCase() } };
+  return {
+    success: true,
+    message: `Double-clicked ${el.tagName.toLowerCase()}`,
+    evidence: { tag: el.tagName.toLowerCase() },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: true,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
+  };
 }
 
 export function hoverElement(el: Element): ActResult {
-  if (!el) return { success: false, message: "No element" };
+  const start = performance.now();
+  if (!el) {
+    return {
+      success: false,
+      message: "No element",
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+    };
+  }
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
   el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, clientX: cx, clientY: cy }));
   el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, clientX: cx, clientY: cy }));
   el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: cx, clientY: cy }));
-  return { success: true, message: `Hovered ${el.tagName.toLowerCase()}`, evidence: { tag: el.tagName.toLowerCase(), x: Math.round(cx), y: Math.round(cy) } };
+  return {
+    success: true,
+    message: `Hovered ${el.tagName.toLowerCase()}`,
+    evidence: { tag: el.tagName.toLowerCase(), x: Math.round(cx), y: Math.round(cy) },
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      domMutated: false,
+      durationMs: performance.now() - start,
+      path: "isolated.dispatchEvent",
+    },
+  };
 }
 
 // ── Dialog ──
@@ -618,7 +1075,14 @@ const BP_ORIG_CONFIRM = Symbol.for("bp.origConfirm");
 const BP_ORIG_PROMPT = Symbol.for("bp.origPrompt");
 
 export function dialogOverride(): ActResult {
-  if ((window as any)[BP_DIALOG_OVERRIDDEN]) return { success: true, message: "Dialog override already active" };
+  const start = performance.now();
+  if ((window as any)[BP_DIALOG_OVERRIDDEN]) {
+    return {
+      success: true,
+      message: "Dialog override already active",
+      executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.dialogOverride" },
+    };
+  }
   (window as any)[BP_DIALOG_OVERRIDDEN] = true;
   (window as any)[BP_LAST_DIALOG] = null;
   (window as any)[BP_DIALOG_RESPONSE] = null;
@@ -651,12 +1115,23 @@ export function dialogOverride(): ActResult {
     return orig.call(window, msg, defaultVal);
   };
 
-  return { success: true, message: "Dialog override active" };
+  return {
+    success: true,
+    message: "Dialog override active",
+    executionVerdict: { executed: true, world: "isolated", domMutated: true, durationMs: performance.now() - start, path: "isolated.dialogOverride" },
+  };
 }
 
 export function dialogRestore(): ActResult {
+  const start = performance.now();
   const overridden = (window as any)[BP_DIALOG_OVERRIDDEN];
-  if (!overridden) return { success: true, message: "Dialog override not active" };
+  if (!overridden) {
+    return {
+      success: true,
+      message: "Dialog override not active",
+      executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.dialogOverride" },
+    };
+  }
 
   const origAlert = (window as any)[BP_ORIG_ALERT];
   const origConfirm = (window as any)[BP_ORIG_CONFIRM];
@@ -673,14 +1148,24 @@ export function dialogRestore(): ActResult {
   delete (window as any)[BP_LAST_DIALOG];
   delete (window as any)[BP_DIALOG_RESPONSE];
 
-  return { success: true, message: "Dialog override removed" };
+  return {
+    success: true,
+    message: "Dialog override removed",
+    executionVerdict: { executed: true, world: "isolated", domMutated: true, durationMs: performance.now() - start, path: "isolated.dialogOverride" },
+  };
 }
 
 export function dialogRespond(response?: Record<string, unknown>): ActResult {
+  const start = performance.now();
   (window as any)[BP_DIALOG_RESPONSE] = response || {};
   const d = (window as any)[BP_LAST_DIALOG];
   (window as any)[BP_LAST_DIALOG] = null;
-  return { success: true, message: "Dialog response set", evidence: { lastDialog: d } };
+  return {
+    success: true,
+    message: "Dialog response set",
+    evidence: { lastDialog: d },
+    executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.dialogOverride" },
+  };
 }
 
 // ── Wait Conditions ──
@@ -692,39 +1177,40 @@ export function waitForElement(
   pollIntervalMs: number,
 ): Promise<ActResult> {
   return new Promise((resolve) => {
-    const start = Date.now();
+    const start = performance.now();
+    const wallStart = Date.now();
     const check = (): void => {
       const el = document.querySelector(selector) as HTMLElement | null;
-      const elapsed = Date.now() - start;
+      const elapsed = Date.now() - wallStart;
 
       if (condition === "exists") {
         if (el) {
           clearInterval(timer);
-          resolve({ success: true, message: `Element appeared after ${elapsed}ms`, evidence: { condition: "exists", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element appeared after ${elapsed}ms`, evidence: { condition: "exists", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
           return;
         }
       } else if (condition === "visible") {
         if (el && el.offsetParent !== null && getComputedStyle(el).visibility !== "hidden") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element visible after ${elapsed}ms`, evidence: { condition: "visible", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element visible after ${elapsed}ms`, evidence: { condition: "visible", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
           return;
         }
       } else if (condition === "hidden") {
         if (!el || el.offsetParent === null || getComputedStyle(el).visibility === "hidden") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element hidden after ${elapsed}ms`, evidence: { condition: "hidden", appeared: false, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element hidden after ${elapsed}ms`, evidence: { condition: "hidden", appeared: false, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
           return;
         }
       } else if (condition === "enabled") {
         if (el && !(el as HTMLInputElement).disabled && el.getAttribute("aria-disabled") !== "true") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element enabled after ${elapsed}ms`, evidence: { condition: "enabled", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element enabled after ${elapsed}ms`, evidence: { condition: "enabled", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
           return;
         }
       } else if (condition === "disabled") {
         if (el && ((el as HTMLInputElement).disabled || el.getAttribute("aria-disabled") === "true")) {
           clearInterval(timer);
-          resolve({ success: true, message: `Element disabled after ${elapsed}ms`, evidence: { condition: "disabled", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element disabled after ${elapsed}ms`, evidence: { condition: "disabled", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
           return;
         }
       } else if (condition === "stable") {
@@ -735,7 +1221,7 @@ export function waitForElement(
             const c = el.getBoundingClientRect();
             if (prev && c.top === prev.top && c.left === prev.left && c.width === prev.width && c.height === prev.height) {
               clearInterval(st);
-              resolve({ success: true, message: `Element stable after ${Date.now() - start}ms`, evidence: { condition: "stable", elapsed_ms: Date.now() - start } });
+              resolve({ success: true, message: `Element stable after ${Date.now() - wallStart}ms`, evidence: { condition: "stable", elapsed_ms: Date.now() - wallStart }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat" } });
             } else {
               prev = c;
             }
@@ -746,7 +1232,7 @@ export function waitForElement(
 
       if (elapsed >= timeoutMs) {
         clearInterval(timer);
-        resolve({ success: false, message: `Timeout waiting for '${condition}' after ${elapsed}ms`, evidence: { condition, appeared: false, elapsed_ms: elapsed }, errorCode: "TIMEOUT" });
+        resolve({ success: false, message: `Timeout waiting for '${condition}' after ${elapsed}ms`, evidence: { condition, appeared: false, elapsed_ms: elapsed }, errorCode: "TIMEOUT", executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: "css-flat", error: { name: "TimeoutError", message: `Condition '${condition}' not met within ${timeoutMs}ms` } } });
       }
     };
     const timer = setInterval(check, pollIntervalMs);
@@ -765,40 +1251,43 @@ export function waitForTarget(
   pollIntervalMs: number,
 ): Promise<ActResult> {
   return new Promise((resolve) => {
-    const start = Date.now();
+    const start = performance.now();
+    const wallStart = Date.now();
+    let lastPathTaken: ResolutionResult["pathTaken"];
     const check = (): void => {
       const resolution = resolveTarget(target);
+      lastPathTaken = resolution.pathTaken;
       const el = resolution.found ? resolution.element as HTMLElement : null;
-      const elapsed = Date.now() - start;
+      const elapsed = Date.now() - wallStart;
 
       if (condition === "exists") {
         if (el) {
           clearInterval(timer);
-          resolve({ success: true, message: `Element appeared after ${elapsed}ms`, evidence: { condition: "exists", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element appeared after ${elapsed}ms`, evidence: { condition: "exists", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
           return;
         }
       } else if (condition === "visible") {
         if (el && el.offsetParent !== null && getComputedStyle(el).visibility !== "hidden") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element visible after ${elapsed}ms`, evidence: { condition: "visible", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element visible after ${elapsed}ms`, evidence: { condition: "visible", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
           return;
         }
       } else if (condition === "hidden") {
         if (!el || el.offsetParent === null || getComputedStyle(el).visibility === "hidden") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element hidden after ${elapsed}ms`, evidence: { condition: "hidden", appeared: false, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element hidden after ${elapsed}ms`, evidence: { condition: "hidden", appeared: false, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
           return;
         }
       } else if (condition === "enabled") {
         if (el && !(el as HTMLInputElement).disabled && el.getAttribute("aria-disabled") !== "true") {
           clearInterval(timer);
-          resolve({ success: true, message: `Element enabled after ${elapsed}ms`, evidence: { condition: "enabled", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element enabled after ${elapsed}ms`, evidence: { condition: "enabled", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
           return;
         }
       } else if (condition === "disabled") {
         if (el && ((el as HTMLInputElement).disabled || el.getAttribute("aria-disabled") === "true")) {
           clearInterval(timer);
-          resolve({ success: true, message: `Element disabled after ${elapsed}ms`, evidence: { condition: "disabled", appeared: true, elapsed_ms: elapsed } });
+          resolve({ success: true, message: `Element disabled after ${elapsed}ms`, evidence: { condition: "disabled", appeared: true, elapsed_ms: elapsed }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
           return;
         }
       } else if (condition === "stable") {
@@ -810,7 +1299,7 @@ export function waitForTarget(
             if (prev && c.top === prev.top && c.left === prev.left && c.width === prev.width && c.height === prev.height) {
               clearInterval(st);
               clearInterval(timer);
-              resolve({ success: true, message: `Element stable after ${Date.now() - start}ms`, evidence: { condition: "stable", elapsed_ms: Date.now() - start } });
+              resolve({ success: true, message: `Element stable after ${Date.now() - wallStart}ms`, evidence: { condition: "stable", elapsed_ms: Date.now() - wallStart }, executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken } });
             } else {
               prev = c;
             }
@@ -821,7 +1310,7 @@ export function waitForTarget(
 
       if (elapsed >= timeoutMs) {
         clearInterval(timer);
-        resolve({ success: false, message: `Timeout waiting for '${condition}' after ${elapsed}ms`, evidence: { condition, appeared: false, elapsed_ms: elapsed }, errorCode: "TIMEOUT" });
+        resolve({ success: false, message: `Timeout waiting for '${condition}' after ${elapsed}ms`, evidence: { condition, appeared: false, elapsed_ms: elapsed }, errorCode: "TIMEOUT", executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.waitFor", pathTaken: lastPathTaken, error: { name: "TimeoutError", message: `Condition '${condition}' not met within ${timeoutMs}ms` } } });
       }
     };
     const timer = setInterval(check, pollIntervalMs);
@@ -831,6 +1320,7 @@ export function waitForTarget(
 
 export function waitForNetworkIdle(idleThreshold: number, timeoutMs: number): Promise<ActResult> {
   return new Promise((resolve) => {
+    const start = performance.now();
     let lastRequestTime = Date.now();
     let outerTimeout: ReturnType<typeof setTimeout>;
     let idleTimer: ReturnType<typeof setTimeout>;
@@ -862,12 +1352,22 @@ export function waitForNetworkIdle(idleThreshold: number, timeoutMs: number): Pr
 
     function onIdle(): void {
       clearTimeout(outerTimeout);
-      resolve({ success: true, message: `Network idle for ${idleThreshold}ms`, evidence: { condition: "network_idle", elapsed_ms: Date.now() - start, idle_for_ms: idleThreshold } });
+      resolve({
+        success: true,
+        message: `Network idle for ${idleThreshold}ms`,
+        evidence: { condition: "network_idle", elapsed_ms: Date.now() - wallStart, idle_for_ms: idleThreshold },
+        executionVerdict: { executed: true, world: "isolated", durationMs: performance.now() - start, path: "isolated.networkIdle" },
+      });
     }
 
-    const start = Date.now();
+    const wallStart = Date.now();
     outerTimeout = setTimeout(() => {
-      resolve({ success: false, message: `Network idle timeout after ${Date.now() - start}ms`, evidence: { condition: "network_idle", timed_out: true, elapsed_ms: Date.now() - start } });
+      resolve({
+        success: false,
+        message: `Network idle timeout after ${Date.now() - wallStart}ms`,
+        evidence: { condition: "network_idle", timed_out: true, elapsed_ms: Date.now() - wallStart },
+        executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.networkIdle", error: { name: "TimeoutError", message: `Network not idle within ${timeoutMs}ms` } },
+      });
     }, timeoutMs);
 
     // Check if already idle
@@ -883,24 +1383,35 @@ export function waitForFunction(
   pollIntervalMs: number,
 ): Promise<ActResult> {
   return new Promise((resolve) => {
-    const start = Date.now();
+    const start = performance.now();
+    const wallStart = Date.now();
     let lastError: string | undefined;
     const timer = setInterval(() => {
       try {
         const result = new Function(expression)();
         if (result) {
           clearInterval(timer);
-          resolve({ success: true, message: `Function returned truthy after ${Date.now() - start}ms`, evidence: { condition: "function", result, elapsed_ms: Date.now() - start } });
+          resolve({
+            success: true,
+            message: `Function returned truthy after ${Date.now() - wallStart}ms`,
+            evidence: { condition: "function", result, elapsed_ms: Date.now() - wallStart },
+            executionVerdict: { executed: true, world: "isolated", value: result, durationMs: performance.now() - start, path: "isolated.newFunction" },
+          });
         }
       } catch (e) {
         // Expression failed — continue polling, but note the last error
         lastError = (e as Error).message;
       }
-      if (Date.now() - start >= timeoutMs) {
+      if (Date.now() - wallStart >= timeoutMs) {
         clearInterval(timer);
-        const evidence: Record<string, unknown> = { condition: "function", timed_out: true, elapsed_ms: Date.now() - start };
+        const evidence: Record<string, unknown> = { condition: "function", timed_out: true, elapsed_ms: Date.now() - wallStart };
         if (lastError) evidence.lastError = lastError;
-        resolve({ success: false, message: `Function condition timeout after ${Date.now() - start}ms`, evidence });
+        resolve({
+          success: false,
+          message: `Function condition timeout after ${Date.now() - wallStart}ms`,
+          evidence,
+          executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.newFunction", error: { name: "TimeoutError", message: `Function did not return truthy within ${timeoutMs}ms`, ...(lastError ? { message: `${lastError} (last error)` } : {}) } },
+        });
       }
     }, pollIntervalMs);
   });
@@ -911,6 +1422,7 @@ export function waitForFunction(
 export function fillFormFields(
   fields: Array<{ selector: string; value: string }>,
 ): ActResult & { filled: number; total: number; errors?: string[] } {
+  const start = performance.now();
   let filled = 0;
   const errors: string[] = [];
   for (const { selector, value } of fields) {
@@ -934,6 +1446,14 @@ export function fillFormFields(
     filled,
     total: fields.length,
     errors: errors.length > 0 ? errors : undefined,
+    executionVerdict: {
+      executed: true,
+      world: "isolated",
+      value: filled,
+      domMutated: filled > 0,
+      durationMs: performance.now() - start,
+      path: "isolated.nativeSetter",
+    },
   };
 }
 
@@ -1142,15 +1662,3 @@ export function generateSelector(css: string): Record<string, unknown> {
     elementSummary: tag + (el.id ? "#" + el.id : "") + (classes.length ? "." + classes.slice(0, 2).join(".") : ""),
   };
 }
-
-// ── Console Capture ──
-//
-// Console capture uses registerContentScripts({ world: "MAIN" }) which
-// injects a capture.js into the page's MAIN world at document_start.
-// The MAIN world script writes entries to a shared DOM <meta> attribute,
-// which the content script reads via MutationObserver.
-// This approach was chosen because:
-// 1. executeScript({ world: "MAIN" }) silently fails in some Chrome versions
-// 2. postMessage from MAIN → isolated world is unreliable in some Chrome versions
-// 3. DOM attributes are genuinely shared between worlds — no workarounds needed
-// See docs/arch_extension.md §10 for full architecture and design decisions.

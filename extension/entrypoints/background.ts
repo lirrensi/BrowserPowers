@@ -8,6 +8,10 @@ import { routeExecute, type ExecuteRequest } from "../src/capability-router";
 import { isExtensionContext } from "../src/safety";
 import { getSettings, saveSettings, saveSessionPermissionOverride, clearSessionPermissionOverride, getPageSitePermissions, addSitePattern } from "../src/storage";
 import { normalizeHostname, resolvePagePermission } from "../src/site-permissions";
+// Side-effect import — registers chrome.debugger.onEvent / onDetach listeners
+// and webNavigation / tabs.onRemoved auto-detach hooks. Attach itself is lazy;
+// nothing happens until the first page.js or console read on a tab.
+import "../src/cdp";
 
 interface PendingApproval {
   requestId: string;
@@ -162,19 +166,6 @@ async function handleCoreMessage(msg: any): Promise<void> {
 function init(): void {
   // Connect when service worker starts
   connect();
-
-  // Register MAIN world console capture script via registerContentScripts
-  // (different Chrome internal code path than executeScript — works where
-  // executeScript({ world: "MAIN" }) silently fails).
-  chrome.scripting.registerContentScripts([{
-    id: "bp-main-console-capture",
-    matches: ["<all_urls>"],
-    js: ["capture.js"],
-    world: "MAIN",
-    runAt: "document_start",
-  }]).catch(() => {
-    // Already registered — expected on SW restart
-  });
 
   // MV3 service worker stability: re-check connection on browser startup
   // (fires when the browser fully restarts, not on service worker wake)

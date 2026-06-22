@@ -1,17 +1,32 @@
 /**
  * FILE: extension/src/v2/page-read.ts
  * PURPOSE: Dispatch read actions (inspect, content, text, html, attr, meta, forms, count, select,
- *          summary, frames, generate_selector) via chrome.tabs.sendMessage to the persistent content script.
+ *          summary, frames, generate_selector, console, runtime_status) via chrome.tabs.sendMessage
+ *          to the persistent content script. Surfaces the content-script ExecutionVerdict and
+ *          runtimeStatus at the top level of the ActionResult, and stores shadowPath on anchors
+ *          for later act calls.
+ *
+ *          `console` reads from the SW-side CDP console buffer (extension/src/cdp.ts)
+ *          directly — the content script no longer owns a console buffer. CDP
+ *          `Runtime.consoleAPICalled` events feed the buffer on attach.
+ *
+ *          `runtime_status` reads the content-script's local state, then merges
+ *          the SW-side CDP state into the response so callers see both the
+ *          isolated-world self-test and the CDP attach status.
+ *
  * OWNS: page.read dispatch — each read action implementation in the service worker.
  * EXPORTS: dispatchReadAction
- * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md
+ * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
+ *       .agents/reports/plan_cdp-max-authority_2026-06-22.md
  */
 
 import { performed, notPerformed, blocked } from "./action-result.js";
 import { setAnchors } from "./anchor-manager.js";
-import type { ActionResult, Target } from "../types.js";
+import { getState as getCdpState, getConsoleBuffer } from "../cdp.js";
+import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
-type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console";
+type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console" | "runtime_status";
 
 export async function dispatchReadAction(
   action: ReadAction,
@@ -46,9 +61,23 @@ export async function dispatchReadAction(
       return generateSelector(params, tabId, frameId);
     case "console":
       return consoleRead(params, tabId, frameId);
+    case "runtime_status":
+      return runtimeStatus(tabId, frameId);
     default:
       return notPerformed("read", `Unknown read action: ${action}`);
   }
+}
+
+/** Extract the ExecutionVerdict and runtimeStatus from a content-script response. */
+function extractVerdicts(response: Record<string, unknown> | null | undefined): {
+  executionVerdict?: ExecutionVerdict;
+  runtimeStatus?: ExecutionVerdict;
+} {
+  if (!response) return {};
+  return {
+    executionVerdict: response.executionVerdict as ExecutionVerdict | undefined,
+    runtimeStatus: response.runtimeStatus as ExecutionVerdict | undefined,
+  };
 }
 
 // ── Helper: send read message to content script ──
@@ -108,19 +137,27 @@ async function inspect(params: Record<string, unknown>, tabId: number, frameId?:
     }
 
     const anchors = data.anchors as Array<Record<string, unknown>> | undefined;
+    const { executionVerdict, runtimeStatus } = extractVerdicts(data);
 
     if (anchors) {
-      const anchorEntries = anchors.map((a: Record<string, unknown>) => ({
-        anchor: a.anchor as string,
-        target: a.target as Target,
-        selector: (a.target as Target)?.css || `[data-bp-anchor="${a.anchor as string}"]`,
-      }));
+      const anchorEntries = anchors.map((a: Record<string, unknown>) => {
+        const target = a.target as Target;
+        const shadowPath = a.shadowPath as string[] | undefined;
+        return {
+          anchor: a.anchor as string,
+          target,
+          selector: target?.css || `[data-bp-anchor="${a.anchor as string}"]`,
+          shadowPath,
+        };
+      });
       setAnchors(tabId, data.documentId as string, anchorEntries);
     }
 
     return performed("inspect", `Found ${anchors?.length || 0} interactable elements`, {
       data,
       evidence: { anchorCount: anchors?.length || 0 },
+      executionVerdict,
+      runtimeStatus,
     });
   } catch (err) {
     return blocked("inspect", `Content script error: ${(err as Error).message}`, {
@@ -358,21 +395,47 @@ async function generateSelector(params: Record<string, unknown>, tabId: number, 
 async function consoleRead(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
   const limit = (params.limit as number) ?? 50;
   const offset = (params.offset as number) ?? 0;
+  // Read directly from the SW-side CDP console buffer. No content-script
+  // round-trip; the buffer is fed by Runtime.consoleAPICalled events.
+  const { entries, totalCount } = getConsoleBuffer(tabId, limit, offset);
+  return performed("console", `Found ${totalCount} console entries (showing ${entries.length})`, {
+    data: { entries, totalCount, source: "cdp" },
+    evidence: { totalCount },
+  });
+}
+
+async function runtimeStatus(tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    // Read from content script buffer. Entries arrive from the MAIN world
-    // capture script (capture.js, registered via registerContentScripts)
-    // via a shared DOM <meta> attribute + MutationObserver.
-    const data = await sendReadMessage(tabId, "console", { limit, offset });
-    if (!data) return contentScriptNotReady("console");
-    if (data.success === false) return notPerformed("console", data.message as string);
-    const entries = (data.entries as Array<unknown>) || [];
-    const totalCount = (data.totalCount as number) ?? 0;
-    return performed("console", `Found ${totalCount} console entries (showing ${entries.length})`, {
-      data: { entries, totalCount },
-      evidence: { totalCount },
+    const data = await sendReadMessage(tabId, "runtime_status", {});
+    if (!data) return contentScriptNotReady("runtime_status");
+
+    // The runtime status IS the verdict. Surface the inner self-test at
+    // executionVerdict, and the full surface state in data.
+    const { executionVerdict, runtimeStatus } = extractVerdicts(data);
+    // Merge SW-side CDP state into the response. The content script no
+    // longer owns console capture — it never had the CDP attach info.
+    const cdp = getCdpState(tabId);
+    const mergedData = {
+      ...(data as Record<string, unknown>),
+      cdp: {
+        ...cdp,
+        // When CDP is the chosen path, consoleCapture.status reflects
+        // CDP attach state. The content script side no longer reports
+        // consoleCapture — it's been moved here.
+        consoleCapture: {
+          status: cdp.attached ? "ready" : "not-attached",
+          source: "cdp",
+          bufferSize: cdp.consoleBufferSize,
+        },
+      },
+    };
+    return performed("runtime_status", "Runtime status collected", {
+      data: mergedData,
+      executionVerdict,
+      runtimeStatus,
     });
   } catch (err) {
-    return blocked("console", `Content script error: ${(err as Error).message}`, {
+    return blocked("runtime_status", `Content script error: ${(err as Error).message}`, {
       errorCode: "CONTENT_SCRIPT_ERROR",
       recoverable: true,
     });
