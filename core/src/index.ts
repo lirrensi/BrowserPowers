@@ -3,6 +3,19 @@
 // OWNS: Process-mode dispatch, detached daemon lifecycle, and graceful server startup.
 // EXPORTS: none (side-effect entry point)
 // DOCS: docs/spec/installer-hard-spec.md
+//
+// ═══════════════════════════════════════════════════════════════
+// HARD SPEC — THE WINDOW RULE  (§0.0 of installer-hard-spec.md)
+// ═══════════════════════════════════════════════════════════════
+//   serve   = ONLY command allowed to open a window (foreground)
+//   start   = NEVER a window.  Direct spawn with windowsHide:true
+//   restart = NEVER a window.  Stop + start, zero visible console
+//   stop    = NEVER a window.  Kill port, exit
+//
+//   Mechanism:  windowsHide: true → Win32 CREATE_NO_WINDOW flag
+//   BANNED:     VBS, cmd /c start /b, ShowWindow(SW_HIDE), or
+//               any post-hoc window-hiding trickery.
+// ═══════════════════════════════════════════════════════════════
 
 import { createServer } from "node:http";
 import { writeFileSync, unlinkSync } from "node:fs";
@@ -60,39 +73,9 @@ function resolvePaths() {
 
 // ── Windows Task Scheduler helpers ──────────────────────
 
-/** Escape a task name for safe use in a PowerShell single-quoted string. */
-function psTaskName(name: string): string {
-  return name.replace(/'/g, "''");
-}
-
-/** Returns true if a scheduled task with the given name exists. */
-function windowsTaskExists(name: string): boolean {
-  const safeName = psTaskName(name);
-  try {
-    execSync(
-      `powershell -NoProfile -Command "$t = Get-ScheduledTask -TaskName '${safeName}' -EA SilentlyContinue; if ($t) { exit 0 } else { exit 1 }"`,
-      { stdio: "pipe", encoding: "utf-8", timeout: 5000, windowsHide: true }
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Start a scheduled task by name. Best-effort; never throws. */
-function startWindowsTask(name: string): void {
-  const safeName = psTaskName(name);
-  try {
-    execSync(
-      `powershell -NoProfile -Command "Start-ScheduledTask -TaskName '${safeName}'"`,
-      { stdio: "pipe", timeout: 8000, windowsHide: true }
-    );
-  } catch { /* task may not exist or may not be startable */ }
-}
-
 /** Stop a scheduled task by name. Best-effort; never throws. */
 function stopWindowsTask(name: string): void {
-  const safeName = psTaskName(name);
+  const safeName = name.replace(/'/g, "''");
   try {
     execSync(
       `powershell -NoProfile -Command "Stop-ScheduledTask -TaskName '${safeName}' -EA SilentlyContinue"`,
@@ -104,10 +87,14 @@ function stopWindowsTask(name: string): void {
 /**
  * Start the server in a background process that survives its parent.
  *
- * Windows: user-scoped Task Scheduler task `BrowserPowers` is started with
- *          `Start-ScheduledTask`; falls back to a hidden direct spawn if the
- *          task has not been registered yet.
- * Unix:    standard `detached: true` spawn — works natively on POSIX.
+ * Direct spawn — never uses the scheduled task for manual start/restart.
+ * The Task Scheduler `-Hidden` flag is unreliable on manual `Start-ScheduledTask`
+ * invocation (can flash a visible console). Direct Node.js spawn with
+ * `windowsHide: true` uses `CREATE_NO_WINDOW` at the OS level — the window
+ * is never created, not hidden after the fact.
+ *
+ * The scheduled task is ONLY for logon auto-start; the task action itself
+ * uses a .ps1 launcher with CreateNoWindow = $true (see scripts/install.mjs).
  */
 async function startDetached(): Promise<void> {
   if (await isPortBusy(config.port)) {
@@ -115,31 +102,15 @@ async function startDetached(): Promise<void> {
     process.exit(0);
   }
 
-  if (process.platform === "win32") {
-    if (windowsTaskExists("BrowserPowers")) {
-      startWindowsTask("BrowserPowers");
-    } else {
-      console.warn("Warning: BrowserPowers scheduled task not found; starting directly.");
-      const { coreEntry, coreDir, tsxCli } = resolvePaths();
-      const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
-        detached: true,
-        windowsHide: true,
-        stdio: "ignore",
-        cwd: coreDir,
-      });
-      child.on("error", () => {});
-      child.unref();
-    }
-  } else {
-    const { coreEntry, coreDir, tsxCli } = resolvePaths();
-    const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
-      detached: true,
-      stdio: "ignore",
-      cwd: coreDir,
-    });
-    child.on("error", () => {});
-    child.unref();
-  }
+  const { coreEntry, coreDir, tsxCli } = resolvePaths();
+  const child = spawn(process.execPath, [tsxCli, coreEntry, "serve"], {
+    detached: true,
+    windowsHide: process.platform === "win32",
+    stdio: "ignore",
+    cwd: coreDir,
+  });
+  child.on("error", () => {});
+  child.unref();
 
   // Poll port to confirm it came up. Max 5s.
   for (let i = 0; i < 20; i++) {

@@ -5,6 +5,21 @@
 // OWNS: Repo-to-home artifact install, CLI wrapper creation, and daemon startup.
 // EXPORTS: none (side-effect CLI script)
 // DOCS: docs/spec/installer-hard-spec.md
+//
+// ═══════════════════════════════════════════════════════════════
+// HARD SPEC — THE WINDOW RULE  (§0.0 of installer-hard-spec.md)
+// ═══════════════════════════════════════════════════════════════
+//   The daemon MUST NEVER open a visible console window — ever.
+//   Not during install, not during start, not during restart,
+//   not on auto-start at logon.  serve is the ONLY foreground mode.
+//
+//   Installer:  starts daemon via `browserpowers start` which
+//               spawns with windowsHide:true (CREATE_NO_WINDOW).
+//   Logon task: calls .daemon-launcher.ps1 which uses .NET
+//               ProcessStartInfo.CreateNoWindow = $true.
+//   BANNED:     VBS, cmd /c start /b, ShowWindow(SW_HIDE), or
+//               any mechanism that creates a window then hides it.
+// ═══════════════════════════════════════════════════════════════
 
 /**
  * BrowserPowers — One-shot install / update / uninstall.
@@ -47,6 +62,7 @@ const REPO_DIR = process.cwd();
 const BP_DIR = resolve(homedir(), ".browserpowers");
 const BP_CORE = resolve(BP_DIR, "core");
 const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core lives in the repo (pnpm workspace) and runs from there
+const BP_DAEMON_LAUNCHER = resolve(BP_DIR, ".daemon-launcher.ps1");
 const BP_EXT = resolve(BP_DIR, "extension");
 const BP_BIN = resolve(BP_DIR, "bin");
 const BP_BIN_BROWSERPOWERS = resolve(BP_BIN, IS_WIN ? "browserpowers.cmd" : "browserpowers");
@@ -308,6 +324,10 @@ function removeAutoStart() {
     tryRun(
       `powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName 'BrowserPowers' -Confirm:$false -EA SilentlyContinue"`
     );
+    // Clean up the daemon launcher script (logon auto-start only, not used for manual start).
+    if (existsSync(BP_DAEMON_LAUNCHER)) {
+      try { unlinkSync(BP_DAEMON_LAUNCHER); } catch {}
+    }
   } else if (IS_LINUX) {
     const desktopPath = resolve(homedir(), ".config", "autostart", "browserpowers.desktop");
     try { unlinkSync(desktopPath); } catch { /* not found */ }
@@ -323,7 +343,14 @@ function removeAutoStart() {
 
 /**
  * Windows: user-scoped Task Scheduler task that runs the daemon at logon.
- * The task is configured with Hidden = true so no console window appears.
+ *
+ * The task action calls a .ps1 launcher script that starts node.exe via
+ * .NET ProcessStartInfo with CreateNoWindow = $true — the daemon process
+ * is never assigned a console.  This is creation-time prevention (not
+ * post-hoc hiding like WshShell.Run or ShowWindow(SW_HIDE)).
+ *
+ * Manual start/restart does NOT use the scheduled task — core/src/index.ts
+ * spawns directly with windowsHide: true (CREATE_NO_WINDOW via Node).
  */
 function createWindowsAutoStart() {
   // Clean up legacy auto-start artifacts (VBS launcher + HKCU Run key) if an
@@ -340,14 +367,37 @@ function createWindowsAutoStart() {
   const coreEntry = resolve(BP_CORE_REPO, "src", "index.ts");
   const nodePath = process.execPath;
 
-  // Build a temporary PowerShell script so the registration command is readable.
+  // ── 1. Write the daemon-launcher.ps1 (stays in ~/.browserpowers/) ──
+  // This script receives three params and starts node.exe with
+  // CreateNoWindow, which maps to the Win32 CREATE_NO_WINDOW flag.
+  // The daemon process is NEVER assigned a console — no flash, no VBS.
+  const launcherScript = [
+    `param(`,
+    `    [Parameter(Mandatory=$true)][string]$Node,`,
+    `    [Parameter(Mandatory=$true)][string]$Tsx,`,
+    `    [Parameter(Mandatory=$true)][string]$Entry`,
+    `)`,
+    ``,
+    `$psi = New-Object System.Diagnostics.ProcessStartInfo`,
+    `$psi.FileName = $Node`,
+    `$psi.Arguments = """$Tsx"" ""$Entry"" serve"`,
+    `$psi.UseShellExecute = $false`,
+    `$psi.CreateNoWindow = $true`,
+    `[System.Diagnostics.Process]::Start($psi) | Out-Null`,
+  ].join("\n");
+  writeFileSync(BP_DAEMON_LAUNCHER, launcherScript, "utf-8");
+
+  // ── 2. Register the scheduled task ──
+  // The task action runs `powershell.exe -File "<launcher>" -Node <...> -Tsx <...> -Entry <...>`.
+  // The launcher then creates the real node.exe process with no console.
   const psSingleQuote = (s) => `'${s.replace(/'/g, "''")}'`;
   const psContent = [
+    `$launcher = ${psSingleQuote(BP_DAEMON_LAUNCHER)}`,
     `$node = ${psSingleQuote(nodePath)}`,
     `$tsx = ${psSingleQuote(tsxCli)}`,
     `$entry = ${psSingleQuote(coreEntry)}`,
-    `$arg = '"' + $tsx + '" "' + $entry + '" serve'`,
-    `$action = New-ScheduledTaskAction -Execute $node -Argument $arg`,
+    `$launcherArgs = "-NoProfile -WindowStyle Hidden -File $launcher -Node $node -Tsx $tsx -Entry $entry"`,
+    `$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $launcherArgs`,
     `$trigger = New-ScheduledTaskTrigger -AtLogon -User "$env:USERNAME"`,
     `$settings = New-ScheduledTaskSettingsSet -Hidden`,
     `Register-ScheduledTask -TaskName "BrowserPowers" -Action $action -Trigger $trigger -Settings $settings -Force`,

@@ -1,6 +1,6 @@
 # BrowserPowers Installer — Hard Specification
 
-**Scope:** `scripts/install.mjs`  
+**Scope:** `scripts/install.mjs`, `core/src/index.ts` (start/stop/restart/serve commands)  
 **Platforms:** Windows, macOS, Linux  
 **Goal:** One script installs BrowserPowers end-to-end. After it exits, the user only opens the browser and loads the unpacked extension.
 
@@ -8,7 +8,43 @@
 
 ## 0. Non-Negotiable Constraints
 
-These are behavioral requirements. The mechanism used to satisfy them is an implementation detail and may change.
+These are permanent, never-violate rules.  If a mechanism breaks a rule, the mechanism is wrong — reformulate.
+
+---
+
+### 0.0 THE WINDOW RULE — DO NOT TOUCH
+
+**`serve` is the ONLY command allowed to open a window.**
+
+| Command     | Window allowed? | Behavior |
+|-------------|-----------------|----------|
+| `serve`     | YES — foreground | Console opens, shows banner, Ctrl+C to close |
+| `start`     | **NEVER**        | Spawns hidden daemon, exits immediately |
+| `restart`   | **NEVER**        | Stop + start, no window at any point |
+| `stop`      | **NEVER**        | Kills daemon, exits immediately |
+| Auto-start  | **NEVER**        | Logon trigger, scheduled task — no window, ever |
+
+**"Never" means:** At no point during execution does a visible console window appear, flash, or persist.  Not for 1ms.  Not behind other windows.  Not minimized.  **Zero visible windows.**
+
+**Mechanisms that satisfy this rule:**
+- Direct Node.js `spawn()` with `windowsHide: true` and `detached: true` — this translates to the Win32 `CREATE_NO_WINDOW` flag at process creation time.
+- .NET `ProcessStartInfo.CreateNoWindow = $true` — same Win32 flag, used by the logon launcher script.
+- `LaunchAgent` / XDG autostart — inherently windowless on POSIX.
+
+**Mechanisms that are BANNED:**
+- VBS `WshShell.Run` with window-style 0 — post-hoc hiding, not creation-time.
+- `cmd.exe /c start /b` — unreliable, often flashes.
+- `FindWindow` / `ShowWindow(SW_HIDE)` — post-hoc, always flashes.
+- Any technique that creates a window and *then* hides it.
+
+**How to verify (before accepting any PR):**
+1. `browserpowers start` — no new window appears, port 4199 is listening.
+2. `browserpowers restart` — no window at any point, daemon is back.
+3. `browserpowers stop` — no window, port released.
+4. Log-off, log-on — daemon starts with no window.
+5. If ANY window appears for start/restart/stop or auto-start: **reject immediately.**
+
+---
 
 ### 0.1 Userland only
 
