@@ -342,19 +342,15 @@ function removeAutoStart() {
 }
 
 /**
- * Windows: user-scoped Task Scheduler task that runs the daemon at logon.
+ * Windows: user-scoped Task Scheduler task that runs `browserpowers start`
+ * at logon — the exact same code path as manual start.
  *
- * The task action calls a .ps1 launcher script that starts node.exe via
- * .NET ProcessStartInfo with CreateNoWindow = $true — the daemon process
- * is never assigned a console.  This is creation-time prevention (not
- * post-hoc hiding like WshShell.Run or ShowWindow(SW_HIDE)).
- *
- * Manual start/restart does NOT use the scheduled task — core/src/index.ts
- * spawns directly with windowsHide: true (CREATE_NO_WINDOW via Node).
+ * The task calls `browserpowers.cmd start` via PowerShell with
+ * -WindowStyle Hidden.  startDetached() then spawns launcher.exe
+ * (GUI binary, CREATE_NO_WINDOW) to start the daemon.
  */
 function createWindowsAutoStart() {
-  // Clean up legacy auto-start artifacts (VBS launcher + HKCU Run key) if an
-  // old install left them behind, so they cannot trigger a missing file.
+  // Clean up legacy auto-start artifacts.
   tryRun(
     `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "BrowserPowers" /f`
   );
@@ -362,42 +358,17 @@ function createWindowsAutoStart() {
   if (existsSync(legacyVbs)) {
     try { unlinkSync(legacyVbs); } catch {}
   }
+  // Legacy .daemon-launcher.ps1 from before the Go launcher era.
+  if (existsSync(BP_DAEMON_LAUNCHER)) {
+    try { unlinkSync(BP_DAEMON_LAUNCHER); } catch {}
+  }
 
-  const tsxCli = resolve(BP_CORE_REPO, "node_modules", "tsx", "dist", "cli.mjs");
-  const coreEntry = resolve(BP_CORE_REPO, "src", "index.ts");
-  const nodePath = process.execPath;
-
-  // ── 1. Write the daemon-launcher.ps1 (stays in ~/.browserpowers/) ──
-  // This script receives three params and starts node.exe with
-  // CreateNoWindow, which maps to the Win32 CREATE_NO_WINDOW flag.
-  // The daemon process is NEVER assigned a console — no flash, no VBS.
-  const launcherScript = [
-    `param(`,
-    `    [Parameter(Mandatory=$true)][string]$Node,`,
-    `    [Parameter(Mandatory=$true)][string]$Tsx,`,
-    `    [Parameter(Mandatory=$true)][string]$Entry`,
-    `)`,
-    ``,
-    `$psi = New-Object System.Diagnostics.ProcessStartInfo`,
-    `$psi.FileName = $Node`,
-    `$psi.Arguments = """$Tsx"" ""$Entry"" serve"`,
-    `$psi.UseShellExecute = $false`,
-    `$psi.CreateNoWindow = $true`,
-    `[System.Diagnostics.Process]::Start($psi) | Out-Null`,
-  ].join("\n");
-  writeFileSync(BP_DAEMON_LAUNCHER, launcherScript, "utf-8");
-
-  // ── 2. Register the scheduled task ──
-  // The task action runs `powershell.exe -File "<launcher>" -Node <...> -Tsx <...> -Entry <...>`.
-  // The launcher then creates the real node.exe process with no console.
+  // Task action: PowerShell runs browserpowers start.
+  // browserpowers start → startDetached() → launcher.exe → daemon.
   const psSingleQuote = (s) => `'${s.replace(/'/g, "''")}'`;
   const psContent = [
-    `$launcher = ${psSingleQuote(BP_DAEMON_LAUNCHER)}`,
-    `$node = ${psSingleQuote(nodePath)}`,
-    `$tsx = ${psSingleQuote(tsxCli)}`,
-    `$entry = ${psSingleQuote(coreEntry)}`,
-    `$launcherArgs = "-NoProfile -WindowStyle Hidden -File $launcher -Node $node -Tsx $tsx -Entry $entry"`,
-    `$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $launcherArgs`,
+    `$wrapper = ${psSingleQuote(BP_BIN_BROWSERPOWERS)}`,
+    `$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -Command & $wrapper start"`,
     `$trigger = New-ScheduledTaskTrigger -AtLogon -User "$env:USERNAME"`,
     `$settings = New-ScheduledTaskSettingsSet -Hidden`,
     `Register-ScheduledTask -TaskName "BrowserPowers" -Action $action -Trigger $trigger -Settings $settings -Force`,
@@ -407,7 +378,7 @@ function createWindowsAutoStart() {
   writeFileSync(tmpPs1, psContent, "utf-8");
   try {
     mustRun(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmpPs1}"`, { cwd: BP_DIR });
-    log(`  Scheduled task: BrowserPowers`);
+    log(`  Scheduled task: BrowserPowers (will run browserpowers start at logon)`);
     return true;
   } finally {
     try { unlinkSync(tmpPs1); } catch {}
