@@ -620,7 +620,9 @@ Click the element matching the target or anchor.
 | `target` | Target (optional) | Structured target for the element to click |
 | `anchor` | string (optional) | Anchor ID from inspect (preferred fast path) |
 
-The extension MUST find the element via anchor or target resolution, then call `.click()` on the matched `HTMLElement`. If the element is disabled, MUST return `not_performed`. If multiple elements match for critical actions (click, submit, check), MUST return `ambiguous` with `errorCode: "AMBIGUOUS_TARGET"`.
+The extension MUST find the element via anchor or target resolution, then dispatch an `Input.dispatchMouseEvent` (`mousePressed` + `mouseReleased`) at the element's center coordinates via the `chrome.debugger` CDP layer. This is the same browser-level input injection Playwright uses and bypasses shadow DOM (open and closed), iframes, overlays, and CSP. If CDP attach is denied, MUST fall back to `HTMLElement.click()` and report the verdict as `world: "isolated"`, `path: "isolated.fallbackClick"`. If the element is disabled, MUST return `not_performed`. If multiple elements match for critical actions (click, submit, check), MUST return `ambiguous` with `errorCode: "AMBIGUOUS_TARGET"`.
+
+For `action: "dblclick"`, the extension MUST dispatch TWO press/release pairs at the same coordinates with `clickCount: 1` on the first pair and `clickCount: 2` on the second pair — this is what causes the browser to synthesize a `dblclick` DOM event with `detail: 2`.
 
 ###### `action: "fill"`
 
@@ -632,7 +634,7 @@ Set a form field's value programmatically (no keystroke simulation).
 | `anchor` | string (optional) | Anchor ID from inspect |
 | `value` | string (required) | Value to set |
 
-The extension MUST set the element's `value` directly and dispatch `input` and `change` events.
+The extension MUST set the element's `value` in the page's MAIN world via `Runtime.evaluate` (using the prototype's native value setter to bypass React controlled-input protection) and dispatch `input` and `change` events from main world. This avoids the "Illegal invocation" error that occurs when calling `HTMLInputElement.prototype`'s value setter on a non-input element (e.g. `<textarea>`). If CDP attach is denied, MUST fall back to the isolated-world native setter and report the verdict as `world: "isolated"`, `path: "isolated.fallbackFill"`.
 
 ###### `action: "check"`
 

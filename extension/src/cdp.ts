@@ -1,9 +1,11 @@
 /**
  * FILE: extension/src/cdp.ts
  * PURPOSE: Single owner of the chrome.debugger (CDP) layer in BrowserPowers.
- *          Provides lazy attach, detach, runtimeEvaluate, and a per-tab console
- *          buffer fed by `Runtime.consoleAPICalled` / `Runtime.exceptionThrown`
- *          / `Log.entryAdded` events. Service-worker-only module — the content
+ *          Provides lazy attach, detach, runtimeEvaluate, Input.* wrappers
+ *          (dispatchMouseEvent, insertText), Runtime.evaluate-based
+ *          focusElement / setElementValue helpers, and a per-tab console buffer
+ *          fed by `Runtime.consoleAPICalled` / `Runtime.exceptionThrown` /
+ *          `Log.entryAdded` events. Service-worker-only module — the content
  *          script does not have access to `chrome.debugger`.
  *
  *          Three execution worlds in BrowserPowers:
@@ -14,13 +16,23 @@
  *              MAIN-world console-capture consumer has been retired in
  *              favour of CDP)
  *
+ *          The Input.* domain is used by the SW-side page-act for click /
+ *          dblclick / hover / type / fill. CDP input injection goes through
+ *          the browser's input pipeline and bypasses page-level synthetic
+ *          event handlers — same approach Playwright uses. See
+ *          .agents/reports/plan_cdp-input-parity_2026-06-23.md.
+ *
  * OWNS: chrome.debugger attach lifecycle, per-tab console ring buffer, per-tab
- *       command serialization queue, runtimeEvaluate wrapper, public state
+ *       command serialization queue, runtimeEvaluate wrapper, Input.*
+ *       wrappers, focusElement / setElementValue helpers, public state
  *       surface for page.read action=runtime_status.
  * EXPORTS: ensureAttached, detach, getState, runtimeEvaluate, getConsoleBuffer,
+ *          dispatchMouseEvent, insertText, focusElement, setElementValue,
  *          init (called once at SW startup to register listeners), CdpState,
- *          AttachResult, EvalResult, ConsoleEntry.
- * DOCS:   .agents/reports/plan_cdp-max-authority_2026-06-22.md
+ *          AttachResult, EvalResult, ConsoleEntry, DispatchMouseEventResult,
+ *          InsertTextResult, FocusElementResult, SetElementValueResult.
+ * DOCS:   .agents/reports/plan_cdp-max-authority_2026-06-22.md,
+ *         .agents/reports/plan_cdp-input-parity_2026-06-23.md
  */
 
 import { isExtensionContext } from "./safety.js";
@@ -270,8 +282,11 @@ export async function ensureAttached(tabId: number, reason: string): Promise<Att
   try {
     await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
     await chrome.debugger.sendCommand({ tabId }, "Log.enable");
+    // Input.enable is a no-op for our use case but is conventional — keep
+    // it so any future Input.* event listeners (touch, key) work.
+    await chrome.debugger.sendCommand({ tabId }, "Input.enable");
   } catch (err) {
-    console.warn(`[bp-cdp] Failed to enable Runtime/Log domains on tab ${tabId}: ${(err as Error).message}`);
+    console.warn(`[bp-cdp] Failed to enable Runtime/Log/Input domains on tab ${tabId}: ${(err as Error).message}`);
   }
 
   return { attached: true, version: CDP_PROTOCOL_VERSION };
@@ -388,6 +403,228 @@ function mapRemoteEvaluateResult(raw: RemoteEvaluateResult | undefined, duration
   return {
     ok: true,
     value: raw.result?.value,
+    durationMs,
+  };
+}
+
+// ── Input.* wrappers ─────────────────────────────────────────────────────
+
+/** Mirrors the `Input.dispatchMouseEvent` `type` field. */
+export type DispatchMouseEventType = "mousePressed" | "mouseReleased" | "mouseMoved" | "mouseWheel";
+
+/** Mirrors the `Input.dispatchMouseEvent` `button` field. */
+export type MouseButton = "none" | "left" | "middle" | "right";
+
+export interface DispatchMouseEventOptions {
+  button?: MouseButton;
+  clickCount?: number;
+  /** Bit field — see CDP docs for modifier flags. 0 = none. */
+  modifiers?: number;
+  /** Only for type="mouseWheel" — deltaX/deltaY. */
+  deltaX?: number;
+  deltaY?: number;
+}
+
+export interface DispatchMouseEventResult {
+  ok: boolean;
+  error?: string;
+  durationMs: number;
+}
+
+export interface InsertTextResult {
+  ok: boolean;
+  error?: string;
+  durationMs: number;
+}
+
+export interface FocusElementResult {
+  ok: boolean;
+  error?: string;
+  /** True when the element was found and `focus()` returned without throwing. */
+  focused: boolean;
+  durationMs: number;
+}
+
+export interface SetElementValueResult {
+  ok: boolean;
+  error?: string;
+  /** The element's `.value` after the set (string). */
+  value?: string;
+  durationMs: number;
+}
+
+/**
+ * Wrap `Input.dispatchMouseEvent`. Lazy-attaches on first call, queues per-tab
+ * so events land in order. Never throws — returns `{ ok: false, error }` on
+ * failure (including attach denial).
+ *
+ * Use this for click / dblclick / hover: pass type "mousePressed" then
+ * "mouseReleased" for a left-click, or "mouseMoved" for a hover. The browser
+ * routes the synthesized event through the normal input pipeline so it hits
+ * the element under viewport coords (x, y) — the same behaviour real user
+ * input would produce.
+ */
+export async function dispatchMouseEvent(
+  tabId: number,
+  type: DispatchMouseEventType,
+  x: number,
+  y: number,
+  opts: DispatchMouseEventOptions = {},
+): Promise<DispatchMouseEventResult> {
+  const tail = cmdQueues.get(tabId) ?? Promise.resolve();
+  const next = tail
+    .catch(() => undefined)
+    .then(async () => {
+      const attach = await ensureAttached(tabId, `input.${type}`);
+      if (!attach.attached) {
+        return {
+          ok: false,
+          error: attach.error ?? "CDP attach failed",
+          durationMs: 0,
+        } satisfies DispatchMouseEventResult;
+      }
+      const start = performance.now();
+      const params: Record<string, unknown> = {
+        type,
+        x,
+        y,
+        button: opts.button ?? "none",
+        clickCount: opts.clickCount ?? 0,
+        modifiers: opts.modifiers ?? 0,
+      };
+      if (type === "mouseWheel") {
+        if (opts.deltaX !== undefined) params.deltaX = opts.deltaX;
+        if (opts.deltaY !== undefined) params.deltaY = opts.deltaY;
+      }
+      try {
+        await chrome.debugger.sendCommand(
+          { tabId },
+          "Input.dispatchMouseEvent",
+          params as Record<string, unknown>,
+        );
+        return { ok: true, durationMs: performance.now() - start } satisfies DispatchMouseEventResult;
+      } catch (err) {
+        return {
+          ok: false,
+          error: (err as Error)?.message ?? String(err),
+          durationMs: performance.now() - start,
+        } satisfies DispatchMouseEventResult;
+      }
+    });
+  cmdQueues.set(tabId, next.catch(() => undefined));
+  return next;
+}
+
+/**
+ * Wrap `Input.insertText`. Lazy-attaches, queues per-tab. The text is
+ * delivered as if typed — element must already be focused (use `focusElement`
+ * first). Use this for the `type` action: a single call covers the whole
+ * text, no per-character synthesis needed.
+ */
+export async function insertText(tabId: number, text: string): Promise<InsertTextResult> {
+  const tail = cmdQueues.get(tabId) ?? Promise.resolve();
+  const next = tail
+    .catch(() => undefined)
+    .then(async () => {
+      const attach = await ensureAttached(tabId, "input.insertText");
+      if (!attach.attached) {
+        return {
+          ok: false,
+          error: attach.error ?? "CDP attach failed",
+          durationMs: 0,
+        } satisfies InsertTextResult;
+      }
+      const start = performance.now();
+      try {
+        await chrome.debugger.sendCommand(
+          { tabId },
+          "Input.insertText",
+          { text } as Record<string, unknown>,
+        );
+        return { ok: true, durationMs: performance.now() - start } satisfies InsertTextResult;
+      } catch (err) {
+        return {
+          ok: false,
+          error: (err as Error)?.message ?? String(err),
+          durationMs: performance.now() - start,
+        } satisfies InsertTextResult;
+      }
+    });
+  cmdQueues.set(tabId, next.catch(() => undefined));
+  return next;
+}
+
+/**
+ * Focus an element in the main world by evaluating a JS expression that
+ * resolves to the element. The caller (content script) is responsible for
+ * building the expression — typically a chain of `.shadowRoot.querySelector()`
+ * calls plus the leaf selector. Example:
+ *
+ *   `document.querySelector('my-app').shadowRoot.querySelector('input')`
+ *
+ * Lazy-attaches, queues per-tab, never throws. On evaluation failure
+ * (element not found, thrown error) returns `{ ok: false, error, focused: false }`.
+ */
+export async function focusElement(tabId: number, jsExpression: string): Promise<FocusElementResult> {
+  const start = performance.now();
+  // Wrap the expression so we get a uniform { ok, focused, error } shape
+  // even if the expression throws (e.g. null deref when a shadow host is
+  // missing).
+  const code = `(() => { try { const el = ${jsExpression}; if (!el) return { ok: false, focused: false, error: 'element not found' }; if (typeof el.focus === 'function') { el.focus(); } return { ok: true, focused: true }; } catch (e) { return { ok: false, focused: false, error: String(e && e.message ? e.message : e) }; } })()`;
+  const result = await runtimeEvaluate(tabId, code);
+  const durationMs = performance.now() - start;
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.exceptionDetails?.text ?? "evaluate failed",
+      focused: false,
+      durationMs,
+    };
+  }
+  const value = result.value as { ok?: boolean; focused?: boolean; error?: string } | undefined;
+  return {
+    ok: value?.ok ?? false,
+    focused: value?.focused ?? false,
+    error: value?.error,
+    durationMs,
+  };
+}
+
+/**
+ * Set the `.value` of an input/textarea/contenteditable element from the main
+ * world. Bypasses React controlled-input protection by using the prototype's
+ * native value setter, then dispatches `input` and `change` events so the
+ * page's listeners fire.
+ *
+ * The caller (content script) is responsible for building a `jsExpression`
+ * that resolves to the target element in the main world — the same
+ * expression `focusElement` accepts.
+ */
+export async function setElementValue(
+  tabId: number,
+  jsExpression: string,
+  value: string,
+): Promise<SetElementValueResult> {
+  const start = performance.now();
+  const valueJson = JSON.stringify(value);
+  // Pick the correct prototype setter based on tagName. The wrapped IIFE
+  // returns a uniform shape; the expression is JSON-string-quoted so a
+  // maliciously-crafted value can't inject JS.
+  const code = `(() => { try { const el = ${jsExpression}; if (!el) return { ok: false, error: 'element not found' }; const tag = (el.tagName || '').toLowerCase(); let setter = null; if (tag === 'textarea') setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value') && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; else if (tag === 'input') setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value') && Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; const newVal = ${valueJson}; if (setter) { setter.call(el, newVal); } else if ('value' in el) { el.value = newVal; } else if (el.isContentEditable) { el.textContent = newVal; } try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {} try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {} const out = (typeof el.value === 'string') ? el.value : (el.isContentEditable ? el.textContent : ''); return { ok: true, value: out }; } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; } })()`;
+  const result = await runtimeEvaluate(tabId, code);
+  const durationMs = performance.now() - start;
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.exceptionDetails?.text ?? "evaluate failed",
+      durationMs,
+    };
+  }
+  const evalValue = result.value as { ok?: boolean; error?: string; value?: string } | undefined;
+  return {
+    ok: evalValue?.ok ?? false,
+    error: evalValue?.error,
+    value: evalValue?.value,
     durationMs,
   };
 }

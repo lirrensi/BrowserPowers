@@ -8,11 +8,18 @@
  *          The MAIN-world console capture surface (a small JS file that piped entries through
  *          a shared DOM `<meta>` element + MutationObserver) was retired when CDP took over
  *          console capture — see plan_cdp-max-authority_2026-06-22.md.
- * OWNS: Message dispatch hub for bp:read, bp:act, bp:js messages in the page context.
+ *          After the CDP-input-parity refactor (2026-06-23) the bp:act click / dblclick /
+ *          hover / type / fill handlers no longer dispatch events — they resolve the target
+ *          and return coordinates + JS expressions so the SW can drive CDP. Synthetic-event
+ *          fallback lives in bp:fallback-click / bp:fallback-dblclick / bp:fallback-hover /
+ *          bp:fallback-type / bp:fallback-fill (invoked when CDP attach is denied or the
+ *          Input.* command itself fails).
+ * OWNS: Message dispatch hub for bp:read, bp:act, bp:js, bp:resolve, bp:fallback-* messages.
  * EXPORTS: WXT content script via defineContentScript (global)
  * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
  *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
- *       .agents/reports/plan_cdp-max-authority_2026-06-22.md
+ *       .agents/reports/plan_cdp-max-authority_2026-06-22.md,
+ *       .agents/reports/plan_cdp-input-parity_2026-06-23.md
  */
 
 import {
@@ -20,19 +27,26 @@ import {
   resolveTarget,
   inspectElements,
   listFrames,
-  // Act actions
+  // Act actions — resolve-and-locate (used by both `bp:act` and `bp:resolve`)
   clickElement,
   fillElement,
+  dblclickElement,
+  hoverElement,
+  typeText,
+  // Fallback synthetic-event dispatchers (used by `bp:fallback-*` when CDP fails)
+  dispatchClickEventFallback,
+  dispatchDblclickEventFallback,
+  dispatchHoverEventFallback,
+  dispatchTypeTextFallback,
+  fillElementFallback,
+  // Other act actions (still direct)
   checkElement,
   selectOption,
   pressKeys,
   scrollElement,
   submitForm,
-  typeText,
   uploadFile,
   dragElement,
-  dblclickElement,
-  hoverElement,
   // Dialog
   dialogOverride,
   dialogRespond,
@@ -125,7 +139,7 @@ function ensureReady(): Promise<void> {
 }
 
 /** Wrap a response envelope so the runtime self-test rides on every reply. */
-function withRuntimeStatus(envelope: Record<string, unknown>): Record<string, unknown> {
+function withRuntimeStatus(envelope: ActResult | Record<string, unknown>): Record<string, unknown> {
   return { ...envelope, runtimeStatus: RUNTIME_SELFTEST };
 }
 
@@ -142,6 +156,14 @@ async function handleMessage(
         return withRuntimeStatus(await handleAct(message.action || "", message.params || {}));
       case "bp:js":
         return withRuntimeStatus(await handleJs(message.params || {}));
+      case "bp:resolve":
+        return withRuntimeStatus(await handleResolve(message.params || {}));
+      case "bp:fallback-click":
+      case "bp:fallback-dblclick":
+      case "bp:fallback-hover":
+      case "bp:fallback-type":
+      case "bp:fallback-fill":
+        return withRuntimeStatus(await handleFallback(message.type, message.params || {}));
       case "bp:runtime_status":
         return withRuntimeStatus(buildRuntimeStatus());
       default:
@@ -230,7 +252,7 @@ async function handleRead(
 async function handleAct(
   action: string,
   params: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
+): Promise<ActResult | Record<string, unknown>> {
   await ensureReady();
 
   /** Try to resolve the element, with a short poll for lazy-loaded content */
@@ -269,14 +291,14 @@ async function handleAct(
     case "click": {
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
-      return clickElement(el);
+      return clickElement(el, params.anchor as string | undefined);
     }
     case "fill": {
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       const value = params.value as string;
       if (value === undefined) return { success: false, message: "No value provided" };
-      return fillElement(el, value);
+      return fillElement(el, value, params.anchor as string | undefined);
     }
     case "check": {
       const el = await resolveEl();
@@ -313,14 +335,14 @@ async function handleAct(
       const text = (params.text as string) ?? (params.value as string);
       const delay = (params.delay as number) ?? 30;
       if (!text) return { success: false, message: "No text provided (use 'text' parameter)" };
-      return typeText(el, text, delay);
+      return typeText(el, text, delay, params.anchor as string | undefined);
     }
     case "smart_click": {
       const target = params.target as Target | undefined;
       if (!target) return { success: false, message: "Smart click requires a target" };
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
-      return clickElement(el);
+      return clickElement(el, params.anchor as string | undefined);
     }
     case "fill_form": {
       const fields = params.fields as Array<{ selector: string; value: string }> | undefined;
@@ -347,12 +369,12 @@ async function handleAct(
     case "dblclick": {
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
-      return dblclickElement(el);
+      return dblclickElement(el, params.anchor as string | undefined);
     }
     case "hover": {
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
-      return hoverElement(el);
+      return hoverElement(el, params.anchor as string | undefined);
     }
     case "dialog_override":
       return dialogOverride();
@@ -398,6 +420,124 @@ async function handleAct(
     default:
       return { success: false, message: `Unknown act action: ${action}`, errorCode: "UNKNOWN_ACTION" };
   }
+}
+
+// ── Resolve Handler (used by SW to drive CDP via coordinates / JS expr) ──
+
+/**
+ * `bp:resolve` is the explicit resolve step the SW uses before driving
+ * CDP `Input.dispatchMouseEvent` / `Input.insertText` / `Runtime.evaluate`.
+ * The CS resolves the target, returns the relevant data (coords for click /
+ * dblclick / hover, jsExpression for type / fill), and the SW does the
+ * actual input injection. The CS itself does NOT dispatch events here.
+ *
+ * The params include an `action` (one of click | dblclick | hover | type |
+ * fill) so the CS knows which resolve function to call.
+ */
+async function handleResolve(params: Record<string, unknown>): Promise<ActResult | Record<string, unknown>> {
+  await ensureReady();
+  const action = (params.action as string) || "";
+  const anchor = params.anchor as string | undefined;
+  const el = await resolveElementFromParams(params);
+  if (!el) {
+    return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
+  }
+  switch (action) {
+    case "click":
+      return clickElement(el, anchor);
+    case "dblclick":
+      return dblclickElement(el, anchor);
+    case "hover":
+      return hoverElement(el, anchor);
+    case "type": {
+      const text = (params.text as string) ?? (params.value as string);
+      const delay = (params.delay as number) ?? 30;
+      if (!text) return { success: false, message: "No text provided (use 'text' parameter)" };
+      return typeText(el, text, delay, anchor);
+    }
+    case "fill": {
+      const value = params.value as string;
+      if (value === undefined) return { success: false, message: "No value provided" };
+      return fillElement(el, value, anchor);
+    }
+    default:
+      return { success: false, message: `Unknown resolve action: ${action}`, errorCode: "UNKNOWN_ACTION" };
+  }
+}
+
+// ── Fallback Handler (synthetic events when CDP attach fails) ──
+
+/**
+ * `bp:fallback-*` is the synthetic-event fallback path invoked by the SW
+ * when CDP attach is denied or the Input.* command itself fails. The CS
+ * re-resolves the target (it may have changed since the resolve step) and
+ * dispatches the legacy synthetic event.
+ *
+ * Each fallback reuses the same params the resolve step used, so the SW
+ * only needs to forward them.
+ */
+async function handleFallback(type: string, params: Record<string, unknown>): Promise<ActResult | Record<string, unknown>> {
+  await ensureReady();
+  const el = await resolveElementFromParams(params);
+  if (!el) {
+    return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
+  }
+  switch (type) {
+    case "bp:fallback-click":
+      return dispatchClickEventFallback(el);
+    case "bp:fallback-dblclick":
+      return dispatchDblclickEventFallback(el);
+    case "bp:fallback-hover":
+      return dispatchHoverEventFallback(el);
+    case "bp:fallback-type": {
+      const text = (params.text as string) ?? (params.value as string);
+      const delay = (params.delay as number) ?? 30;
+      if (!text) return { success: false, message: "No text provided (use 'text' parameter)" };
+      return dispatchTypeTextFallback(el, text, delay);
+    }
+    case "bp:fallback-fill": {
+      const value = params.value as string;
+      if (value === undefined) return { success: false, message: "No value provided" };
+      return fillElementFallback(el, value);
+    }
+    default:
+      return { success: false, message: `Unknown fallback type: ${type}`, errorCode: "UNKNOWN_TYPE" };
+  }
+}
+
+/**
+ * Resolve an Element from the standard {selector?, target?, shadowPath?}
+ * shape that both bp:resolve and bp:fallback-* accept. Reuses the same
+ * short-poll loop as handleAct.resolveEl so lazy-loaded elements still
+ * resolve.
+ */
+async function resolveElementFromParams(params: Record<string, unknown>): Promise<Element | null> {
+  const sel = params.selector as string | undefined;
+  const target = params.target as Target | undefined;
+  const shadowPath = params.shadowPath as string[] | undefined;
+
+  function attempt(): Element | null {
+    if (sel) {
+      const resolution = resolveTarget({ css: sel }, shadowPath);
+      return resolution.found ? (resolution.element ?? null) : null;
+    }
+    if (target) {
+      const resolution = resolveTarget(target, shadowPath);
+      if (resolution.found && resolution.element) return resolution.element;
+    }
+    return null;
+  }
+
+  const immediate = attempt();
+  if (immediate) return immediate;
+
+  const deadline = Date.now() + 500;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    const result = attempt();
+    if (result) return result;
+  }
+  return null;
 }
 
 // ── JS Handler ──

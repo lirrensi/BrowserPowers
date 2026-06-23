@@ -8,7 +8,10 @@
  *            2. page.read action=runtime_status returns the full surface state
  *               and the merged cdp block shows attached: true after a page.js call.
  *            3. page.act click on a button inside a shadow root succeeds and
- *               reports executionVerdict.eventFired === true.
+ *               reports executionVerdict.world === "cdp" with path
+ *               "cdp.input.dispatchMouseEvent" (CDP path; click is verified
+ *               via the page-side side effect, not via eventFired which the
+ *               CDP path does not populate).
  *            4. The same flow works on a CSP-strict page — page.js and page.act
  *               are immune to page CSP because CDP bypasses page CSP.
  *
@@ -311,9 +314,11 @@ test.describe("Runtime Verdict — Shadow DOM click", () => {
     const clickData = click.data as { executionVerdict?: { executed?: boolean; world?: string; eventFired?: boolean; domMutated?: boolean; path?: string; durationMs?: number } } | undefined;
     const cv = clickData?.executionVerdict;
     expect(cv?.executed, "verdict.executed should be true").toBe(true);
-    expect(cv?.world, "verdict.world should be 'isolated'").toBe("isolated");
-    expect(cv?.eventFired, "verdict.eventFired should be true — the click reached the target").toBe(true);
-    expect(cv?.path, "verdict.path should be 'isolated.elClick'").toBe("isolated.elClick");
+    expect(cv?.world, "verdict.world should be 'cdp' (CDP Input.dispatchMouseEvent)").toBe("cdp");
+    expect(cv?.path, "verdict.path should be 'cdp.input.dispatchMouseEvent'").toBe("cdp.input.dispatchMouseEvent");
+    // eventFired is no longer set by the CDP path — the side-effect
+    // verification below (status-… textContent) is the authoritative proof
+    // that the click reached the target.
     expect(
       typeof cv?.durationMs === "number" && Number.isFinite(cv.durationMs),
       "verdict.durationMs should be a finite number",
@@ -383,9 +388,11 @@ test.describe("Runtime Verdict — Shadow DOM click", () => {
     const clickData = click.data as { executionVerdict?: { executed?: boolean; world?: string; eventFired?: boolean; path?: string; durationMs?: number } } | undefined;
     const cv = clickData?.executionVerdict;
     expect(cv?.executed, "verdict.executed should be true").toBe(true);
-    expect(cv?.world, "verdict.world should be 'isolated'").toBe("isolated");
-    expect(cv?.eventFired, "verdict.eventFired should be true for nested shadow root click").toBe(true);
-    expect(cv?.path, "verdict.path should be 'isolated.elClick'").toBe("isolated.elClick");
+    expect(cv?.world, "verdict.world should be 'cdp' (CDP Input.dispatchMouseEvent)").toBe("cdp");
+    expect(cv?.path, "verdict.path should be 'cdp.input.dispatchMouseEvent'").toBe("cdp.input.dispatchMouseEvent");
+    // eventFired is no longer set by the CDP path — the side-effect
+    // verification below (status-… textContent) is the authoritative proof
+    // that the click reached the target.
 
     const statusText = await page.locator("#status-nested").textContent();
     expect(statusText, "the click handler in the nested shadow root should have run").toBe("nested-fired");
@@ -470,7 +477,9 @@ test.describe("Runtime Verdict — CSP-strict page", () => {
     expect(jsData?.executionVerdict?.executed, "verdict.executed should be true").toBe(true);
     expect(jsData?.executionVerdict?.value, "verdict.value should be 2").toBe(2);
 
-    // 2. page.act click on a button must work under strict CSP (isolated world)
+    // 2. page.act click on a button must work under strict CSP (CDP path —
+    // CDP bypasses page CSP because the debugger runs in the browser's
+    // privileged context, not the page's JS context).
     const click = await executeBrowserTool(browserId, "page.act", {
       action: "click",
       tabId,
@@ -479,9 +488,11 @@ test.describe("Runtime Verdict — CSP-strict page", () => {
     expect(click.success, "page.act click should succeed under strict CSP").toBe(true);
     const clickData = click.data as { executionVerdict?: { world?: string; eventFired?: boolean; executed?: boolean } } | undefined;
     const cv = clickData?.executionVerdict;
-    expect(cv?.world, "verdict.world should be 'isolated'").toBe("isolated");
+    expect(cv?.world, "verdict.world should be 'cdp' (CDP Input.dispatchMouseEvent)").toBe("cdp");
     expect(cv?.executed, "verdict.executed should be true").toBe(true);
-    expect(cv?.eventFired, "verdict.eventFired should be true — click reached the target").toBe(true);
+    // eventFired is no longer set by the CDP path — the side-effect
+    // verification below (status-csp textContent) is the authoritative proof
+    // that the click reached the target.
 
     const statusText = await page.locator("#csp-status").textContent();
     expect(statusText, "click handler should have fired on the CSP-strict page").toBe("csp-fired");
@@ -511,5 +522,203 @@ test.describe("Runtime Verdict — CSP-strict page", () => {
       statusData?.data?.cdp?.consoleCapture?.status,
       "cdp.consoleCapture.status should be 'ready' (CDP bypasses page CSP)",
     ).toBe("ready");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 4) CDP input parity — closed shadow root click (CRITICAL T1)
+//
+// Closed shadow roots are unreachable from the isolated world; only CDP
+// can hit them. The content-script's resolveTarget cannot penetrate a
+// closed root, so we pass `shadowPath: ["host-closed"]` directly — the
+// CDP click then dispatches at the element's viewport coordinates.
+// ─────────────────────────────────────────────────────────────────────
+
+test.describe("CDP input parity — Closed shadow root", () => {
+  test("click on a button inside a CLOSED shadow root fires the event via CDP", async ({
+    page,
+    context,
+    getBrowserId,
+    executeBrowserTool,
+  }) => {
+    await allowPageExecuteAndAct(page, context);
+
+    await page.goto("https://example.com/?bp=shadow-closed");
+    await setPageBody(
+      page,
+      `
+        <div id="host-closed"></div>
+        <div id="status-closed">idle</div>
+      `,
+      `
+        const host = document.getElementById('host-closed');
+        const root = host.attachShadow({ mode: 'closed' });
+        root.innerHTML = '<button id="closed-btn" data-testid="closed-shadow-target">Closed Shadow Button</button>';
+        const btn = root.getElementById('closed-btn');
+        const status = document.getElementById('status-closed');
+        btn.addEventListener('click', () => { status.textContent = 'closed-fired'; });
+      `,
+    );
+
+    const browserId = await getBrowserId();
+    const tabId = await resolveActiveTabId(
+      browserId,
+      executeBrowserTool as ExecTool,
+      "example.com/?bp=shadow-closed",
+    );
+
+    // Note: we do NOT use `inspect` here because the content script's
+    // resolveTarget cannot penetrate closed shadow roots. We use the
+    // `shadowPath` parameter directly: ["host-closed"] tells the
+    // dispatcher to descend into host-closed's shadow root and find
+    // #closed-btn inside.
+
+    const click = await executeBrowserTool(browserId, "page.act", {
+      action: "click",
+      tabId,
+      target: { css: "#closed-btn" },
+      shadowPath: ["host-closed"],
+    });
+    expect(click.success, "click on closed shadow button should succeed").toBe(true);
+    const clickData = click.data as { executionVerdict?: { world?: string; path?: string; executed?: boolean } } | undefined;
+    const cv = clickData?.executionVerdict;
+    expect(cv?.world, "verdict.world should be 'cdp'").toBe("cdp");
+    expect(cv?.path, "verdict.path should be 'cdp.input.dispatchMouseEvent'").toBe("cdp.input.dispatchMouseEvent");
+    expect(cv?.executed, "verdict.executed should be true").toBe(true);
+
+    // Side-effect verification — the click handler in the closed shadow root ran.
+    const statusText = await page.locator("#status-closed").textContent();
+    expect(statusText, "the click handler in the closed shadow root should have run").toBe("closed-fired");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 5) CDP input parity — textarea fill (CRITICAL T2)
+//
+// Proves the goal's primary bug fix: fill on <textarea> no longer
+// throws "Illegal invocation" because we now use CDP Runtime.evaluate
+// to set .value in the main world. Verdict: world="main" (the IIFE
+// runs in the page main world), path="cdp.runtime.evaluate",
+// valueMatched=true. The IIFE also dispatches input + change events,
+// so the input handler fires as a side effect.
+// ─────────────────────────────────────────────────────────────────────
+
+test.describe("CDP input parity — Textarea fill", () => {
+  test("fill on a textarea sets the value via CDP Runtime.evaluate", async ({
+    page,
+    context,
+    getBrowserId,
+    executeBrowserTool,
+  }) => {
+    await allowPageExecuteAndAct(page, context);
+
+    await page.goto("https://example.com/?bp=textarea-fill");
+    await setPageBody(
+      page,
+      `
+        <textarea id="ta"></textarea>
+        <div id="ta-status">idle</div>
+      `,
+      `
+        const ta = document.getElementById('ta');
+        ta.addEventListener('input', () => {
+          document.getElementById('ta-status').textContent = 'input-fired';
+        });
+      `,
+    );
+
+    const browserId = await getBrowserId();
+    const tabId = await resolveActiveTabId(
+      browserId,
+      executeBrowserTool as ExecTool,
+      "example.com/?bp=textarea-fill",
+    );
+
+    const fill = await executeBrowserTool(browserId, "page.act", {
+      action: "fill",
+      tabId,
+      target: { css: "#ta" },
+      value: "hello world from CDP",
+    });
+    expect(fill.success, "fill on textarea should succeed").toBe(true);
+    const fillData = fill.data as { executionVerdict?: { world?: string; path?: string; executed?: boolean; valueMatched?: boolean } } | undefined;
+    const fv = fillData?.executionVerdict;
+    expect(fv?.world, "verdict.world should be 'main' (Runtime.evaluate runs in page main world)").toBe("main");
+    expect(fv?.path, "verdict.path should be 'cdp.runtime.evaluate'").toBe("cdp.runtime.evaluate");
+    expect(fv?.executed, "verdict.executed should be true").toBe(true);
+    expect(fv?.valueMatched, "verdict.valueMatched should be true — textarea value matches").toBe(true);
+
+    // Side-effect verification — the input event fired and the value is set.
+    const value = await page.locator("#ta").inputValue();
+    expect(value, "textarea value should be 'hello world from CDP'").toBe("hello world from CDP");
+    const status = await page.locator("#ta-status").textContent();
+    expect(status, "input event should have fired").toBe("input-fired");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 6) CDP input parity — dblclick (CRITICAL T5)
+//
+// Proves Fix 2 (dblclick clickCount 1,1,2,2) is correct — the browser
+// synthesizes a `dblclick` DOM event with detail: 2. The first
+// press/release pair uses clickCount: 1 (records a normal click); the
+// second pair uses clickCount: 2 (triggers the dblclick). Verdict:
+// world="cdp", path="cdp.input.dispatchMouseEvent", durationMs is the
+// sum of all 4 dispatch round-trips.
+// ─────────────────────────────────────────────────────────────────────
+
+test.describe("CDP input parity — Dblclick", () => {
+  test("dblclick fires the dblclick event with detail: 2 via CDP", async ({
+    page,
+    context,
+    getBrowserId,
+    executeBrowserTool,
+  }) => {
+    await allowPageExecuteAndAct(page, context);
+
+    await page.goto("https://example.com/?bp=dblclick");
+    await setPageBody(
+      page,
+      `
+        <button id="dclk">Double-click me</button>
+        <div id="dclk-status">idle</div>
+      `,
+      `
+        const btn = document.getElementById('dclk');
+        const status = document.getElementById('dclk-status');
+        let dblclickCount = 0;
+        btn.addEventListener('dblclick', (e) => {
+          dblclickCount++;
+          status.textContent = 'detail=' + e.detail + ', count=' + dblclickCount;
+        });
+      `,
+    );
+
+    const browserId = await getBrowserId();
+    const tabId = await resolveActiveTabId(
+      browserId,
+      executeBrowserTool as ExecTool,
+      "example.com/?bp=dblclick",
+    );
+
+    const dblclick = await executeBrowserTool(browserId, "page.act", {
+      action: "dblclick",
+      tabId,
+      target: { css: "#dclk" },
+    });
+    expect(dblclick.success, "dblclick should succeed").toBe(true);
+    const dblclickData = dblclick.data as { executionVerdict?: { world?: string; path?: string; executed?: boolean; durationMs?: number } } | undefined;
+    const dv = dblclickData?.executionVerdict;
+    expect(dv?.world, "verdict.world should be 'cdp'").toBe("cdp");
+    expect(dv?.path, "verdict.path should be 'cdp.input.dispatchMouseEvent'").toBe("cdp.input.dispatchMouseEvent");
+    expect(dv?.executed, "verdict.executed should be true").toBe(true);
+    expect(
+      typeof dv?.durationMs === "number" && Number.isFinite(dv.durationMs) && dv.durationMs > 0,
+      "verdict.durationMs should be a positive finite number — sums all 4 events for dblclick",
+    ).toBe(true);
+
+    // Side-effect verification — the dblclick handler ran with detail: 2.
+    const statusText = await page.locator("#dclk-status").textContent();
+    expect(statusText, "dblclick handler should have fired with detail=2").toBe("detail=2, count=1");
   });
 });

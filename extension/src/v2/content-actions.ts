@@ -2,19 +2,33 @@
  * FILE: extension/src/v2/content-actions.ts
  * PURPOSE: All DOM interaction logic as real TypeScript functions — loaded in the persistent
  *          content script at document_start, replacing the fragile string-body injection pattern.
- * OWNS: Target resolution, inspection, act actions, dialog control, wait conditions, read operations.
+ *          After the CDP-input-parity refactor (2026-06-23), the
+ *          resolve-and-locate functions (clickElement, dblclickElement,
+ *          hoverElement, typeText, fillElement) NO LONGER dispatch events
+ *          themselves — they return coordinates / JS expressions that the
+ *          service worker feeds into CDP `Input.*` / `Runtime.evaluate`.
+ *          The old synthetic-event behaviour is preserved in
+ *          `dispatchClickEventFallback`, `dispatchDblclickEventFallback`,
+ *          `dispatchHoverEventFallback`, `dispatchTypeTextFallback`, and
+ *          `fillElementFallback` for the case where CDP attach fails.
+ * OWNS: Target resolution, inspection, act actions, dialog control, wait conditions, read operations,
+ *       resolve-and-locate for CDP-bound actions, fallback synthetic-event dispatch.
  * EXPORTS: resolveTarget, inspectElements, listFrames,
- *          walkShadowPath, getShadowHostChain,
- *          clickElement, fillElement, checkElement, selectOption, pressKeys,
- *          scrollElement, submitForm, typeText, uploadFile, dragElement,
- *          dblclickElement, hoverElement, dialogOverride, dialogRespond,
+ *          walkShadowPath, getShadowHostChain, buildJsExpression,
+ *          clickElement, dblclickElement, hoverElement, typeText, fillElement,
+ *          dispatchClickEventFallback, dispatchDblclickEventFallback,
+ *          dispatchHoverEventFallback, dispatchTypeTextFallback, fillElementFallback,
+ *          checkElement, selectOption, pressKeys,
+ *          scrollElement, submitForm, uploadFile, dragElement,
+ *          dialogOverride, dialogRestore, dialogRespond,
  *          waitForElement, waitForTarget, waitForNetworkIdle, waitForFunction,
  *          fillFormFields,
  *          readContent, readTexts, readHtml, readAttr, readMeta, readForms,
  *          countElements, selectText, readSummary, generateSelector,
  *          initConsoleCapture, getConsoleEntries
  * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
- *       .agents/reports/plan_runtime-verdict_2026-06-22.md
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
+ *       .agents/reports/plan_cdp-input-parity_2026-06-23.md
  */
 
 // ── Types ──
@@ -46,6 +60,35 @@ export interface ActResult {
   matchCount?: number;
   /** Additive — every act path emits an ExecutionVerdict. */
   executionVerdict?: ExecutionVerdict;
+  /**
+   * Viewport coordinates of the element's center, populated by the
+   * resolve-and-locate paths used before CDP Input.dispatchMouseEvent.
+   * The SW consumes these to issue the browser-level click.
+   */
+  coords?: { x: number; y: number };
+  /**
+   * A JS expression (in the main world's scope) that resolves to the
+   * target element. Built by content-actions.resolveAndLocate so the SW
+   * can pass it to cdp.focusElement / cdp.setElementValue.
+   */
+  jsExpression?: string;
+  /** For type action — full text to insert. */
+  text?: string;
+  /** For type action — per-character delay (ms). */
+  delay?: number;
+  /** For fill action — value to assign. */
+  value?: string;
+  /** Info about the resolved element. Populated by resolve-and-locate paths. */
+  elementInfo?: {
+    tag: string;
+    type?: string;
+    /** Shadow host chain from topmost host to immediate host. */
+    shadowPath?: string[];
+    /** Anchor id used to resolve this element (if any). */
+    anchor?: string;
+    /** Bounding rect at the time of resolution. */
+    rect?: { left: number; top: number; width: number; height: number };
+  };
 }
 
 export interface InspectResult {
@@ -508,7 +551,135 @@ function isDescendantOrSelf(ancestor: Element, descendant: Element): boolean {
   return false;
 }
 
-export function clickElement(el: Element, clickDelayMs?: number): Promise<ActResult> {
+/**
+ * Build a JS expression (in the main world's scope) that resolves to `el`.
+ * Walks the shadow host chain from document → topmost host → ... → leaf.
+ * The leaf is identified with a CSS selector (prefer id, then class+tag,
+ * then bare tag). The expression is the value passed to
+ * cdp.focusElement / cdp.setElementValue so the SW can drive the element
+ * from CDP without re-resolving it.
+ */
+export function buildJsExpression(shadowPath: string[] | undefined, leafSelector: string): string {
+  if (!shadowPath || shadowPath.length === 0) {
+    return `document.querySelector(${JSON.stringify(leafSelector)})`;
+  }
+  const parts: string[] = ["document"];
+  for (const host of shadowPath) {
+    parts.push(`querySelector(${JSON.stringify(host)})`, "shadowRoot");
+  }
+  parts.push(`querySelector(${JSON.stringify(leafSelector)})`);
+  return parts.join(".");
+}
+
+/**
+ * Pick a CSS selector that matches `el` within its parent (light DOM or
+ * shadow root). Prefers id, then class+tag, then tag only. The result is
+ * not guaranteed unique across the parent — callers needing uniqueness
+ * should pass a richer target.
+ */
+function generateLeafSelector(el: Element): string {
+  if (el.id && typeof CSS !== "undefined" && CSS.escape) {
+    return `#${CSS.escape(el.id)}`;
+  }
+  if (el.id) {
+    return `#${cssEscape(el.id)}`;
+  }
+  const tag = el.tagName.toLowerCase();
+  const classes = Array.from(el.classList).filter((c) => c.length > 0);
+  if (classes.length > 0) {
+    const cls = classes.map((c) => (typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(c) : cssEscape(c)).join(".");
+    return `${tag}.${cls}`;
+  }
+  return tag;
+}
+
+/**
+ * Compute the shadow host chain leading to `el`, topmost first. Used by
+ * the resolve-and-locate paths so the SW can drive CDP against the
+ * correct element even when it's nested inside one or more shadow roots.
+ */
+function getShadowPathFromElement(el: Element): string[] | undefined {
+  const chain = getShadowHostChain(el);
+  if (chain.length <= 1) return undefined;
+  return chain.slice(1).map((h) => h.tagName.toLowerCase()).reverse();
+}
+
+/** Helper: build the standard `elementInfo` object for resolve results. */
+function buildElementInfo(el: Element, anchor: string | undefined, rect?: DOMRect): ActResult["elementInfo"] {
+  const htmlEl = el as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+  const type = (htmlEl).getAttribute?.("type") || undefined;
+  const info: ActResult["elementInfo"] = {
+    tag,
+    shadowPath: getShadowPathFromElement(el),
+    anchor,
+  };
+  if (type) info.type = type;
+  if (rect) {
+    info.rect = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  }
+  return info;
+}
+
+/**
+ * Build the standard `executionVerdict` for a resolve-and-locate step.
+ * `path` is always `"isolated.resolveAndLocate"` — the element was found
+ * in the isolated world; the actual click / type / fill is what comes next.
+ */
+function resolveAndLocateVerdict(start: number, executed: boolean, error?: { name: string; message: string }): ExecutionVerdict {
+  return {
+    executed,
+    world: "isolated",
+    durationMs: performance.now() - start,
+    path: "isolated.resolveAndLocate",
+    ...(error ? { error } : {}),
+  };
+}
+
+export function clickElement(el: Element, anchor?: string): ActResult {
+  // Resolve-and-locate only. The actual click is dispatched by the SW via
+  // CDP `Input.dispatchMouseEvent` at the returned coords. This function
+  // does NOT fire any synthetic events — that's the whole point of the
+  // CDP path (it bypasses document-level overlays and shadow-DOM event
+  // composition issues). For the fallback path, see dispatchClickEventFallback.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+  if ((el as HTMLInputElement).disabled) {
+    return { success: false, message: "Element is disabled", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+
+  el.scrollIntoView({ behavior: "instant", block: "center" });
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return {
+      success: false,
+      message: "Element has zero size (not visible?)",
+      executionVerdict: resolveAndLocateVerdict(start, false, { name: "ZeroSize", message: "Element bounding rect is empty" }),
+    };
+  }
+
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const tag = el.tagName.toLowerCase();
+
+  return {
+    success: true,
+    message: `Resolved ${tag} at (${Math.round(cx)}, ${Math.round(cy)})`,
+    coords: { x: cx, y: cy },
+    elementInfo: buildElementInfo(el, anchor, rect),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+/**
+ * Fallback click path — kept for the case where CDP attach is denied or
+ * `Input.dispatchMouseEvent` fails. Synthesises a composed MouseEvent +
+ * native click() through the element's own event path. This is the OLD
+ * behaviour that previously lived inside clickElement.
+ */
+export function dispatchClickEventFallback(el: Element, clickDelayMs?: number): Promise<ActResult> {
   if (!el) return Promise.resolve({ success: false, message: "No element" });
   if ((el as HTMLInputElement).disabled) return Promise.resolve({ success: false, message: "Element is disabled" });
 
@@ -561,7 +732,7 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
             executed: false,
             world: "isolated",
             durationMs,
-            path: "isolated.elClick",
+            path: "isolated.fallbackClick",
             error: { name: "ClickBlocked", message: `Overlay ${topTag} covers target ${el.tagName.toLowerCase()}` },
           },
         });
@@ -599,7 +770,7 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
             executed: false,
             world: "isolated",
             durationMs,
-            path: "isolated.elClick",
+            path: "isolated.fallbackClick",
             error: { name: (e as Error).name || "Error", message: (e as Error).message || String(e) },
           },
         });
@@ -620,7 +791,7 @@ export function clickElement(el: Element, clickDelayMs?: number): Promise<ActRes
             eventFired,
             domMutated: true,
             durationMs,
-            path: "isolated.elClick",
+            path: "isolated.fallbackClick",
           },
         });
       }, 0);
@@ -639,43 +810,102 @@ function isInteractableForGate(el: Element): boolean {
   return false;
 }
 
-export function fillElement(el: Element, value: string): ActResult {
+export function fillElement(el: Element, value: string, anchor?: string): ActResult {
+  // Resolve-and-locate only. The actual set is performed by the SW via
+  // cdp.setElementValue, which uses Runtime.evaluate to assign .value in
+  // the main world and dispatch input/change events. This function does
+  // NOT touch .value itself — that's the CDP path. For the fallback, see
+  // fillElementFallback.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+
+  const chain = getShadowPathFromElement(el);
+  const leafSelector = generateLeafSelector(el);
+  const jsExpression = buildJsExpression(chain, leafSelector);
+  const tag = el.tagName.toLowerCase();
+
+  return {
+    success: true,
+    message: `Resolved ${tag} for fill`,
+    jsExpression,
+    value,
+    elementInfo: buildElementInfo(el, anchor),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+/**
+ * Fallback fill path — kept for the case where CDP attach is denied or
+ * Runtime.evaluate fails. Sets `.value` in the isolated world using the
+ * correct prototype setter (so React-controlled inputs don't reject it)
+ * and dispatches `input` + `change` events. This is the OLD behaviour
+ * that previously lived inside fillElement.
+ */
+export function fillElementFallback(el: Element, value: string): ActResult {
   const start = performance.now();
   if (!el) {
     return {
       success: false,
       message: "No element",
-      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.nativeSetter" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackFill" },
     };
   }
-  const input = el as HTMLInputElement;
+  const tag = el.tagName.toLowerCase();
+  const isInput = tag === "input";
+  const isTextarea = tag === "textarea";
+  const isContentEditable = el.getAttribute("contenteditable") === "true";
 
-  // Bypass React controlled input protection
-  const nativeSetter = Object.getOwnPropertyDescriptor(
-    HTMLInputElement.prototype, "value"
-  )?.set;
-  if (nativeSetter) {
-    nativeSetter.call(input, value);
-  } else {
-    input.value = value;
+  if (isInput || isTextarea) {
+    const input = el as HTMLInputElement | HTMLTextAreaElement;
+    const proto = isTextarea ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (nativeSetter) {
+      nativeSetter.call(input, value);
+    } else {
+      input.value = value;
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    const valueMatched = input.value === value;
+    return {
+      success: true,
+      message: `Filled with value`,
+      evidence: { tag },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        value: input.value,
+        valueMatched,
+        domMutated: true,
+        durationMs: performance.now() - start,
+        path: "isolated.fallbackFill",
+      },
+    };
   }
-
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-  const valueMatched = input.value === value;
+  if (isContentEditable) {
+    el.textContent = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return {
+      success: true,
+      message: "Filled contenteditable",
+      evidence: { tag },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        value: el.textContent || "",
+        valueMatched: (el.textContent || "") === value,
+        domMutated: true,
+        durationMs: performance.now() - start,
+        path: "isolated.fallbackFill",
+      },
+    };
+  }
   return {
-    success: true,
-    message: `Filled with value`,
-    evidence: { tag: el.tagName.toLowerCase() },
-    executionVerdict: {
-      executed: true,
-      world: "isolated",
-      value: input.value,
-      valueMatched,
-      domMutated: true,
-      durationMs: performance.now() - start,
-      path: "isolated.nativeSetter",
-    },
+    success: false,
+    message: "Element is not fillable (not input, textarea, or contenteditable)",
+    executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackFill" },
   };
 }
 
@@ -868,30 +1098,110 @@ export function submitForm(el: Element): ActResult {
   };
 }
 
-export function typeText(el: Element, text: string, delay: number): Promise<ActResult> {
+export function typeText(el: Element, text: string, delay: number, anchor?: string): ActResult {
+  // Resolve-and-locate only. The actual keystroke insertion is performed
+  // by the SW via cdp.focusElement + cdp.insertText — a single
+  // Input.insertText call covers the whole text, no per-character synthesis.
+  // The element is focused first (in the isolated world) so the input lands
+  // even before CDP takes over. For the fallback, see dispatchTypeTextFallback.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+  if (!text) {
+    return { success: false, message: "No text provided", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+
+  // Pre-focus in the isolated world so the element is the activeElement
+  // when CDP insertText lands. The SW will also call cdp.focusElement
+  // (which runs in the main world) as a safety net.
+  try {
+    (el as HTMLElement).focus();
+  } catch (_) {
+    // focus() can throw on detached or read-only elements — non-fatal.
+  }
+
+  const chain = getShadowPathFromElement(el);
+  const leafSelector = generateLeafSelector(el);
+  const jsExpression = buildJsExpression(chain, leafSelector);
+  const tag = el.tagName.toLowerCase();
+
+  return {
+    success: true,
+    message: `Resolved ${tag} for type`,
+    jsExpression,
+    text,
+    delay,
+    elementInfo: buildElementInfo(el, anchor),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+/**
+ * Fallback type path — kept for the case where CDP attach is denied or
+ * Input.insertText fails. Synthesises a sequence of keydown/keypress/keyup
+ * + per-character value assignment. This is the OLD behaviour that
+ * previously lived inside typeText.
+ */
+export function dispatchTypeTextFallback(el: Element, text: string, delay: number): Promise<ActResult> {
   if (!el || !text) {
     return Promise.resolve({
       success: false,
       message: "No element or text",
-      executionVerdict: { executed: false, world: "isolated", durationMs: 0, path: "isolated.nativeSetter" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: 0, path: "isolated.fallbackType" },
     });
   }
   const start = performance.now();
   const chars = text.split("");
   let i = 0;
-  const htmlEl = el as HTMLInputElement;
+  const tag = el.tagName.toLowerCase();
 
-  // Get native value setter once
-  const nativeSetter = Object.getOwnPropertyDescriptor(
-    HTMLInputElement.prototype, "value"
-  )?.set;
+  // Detect element type and get the correct prototype setter
+  const isInput = tag === "input";
+  const isTextarea = tag === "textarea";
+  const isContentEditable = el.getAttribute("contenteditable") === "true";
+
+  // Get the correct native setter for the element type
+  let nativeSetter: ((value: string) => void) | null = null;
+  if (isInput) {
+    nativeSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, "value"
+    )?.set ?? null;
+  } else if (isTextarea) {
+    nativeSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype, "value"
+    )?.set ?? null;
+  }
+
+  // Helper to get current value
+  function getValue(): string {
+    if (isInput || isTextarea) {
+      return (el as HTMLInputElement | HTMLTextAreaElement).value;
+    }
+    if (isContentEditable) {
+      return el.textContent || "";
+    }
+    return "";
+  }
+
+  // Helper to set value
+  function setValue(newValue: string): void {
+    if ((isInput || isTextarea) && nativeSetter) {
+      nativeSetter.call(el, newValue);
+    } else if ((isInput || isTextarea) && !nativeSetter) {
+      (el as HTMLInputElement | HTMLTextAreaElement).value = newValue;
+    } else if (isContentEditable) {
+      el.textContent = newValue;
+    }
+  }
 
   return new Promise((resolve) => {
     function typeNext(): void {
       if (i >= chars.length) {
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
-        const valueMatched = htmlEl.value === text || htmlEl.value.endsWith(text);
+        const currentValue = getValue();
+        const valueMatched = currentValue === text || currentValue.endsWith(text);
         resolve({
           success: true,
           message: `Typed ${chars.length} characters`,
@@ -899,27 +1209,32 @@ export function typeText(el: Element, text: string, delay: number): Promise<ActR
           executionVerdict: {
             executed: true,
             world: "isolated",
-            value: htmlEl.value,
+            value: currentValue,
             valueMatched,
             domMutated: true,
             durationMs: performance.now() - start,
-            path: "isolated.nativeSetter",
+            path: "isolated.fallbackType",
           },
         });
         return;
       }
       const ch = chars[i++];
-      htmlEl.focus();
+      (el as HTMLElement).focus();
       el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
       el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, bubbles: true }));
 
       // Use native setter for React compatibility
-      const currentValue = htmlEl.value;
+      const currentValue = getValue();
       const newValue = currentValue + ch;
-      if (nativeSetter) {
-        nativeSetter.call(htmlEl, newValue);
-      } else {
-        htmlEl.value = newValue;
+      try {
+        setValue(newValue);
+      } catch (e) {
+        // Fallback: direct assignment if native setter fails
+        if ((isInput || isTextarea)) {
+          (el as HTMLInputElement | HTMLTextAreaElement).value = newValue;
+        } else if (isContentEditable) {
+          el.textContent = newValue;
+        }
       }
 
       el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
@@ -1009,13 +1324,51 @@ export function dragElement(el: Element, x?: number, y?: number): ActResult {
   };
 }
 
-export function dblclickElement(el: Element): ActResult {
+export function dblclickElement(el: Element, anchor?: string): ActResult {
+  // Resolve-and-locate only. The actual dblclick is dispatched by the SW
+  // via two CDP `Input.dispatchMouseEvent` calls (mousePressed + mouseReleased
+  // with clickCount: 2, twice). For the fallback, see dispatchDblclickEventFallback.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+  if ((el as HTMLInputElement).disabled) {
+    return { success: false, message: "Element is disabled", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+
+  el.scrollIntoView({ behavior: "instant", block: "center" });
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return {
+      success: false,
+      message: "Element has zero size (not visible?)",
+      executionVerdict: resolveAndLocateVerdict(start, false, { name: "ZeroSize", message: "Element bounding rect is empty" }),
+    };
+  }
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const tag = el.tagName.toLowerCase();
+  return {
+    success: true,
+    message: `Resolved ${tag} for dblclick`,
+    coords: { x: cx, y: cy },
+    elementInfo: buildElementInfo(el, anchor, rect),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+/**
+ * Fallback dblclick path — synthetic composed dispatch through the
+ * element's own event path. The SW calls this when CDP attach is denied
+ * or Input.dispatchMouseEvent fails.
+ */
+export function dispatchDblclickEventFallback(el: Element): ActResult {
   const start = performance.now();
   if (!el) {
     return {
       success: false,
       message: "No element",
-      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackDblclick" },
     };
   }
   const rect = el.getBoundingClientRect();
@@ -1031,18 +1384,52 @@ export function dblclickElement(el: Element): ActResult {
       world: "isolated",
       domMutated: true,
       durationMs: performance.now() - start,
-      path: "isolated.dispatchEvent",
+      path: "isolated.fallbackDblclick",
     },
   };
 }
 
-export function hoverElement(el: Element): ActResult {
+export function hoverElement(el: Element, anchor?: string): ActResult {
+  // Resolve-and-locate only. The actual mouseMoved is dispatched by the SW
+  // via a single CDP `Input.dispatchMouseEvent` with type "mouseMoved".
+  // For the fallback, see dispatchHoverEventFallback.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+  el.scrollIntoView({ behavior: "instant", block: "center" });
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return {
+      success: false,
+      message: "Element has zero size (not visible?)",
+      executionVerdict: resolveAndLocateVerdict(start, false, { name: "ZeroSize", message: "Element bounding rect is empty" }),
+    };
+  }
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const tag = el.tagName.toLowerCase();
+  return {
+    success: true,
+    message: `Resolved ${tag} for hover`,
+    coords: { x: cx, y: cy },
+    elementInfo: buildElementInfo(el, anchor, rect),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+/**
+ * Fallback hover path — synthetic mouseover / mouseenter / mousemove
+ * through the element's event path. The SW calls this when CDP attach
+ * is denied or Input.dispatchMouseEvent fails.
+ */
+export function dispatchHoverEventFallback(el: Element): ActResult {
   const start = performance.now();
   if (!el) {
     return {
       success: false,
       message: "No element",
-      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackHover" },
     };
   }
   const rect = el.getBoundingClientRect();
@@ -1060,7 +1447,7 @@ export function hoverElement(el: Element): ActResult {
       world: "isolated",
       domMutated: false,
       durationMs: performance.now() - start,
-      path: "isolated.dispatchEvent",
+      path: "isolated.fallbackHover",
     },
   };
 }

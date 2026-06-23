@@ -319,9 +319,9 @@ The cost: one-time `"debugger"` permission prompt at install/upgrade, a yellow "
 
 | World | Where it runs | Page variables? | Page CSP applies? | Used by |
 |---|---|---|---|---|
-| **isolated** | Content script | No | No (extension CSP) | `page.act`, `page.read` (DOM-based), `RUNTIME_SELFTEST`, the `page.js` fallback when CDP attach is denied |
-| **cdp** | Browser debugger | Yes | **No** (privileged) | `page.js` (primary), `page.read action=console` |
-| **main** | Page's MAIN realm | Yes | Yes | Reserved for future; currently unused. `capture.js` was the only consumer; deleted when CDP took over console capture. |
+| **isolated** | Content script | No | No (extension CSP) | `page.read` (DOM-based), `RUNTIME_SELFTEST`, the `page.js` fallback when CDP attach is denied, `page.act` synthetic-event FALLBACKS (`isolated.fallbackClick`, `fallbackDblclick`, `fallbackHover`, `fallbackType`, `fallbackFill`) when CDP attach fails |
+| **cdp** | Browser debugger | Yes | **No** (privileged) | `page.js` (primary), `page.read action=console`, `page.act` primary paths: `click` / `dblclick` / `hover` / `type` (via `Input.*` and `DOM.focus` + `Input.insertText`) |
+| **main** | Page's MAIN realm (via Runtime.evaluate) | Yes | No (CDP bypasses) | `page.act` `fill` primary (via `setElementValue` Runtime.evaluate IIFE) |
 
 Every script path BrowserPowers uses is CSP-immune. `page.js` additionally has full page-variable access.
 
@@ -393,12 +393,19 @@ chrome.debugger.onEvent(source, method, params)
 
 | Path string | World | Meaning |
 |---|---|---|
-| `cdp.runtime.evaluate` | `"main"` | Successful or failed `Runtime.evaluate` — page variables accessible, no page CSP |
+| `cdp.runtime.evaluate` | `"main"` | Successful or failed `Runtime.evaluate` — page variables accessible, no page CSP. Used by `page.js` and by `page.act` `fill` (via `setElementValue`). |
 | `cdp.runtime.attach` | `"main"` | Attach failed; if no fallback was possible, this is the verdict |
+| `cdp.input.dispatchMouseEvent` | `"cdp"` | Browser-level mouse event via `Input.dispatchMouseEvent` — used by `page.act` `click`, `dblclick`, `hover`. Bypasses shadow DOM, iframes, overlays, CSP. |
+| `cdp.input.insertText` | `"cdp"` | Browser-level text insertion via `Input.insertText` (after `DOM.focus`) — used by `page.act` `type`. |
 | `isolated.newFunction` | `"isolated"` | Content-script fallback for `page.js` when CDP attach is denied (page variables NOT accessible) |
-| `isolated.elClick` and friends | `"isolated"` | Content-script act actions (unchanged) |
+| `isolated.fallbackClick` / `fallbackDblclick` / `fallbackHover` / `fallbackType` / `fallbackFill` | `"isolated"` | Synthetic-event fallback for the corresponding `page.act` action when CDP attach fails |
+| `isolated.dispatchEvent` | `"isolated"` | Synthetic events for `check`, `select_option`, `press`, `scroll` — not routed through CDP |
+| `isolated.resolveAndLocate` | `"isolated"` | Element resolution step (no event dispatch) — content script returns coords + elementInfo to the SW |
 
-The `world: "main"` literal in the verdict now means **CDP-driven** (not MAIN-world `executeScript`). The previous meaning is no longer in use — `capture.js` was the only consumer and has been retired.
+The three verdict `world` values are now distinct:
+- `"main"` — CDP-driven `Runtime.evaluate` (page variables accessible, no page CSP)
+- `"cdp"` — CDP-driven `Input.*` commands (browser-level input injection)
+- `"isolated"` — Content-script synthetic events or `new Function` (no page variables, extension CSP only)
 
 #### 11.7 Playwright / E2E Notes
 

@@ -5,14 +5,36 @@
  *          via chrome.tabs.sendMessage to the persistent content script.
  *          Surfaces the content-script ExecutionVerdict at the top level of
  *          the ActionResult and forwards shadowPath from anchors.
+ *          After the CDP-input-parity refactor (2026-06-23), five act actions
+ *          use a CDP primary path with a synthetic-event fallback:
+ *            click / dblclick / hover — CDP `Input.dispatchMouseEvent` at
+ *              element center coords returned by the CS's resolve step.
+ *              Fallback to a bp:fallback-click / -dblclick / -hover message.
+ *            type — CDP `focusElement` + `Input.insertText` with the JS
+ *              expression and text returned by the CS. Fallback to
+ *              bp:fallback-type.
+ *            fill — CDP `setElementValue` (Runtime.evaluate in main world
+ *              that sets .value and dispatches input/change). Fallback to
+ *              bp:fallback-fill.
+ *          Other act actions (press, check, select_option, submit, scroll,
+ *          drag, upload, dialog_*) still go through the content script
+ *          directly — synthetic events work fine for them.
  * OWNS: page.act dispatch — each act action implementation in the service worker.
  * EXPORTS: dispatchActAction
  * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
- *       .agents/reports/plan_runtime-verdict_2026-06-22.md
+ *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
+ *       .agents/reports/plan_cdp-input-parity_2026-06-23.md
  */
 
 import { getAnchor } from "./anchor-manager.js";
 import { performed, notPerformed, ambiguous, blocked } from "./action-result.js";
+import {
+  ensureAttached,
+  dispatchMouseEvent,
+  insertText,
+  focusElement,
+  setElementValue,
+} from "../cdp.js";
 import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
 type ActAction =
@@ -213,7 +235,7 @@ async function click(params: Record<string, unknown>, tabId: number, frameId?: n
     return notPerformed("click", "No target or anchor provided");
   }
 
-  return sendActMessage(tabId, "click", resolved as Record<string, unknown>);
+  return await dispatchClickViaCdp(resolved as Record<string, unknown>, tabId, { clickCount: 1 });
 }
 
 async function fill(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -235,7 +257,7 @@ async function fill(params: Record<string, unknown>, tabId: number, frameId?: nu
 
   const actParams = resolved as Record<string, unknown>;
   actParams.value = value;
-  return sendActMessage(tabId, "fill", actParams);
+  return await dispatchFillViaCdp(actParams, tabId, value);
 }
 
 async function check(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -493,16 +515,12 @@ async function typeAction(params: Record<string, unknown>, tabId: number, frameI
   const actParams = resolved as Record<string, unknown>;
   actParams.text = text;
   actParams.delay = delay;
-  return sendActMessage(tabId, "type", actParams);
+  return await dispatchTypeViaCdp(actParams, tabId, text, delay);
 }
 
 async function smartClick(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
-  const target = params.target as Target | undefined;
-  if (!target) {
-    return notPerformed("smart_click", "Smart click requires a target (use one of: css, text, role, name, label, placeholder, testId)");
-  }
-
-  return sendActMessage(tabId, "smart_click", { target });
+  // smart_click uses click under the hood — same CDP primary + fallback flow.
+  return click({ ...params, action: "click" }, tabId, frameId);
 }
 
 // ── Upload action ──
@@ -572,7 +590,7 @@ async function dblclickAction(params: Record<string, unknown>, tabId: number, fr
     return notPerformed("dblclick", "No target or anchor provided");
   }
 
-  return sendActMessage(tabId, "dblclick", resolved as Record<string, unknown>);
+  return await dispatchClickViaCdp(resolved as Record<string, unknown>, tabId, { clickCount: 2, dblclick: true });
 }
 
 // ── Hover action ──
@@ -593,7 +611,7 @@ async function hoverAction(params: Record<string, unknown>, tabId: number, frame
     return notPerformed("hover", "No target or anchor provided");
   }
 
-  return sendActMessage(tabId, "hover", resolved as Record<string, unknown>);
+  return await dispatchHoverViaCdp(resolved as Record<string, unknown>, tabId);
 }
 
 // ── Dialog actions ──
@@ -643,4 +661,388 @@ async function fillForm(params: Record<string, unknown>, tabId: number, frameId?
   }));
 
   return sendActMessage(tabId, "fill_form", { fields: selectorsAndValues });
+}
+
+// ── CDP dispatch helpers (resolve → CDP → fallback) ──
+
+/**
+ * Send `bp:resolve` to the CS, parse the coords + elementInfo response.
+ * Returns the raw envelope from the CS, or null if the CS could not
+ * resolve the target. Errors are returned as ActionResult-shaped objects
+ * via the helper's caller.
+ */
+async function sendResolve(
+  tabId: number,
+  action: "click" | "dblclick" | "hover" | "type" | "fill",
+  params: Record<string, unknown>,
+): Promise<{ ok: true; coords?: { x: number; y: number }; jsExpression?: string; text?: string; delay?: number; value?: string; elementInfo?: Record<string, unknown>; resolveVerdict?: ExecutionVerdict } | { ok: false; result: ActionResult }> {
+  const response = await sendMessageRaw(tabId, "bp:resolve", { ...params, action });
+  if (!response) {
+    return { ok: false, result: blocked(action, "No response from content script", { errorCode: "CONTENT_SCRIPT_NOT_READY", recoverable: true }) };
+  }
+  if (response.success === false) {
+    // Re-emit as a not_performed / blocked / ambiguous, preserving CS verdict + message.
+    const { executionVerdict, runtimeStatus } = extractVerdicts(response);
+    if (response.errorCode === "AMBIGUOUS_TARGET") {
+      return { ok: false, result: ambiguous(action, response.message as string, { errorCode: "AMBIGUOUS_TARGET", evidence: { matchedCount: response.matchCount }, executionVerdict, runtimeStatus }) };
+    }
+    if (response.blocked) {
+      return { ok: false, result: blocked(action, response.message as string, { errorCode: response.errorCode as string, recoverable: true, evidence: response.evidence as Record<string, unknown>, executionVerdict, runtimeStatus }) };
+    }
+    return { ok: false, result: notPerformed(action, (response.message as string) || `${action} resolve failed`, { errorCode: response.errorCode as string, executionVerdict, runtimeStatus }) };
+  }
+  return {
+    ok: true,
+    coords: response.coords as { x: number; y: number } | undefined,
+    jsExpression: response.jsExpression as string | undefined,
+    text: response.text as string | undefined,
+    delay: response.delay as number | undefined,
+    value: response.value as string | undefined,
+    elementInfo: response.elementInfo as Record<string, unknown> | undefined,
+    resolveVerdict: response.executionVerdict as ExecutionVerdict | undefined,
+  };
+}
+
+/**
+ * Send a generic `bp:fallback-*` message and return the resulting
+ * ActionResult. The CS re-resolves the target and dispatches the
+ * synthetic event. The verdict reported by the CS rides through.
+ */
+async function sendFallback(
+  tabId: number,
+  action: "click" | "dblclick" | "hover" | "type" | "fill",
+  type: "bp:fallback-click" | "bp:fallback-dblclick" | "bp:fallback-hover" | "bp:fallback-type" | "bp:fallback-fill",
+  params: Record<string, unknown>,
+): Promise<ActionResult> {
+  const response = await sendMessageRaw(tabId, type, params);
+  if (!response) {
+    return blocked(action, "No response from content script (fallback)", { errorCode: "CONTENT_SCRIPT_NOT_READY", recoverable: true });
+  }
+  const { executionVerdict, runtimeStatus } = extractVerdicts(response);
+  if (response.success === false) {
+    if (response.errorCode === "AMBIGUOUS_TARGET") {
+      return ambiguous(action, response.message as string, { errorCode: "AMBIGUOUS_TARGET", evidence: { matchedCount: response.matchCount }, executionVerdict, runtimeStatus });
+    }
+    if (response.blocked) {
+      return blocked(action, response.message as string, { errorCode: response.errorCode as string, recoverable: true, evidence: response.evidence as Record<string, unknown>, executionVerdict, runtimeStatus });
+    }
+    return notPerformed(action, (response.message as string) || `${action} fallback failed`, { errorCode: response.errorCode as string, executionVerdict, runtimeStatus });
+  }
+  return performed(action, (response.message as string) || `${action} (CDP fallback — synthetic event)`, {
+    evidence: response.evidence as Record<string, unknown>,
+    data: { ...(response.data as Record<string, unknown> | undefined), _fallback: "isolated", _cdpAttachError: params._cdpAttachError as string | undefined },
+    executionVerdict,
+    runtimeStatus,
+  });
+}
+
+/**
+ * Same as sendActMessage but returns the raw response (Record<string, unknown>)
+ * instead of mapping to an ActionResult — used by the CDP dispatch helpers
+ * that need the coords / jsExpression / text fields.
+ */
+async function sendMessageRaw(
+  tabId: number,
+  type: string,
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  const maxRetries = 3;
+  const delays = [1000, 2000, 4000];
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, {
+        source: "browserpowers",
+        type,
+        params,
+      } as any) as Record<string, unknown>;
+      return response ?? null;
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      if (msg.includes("receiving end does not exist") || msg.includes("Could not establish connection")) {
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        return null;
+      }
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Click / dblclick via CDP.
+ *
+ * 1. Send `bp:resolve` to the CS — get coords + elementInfo.
+ * 2. Lazy-attach CDP. If attach fails, jump to the fallback path.
+ * 3. Send `Input.dispatchMouseEvent` mousePressed + mouseReleased at
+ *    the resolved coords. For dblclick, do it twice with clickCount: 2.
+ * 4. If either CDP call fails, fall back to the synthetic event.
+ *
+ * The verdict's world/path reflect which path was actually used:
+ *   - "cdp", "cdp.input.dispatchMouseEvent" — CDP path succeeded.
+ *   - "isolated", "isolated.fallbackClick" / "isolated.fallbackDblclick"
+ *     — synthetic event fallback was used (with `_fallback: "isolated"`
+ *     in data so the wire signal is also explicit).
+ */
+async function dispatchClickViaCdp(
+  resolveParams: Record<string, unknown>,
+  tabId: number,
+  opts: { clickCount: number; dblclick?: boolean },
+): Promise<ActionResult> {
+  const action: "click" | "dblclick" = opts.dblclick ? "dblclick" : "click";
+  const resolve = await sendResolve(tabId, action, resolveParams);
+  if (!resolve.ok) return resolve.result;
+
+  const coords = resolve.coords;
+  if (!coords) {
+    return blocked(action, "Resolve did not return coords", {
+      errorCode: "RESOLVE_NO_COORDS",
+      recoverable: true,
+      executionVerdict: resolve.resolveVerdict,
+    });
+  }
+
+  // Lazy-attach. ensureAttached is idempotent and safe to call early.
+  const attach = await ensureAttached(tabId, `input.${action}`);
+  if (!attach.attached) {
+    const fallback = await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", resolveParams);
+    if (fallback.success) {
+      return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
+    }
+    return fallback;
+  }
+
+  // Send mousePressed + mouseReleased (twice for dblclick) at coords.
+  // Playwright's dblclick protocol: first press/release pair uses clickCount: 1
+  // (so the browser records a normal click), second pair uses clickCount: 2
+  // (so the browser synthesizes a `dblclick` DOM event with detail: 2).
+  const firstClickCount = 1;
+  const secondClickCount = opts.dblclick ? 2 : 1;
+  const down = await dispatchMouseEvent(tabId, "mousePressed", coords.x, coords.y, {
+    button: "left",
+    clickCount: firstClickCount,
+  });
+  if (!down.ok) {
+    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: down.error });
+  }
+  const up = await dispatchMouseEvent(tabId, "mouseReleased", coords.x, coords.y, {
+    button: "left",
+    clickCount: firstClickCount,
+  });
+  if (!up.ok) {
+    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: up.error });
+  }
+  if (opts.dblclick) {
+    // Playwright dblclick: a second press/release pair right after, same coords.
+    // Use clickCount: 2 on both — the browser synthesizes the dblclick event
+    // when the second press arrives with clickCount: 2.
+    const down2 = await dispatchMouseEvent(tabId, "mousePressed", coords.x, coords.y, {
+      button: "left",
+      clickCount: secondClickCount,
+    });
+    if (!down2.ok) {
+      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: down2.error });
+    }
+    const up2 = await dispatchMouseEvent(tabId, "mouseReleased", coords.x, coords.y, {
+      button: "left",
+      clickCount: secondClickCount,
+    });
+    if (!up2.ok) {
+      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: up2.error });
+    }
+    // Sum all CDP dispatch durations — dblclick includes the second
+    // press/release pair; click is just the first pair.
+    const totalDurationMs = (down.durationMs || 0) + (up.durationMs || 0) + (down2.durationMs || 0) + (up2.durationMs || 0);
+    return performed(action, `Double-clicked at (${Math.round(coords.x)}, ${Math.round(coords.y)}) via CDP`, {
+      evidence: { coords, elementInfo: resolve.elementInfo },
+      data: { coords, elementInfo: resolve.elementInfo },
+      executionVerdict: {
+        executed: true,
+        world: "cdp",
+        durationMs: totalDurationMs,
+        path: "cdp.input.dispatchMouseEvent",
+      },
+    });
+  }
+
+  // Click path: just the first press/release pair.
+  const totalDurationMs = (down.durationMs || 0) + (up.durationMs || 0);
+  const verdict: ExecutionVerdict = {
+    executed: true,
+    world: "cdp",
+    durationMs: totalDurationMs,
+    path: "cdp.input.dispatchMouseEvent",
+  };
+  return performed(action, `Clicked at (${Math.round(coords.x)}, ${Math.round(coords.y)}) via CDP`, {
+    evidence: { coords, elementInfo: resolve.elementInfo },
+    data: { coords, elementInfo: resolve.elementInfo },
+    executionVerdict: verdict,
+  });
+}
+
+/**
+ * Hover via CDP — single `Input.dispatchMouseEvent` with type "mouseMoved".
+ * Falls back to `bp:fallback-hover` on failure.
+ */
+async function dispatchHoverViaCdp(
+  resolveParams: Record<string, unknown>,
+  tabId: number,
+): Promise<ActionResult> {
+  const resolve = await sendResolve(tabId, "hover", resolveParams);
+  if (!resolve.ok) return resolve.result;
+
+  const coords = resolve.coords;
+  if (!coords) {
+    return blocked("hover", "Resolve did not return coords", {
+      errorCode: "RESOLVE_NO_COORDS",
+      recoverable: true,
+      executionVerdict: resolve.resolveVerdict,
+    });
+  }
+
+  const attach = await ensureAttached(tabId, "input.hover");
+  if (!attach.attached) {
+    const fallback = await sendFallback(tabId, "hover", "bp:fallback-hover", resolveParams);
+    if (fallback.success) {
+      return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
+    }
+    return fallback;
+  }
+
+  const moved = await dispatchMouseEvent(tabId, "mouseMoved", coords.x, coords.y);
+  if (!moved.ok) {
+    return await sendFallback(tabId, "hover", "bp:fallback-hover", { ...resolveParams, _cdpAttachError: moved.error });
+  }
+
+  return performed("hover", `Hovered at (${Math.round(coords.x)}, ${Math.round(coords.y)}) via CDP`, {
+    evidence: { coords, elementInfo: resolve.elementInfo },
+    data: { coords, elementInfo: resolve.elementInfo },
+    executionVerdict: {
+      executed: true,
+      world: "cdp",
+      durationMs: moved.durationMs || 0,
+      path: "cdp.input.dispatchMouseEvent",
+    },
+  });
+}
+
+/**
+ * Type via CDP — `focusElement(jsExpression)` + `Input.insertText(text)`
+ * with a single call (not per-character). Falls back to `bp:fallback-type`.
+ */
+async function dispatchTypeViaCdp(
+  resolveParams: Record<string, unknown>,
+  tabId: number,
+  text: string,
+  delay: number,
+): Promise<ActionResult> {
+  const resolve = await sendResolve(tabId, "type", resolveParams);
+  if (!resolve.ok) return resolve.result;
+
+  const jsExpression = resolve.jsExpression;
+  if (!jsExpression) {
+    return blocked("type", "Resolve did not return jsExpression", {
+      errorCode: "RESOLVE_NO_EXPRESSION",
+      recoverable: true,
+      executionVerdict: resolve.resolveVerdict,
+    });
+  }
+
+  const attach = await ensureAttached(tabId, "input.type");
+  if (!attach.attached) {
+    const fallback = await sendFallback(tabId, "type", "bp:fallback-type", resolveParams);
+    if (fallback.success) {
+      return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
+    }
+    return fallback;
+  }
+
+  // Focus first, then insertText. If focus failed (closed shadow root, element
+  // not in main world, etc.) bail to the content-script fallback rather than
+  // typing into whatever element was already focused — that would silently
+  // misroute text. The CS's `bp:fallback-type` handles focus + per-character
+  // typing in the isolated world.
+  const focus = await focusElement(tabId, jsExpression);
+  if (!focus.ok) {
+    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpFocusError: focus.error });
+  }
+  const inserted = await insertText(tabId, text);
+  if (!inserted.ok) {
+    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpAttachError: inserted.error });
+  }
+
+  const totalDurationMs = (focus.durationMs || 0) + (inserted.durationMs || 0);
+  return performed("type", `Typed ${text.length} character(s) via CDP`, {
+    evidence: { charCount: text.length, delay, elementInfo: resolve.elementInfo },
+    data: { text, delay, elementInfo: resolve.elementInfo },
+    executionVerdict: {
+      executed: true,
+      world: "cdp",
+      durationMs: totalDurationMs,
+      path: "cdp.input.insertText",
+    },
+  });
+}
+
+/**
+ * Fill via CDP — `setElementValue(jsExpression, value)` runs a
+ * Runtime.evaluate in the main world that assigns .value (bypassing
+ * React's controlled-input protection) and dispatches input + change.
+ * Falls back to `bp:fallback-fill`.
+ */
+async function dispatchFillViaCdp(
+  resolveParams: Record<string, unknown>,
+  tabId: number,
+  value: string | undefined,
+): Promise<ActionResult> {
+  const resolve = await sendResolve(tabId, "fill", resolveParams);
+  if (!resolve.ok) return resolve.result;
+
+  const jsExpression = resolve.jsExpression;
+  if (!jsExpression) {
+    return blocked("fill", "Resolve did not return jsExpression", {
+      errorCode: "RESOLVE_NO_EXPRESSION",
+      recoverable: true,
+      executionVerdict: resolve.resolveVerdict,
+    });
+  }
+  if (value === undefined) {
+    return notPerformed("fill", "No value provided");
+  }
+
+  const attach = await ensureAttached(tabId, "input.fill");
+  if (!attach.attached) {
+    const fallback = await sendFallback(tabId, "fill", "bp:fallback-fill", resolveParams);
+    if (fallback.success) {
+      return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
+    }
+    return fallback;
+  }
+
+  const set = await setElementValue(tabId, jsExpression, value);
+  if (!set.ok) {
+    return await sendFallback(tabId, "fill", "bp:fallback-fill", { ...resolveParams, _cdpAttachError: set.error });
+  }
+
+  return performed("fill", `Filled via CDP`, {
+    evidence: { tag: (resolve.elementInfo as { tag?: string } | undefined)?.tag, valueMatched: set.value === value },
+    data: { value, elementInfo: resolve.elementInfo, _cdpValue: set.value },
+    executionVerdict: {
+      // setElementValue uses CDP Runtime.evaluate in the main world, so the
+      // world is "main" (not "cdp") — the page-vars-accessible path that
+      // bypasses page CSP via the debugger.
+      executed: true,
+      world: "main",
+      value: set.value,
+      valueMatched: set.value === value,
+      durationMs: set.durationMs || 0,
+      path: "cdp.runtime.evaluate",
+    },
+  });
 }
