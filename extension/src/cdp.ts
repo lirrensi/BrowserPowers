@@ -17,20 +17,22 @@
  *              favour of CDP)
  *
  *          The Input.* domain is used by the SW-side page-act for click /
- *          dblclick / hover / type / fill. CDP input injection goes through
- *          the browser's input pipeline and bypasses page-level synthetic
- *          event handlers — same approach Playwright uses. See
- *          .agents/reports/plan_cdp-input-parity_2026-06-23.md.
+ *          dblclick / hover / type / fill / press. CDP input injection goes
+ *          through the browser's input pipeline and bypasses page-level
+ *          synthetic event handlers — same approach Playwright uses. See
+ *          .agents/reports/plan_cdp-input-parity_2026-06-23.md and
+ *          .agents/reports/plan_visual-help-csp-tighten_2026-06-23.md.
  *
  * OWNS: chrome.debugger attach lifecycle, per-tab console ring buffer, per-tab
  *       command serialization queue, runtimeEvaluate wrapper, Input.*
  *       wrappers, focusElement / setElementValue helpers, public state
  *       surface for page.read action=runtime_status.
  * EXPORTS: ensureAttached, detach, getState, runtimeEvaluate, getConsoleBuffer,
- *          dispatchMouseEvent, insertText, focusElement, setElementValue,
+ *          dispatchMouseEvent, insertText, dispatchKeyEvent, focusElement, setElementValue,
  *          init (called once at SW startup to register listeners), CdpState,
  *          AttachResult, EvalResult, ConsoleEntry, DispatchMouseEventResult,
- *          InsertTextResult, FocusElementResult, SetElementValueResult.
+ *          InsertTextResult, DispatchKeyEventResult, FocusElementResult,
+ *          SetElementValueResult.
  * DOCS:   .agents/reports/plan_cdp-max-authority_2026-06-22.md,
  *         .agents/reports/plan_cdp-input-parity_2026-06-23.md
  */
@@ -453,6 +455,17 @@ export interface SetElementValueResult {
   durationMs: number;
 }
 
+export interface DispatchKeyEventResult {
+  ok: boolean;
+  error?: string;
+  durationMs: number;
+}
+
+export interface DispatchKeyEventOptions {
+  /** Modifier bit field — see CDP docs. Default 0. */
+  modifiers?: number;
+}
+
 /**
  * Wrap `Input.dispatchMouseEvent`. Lazy-attaches on first call, queues per-tab
  * so events land in order. Never throws — returns `{ ok: false, error }` on
@@ -548,6 +561,146 @@ export async function insertText(tabId: number, text: string): Promise<InsertTex
           error: (err as Error)?.message ?? String(err),
           durationMs: performance.now() - start,
         } satisfies InsertTextResult;
+      }
+    });
+  cmdQueues.set(tabId, next.catch(() => undefined));
+  return next;
+}
+
+// ── Key → code mapping (Playwright parity) ──
+// Covers the common named keys. For unknown keys the caller passes a single
+// character or composite; we still send `key` and let the browser derive the
+// rest. Never throws — unknown keys just get `key` only.
+
+const KEY_CODE_MAP: Record<string, { key: string; code: string; windowsVirtualKeyCode: number }> = {
+  // Whitespace / control
+  Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 },
+  Tab: { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 },
+  Backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 },
+  Delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
+  Escape: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
+  " ": { key: " ", code: "Space", windowsVirtualKeyCode: 32 },
+  Space: { key: " ", code: "Space", windowsVirtualKeyCode: 32 },
+  // Navigation
+  ArrowUp: { key: "ArrowUp", code: "ArrowUp", windowsVirtualKeyCode: 38 },
+  ArrowDown: { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 },
+  ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 },
+  ArrowRight: { key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39 },
+  Home: { key: "Home", code: "Home", windowsVirtualKeyCode: 36 },
+  End: { key: "End", code: "End", windowsVirtualKeyCode: 35 },
+  PageUp: { key: "PageUp", code: "PageUp", windowsVirtualKeyCode: 33 },
+  PageDown: { key: "PageDown", code: "PageDown", windowsVirtualKeyCode: 34 },
+  Insert: { key: "Insert", code: "Insert", windowsVirtualKeyCode: 45 },
+  // Function keys
+  F1: { key: "F1", code: "F1", windowsVirtualKeyCode: 112 },
+  F2: { key: "F2", code: "F2", windowsVirtualKeyCode: 113 },
+  F3: { key: "F3", code: "F3", windowsVirtualKeyCode: 114 },
+  F4: { key: "F4", code: "F4", windowsVirtualKeyCode: 115 },
+  F5: { key: "F5", code: "F5", windowsVirtualKeyCode: 116 },
+  F6: { key: "F6", code: "F6", windowsVirtualKeyCode: 117 },
+  F7: { key: "F7", code: "F7", windowsVirtualKeyCode: 118 },
+  F8: { key: "F8", code: "F8", windowsVirtualKeyCode: 119 },
+  F9: { key: "F9", code: "F9", windowsVirtualKeyCode: 120 },
+  F10: { key: "F10", code: "F10", windowsVirtualKeyCode: 121 },
+  F11: { key: "F11", code: "F11", windowsVirtualKeyCode: 122 },
+  F12: { key: "F12", code: "F12", windowsVirtualKeyCode: 123 },
+  // Modifier-only (rare but valid)
+  Shift: { key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16 },
+  Control: { key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17 },
+  Alt: { key: "Alt", code: "AltLeft", windowsVirtualKeyCode: 18 },
+  Meta: { key: "Meta", code: "MetaLeft", windowsVirtualKeyCode: 91 },
+  // Punctuation / named symbols
+  CapsLock: { key: "CapsLock", code: "CapsLock", windowsVirtualKeyCode: 20 },
+  ContextMenu: { key: "ContextMenu", code: "ContextMenu", windowsVirtualKeyCode: 93 },
+  Pause: { key: "Pause", code: "Pause", windowsVirtualKeyCode: 19 },
+  PrintScreen: { key: "PrintScreen", code: "PrintScreen", windowsVirtualKeyCode: 44 },
+  ScrollLock: { key: "ScrollLock", code: "ScrollLock", windowsVirtualKeyCode: 145 },
+};
+
+/**
+ * Map a user-supplied key name to the CDP key/code/virtualKeyCode triple.
+ * For single-character keys, we use the literal as `key` and a `Key<letter>`
+ * as `code`. For unknown keys, we return just `{ key }` — the browser will
+ * derive the rest.
+ */
+function mapKeyForCdp(key: string): { key: string; code?: string; windowsVirtualKeyCode?: number } {
+  if (KEY_CODE_MAP[key]) {
+    const m = KEY_CODE_MAP[key];
+    return { key: m.key, code: m.code, windowsVirtualKeyCode: m.windowsVirtualKeyCode };
+  }
+  // Single printable character — use the literal as `key`, derive `code` heuristically.
+  if (key.length === 1) {
+    const ch = key;
+    if (/[a-zA-Z]/.test(ch)) {
+      return { key: ch, code: "Key" + ch.toUpperCase() };
+    }
+    if (/[0-9]/.test(ch)) {
+      return { key: ch, code: "Digit" + ch };
+    }
+    return { key: ch };
+  }
+  // Unknown composite — let the browser derive everything from `key`.
+  return { key };
+}
+
+/**
+ * Wrap `Input.dispatchKeyEvent`. Lazy-attaches, queues per-tab, never throws.
+ * Dispatches a `keyDown` + `keyUp` pair for the given key with optional
+ * modifier bit field. Use this for the `press` act action — same approach
+ * Playwright uses for the Input.dispatchKeyEvent family.
+ *
+ * On attach failure, returns `{ ok: false, error }` so the caller can fall
+ * back to the content-script synthetic KeyboardEvent path.
+ */
+export async function dispatchKeyEvent(
+  tabId: number,
+  key: string,
+  opts: DispatchKeyEventOptions = {},
+): Promise<DispatchKeyEventResult> {
+  if (!key) {
+    return { ok: false, error: "No key provided", durationMs: 0 };
+  }
+  const mapped = mapKeyForCdp(key);
+  const modifiers = opts.modifiers ?? 0;
+
+  const tail = cmdQueues.get(tabId) ?? Promise.resolve();
+  const next = tail
+    .catch(() => undefined)
+    .then(async () => {
+      const attach = await ensureAttached(tabId, "input.press");
+      if (!attach.attached) {
+        return {
+          ok: false,
+          error: attach.error ?? "CDP attach failed",
+          durationMs: 0,
+        } satisfies DispatchKeyEventResult;
+      }
+      const start = performance.now();
+      const commonParams: Record<string, unknown> = {
+        modifiers,
+        ...(mapped.code !== undefined ? { code: mapped.code } : {}),
+        ...(mapped.windowsVirtualKeyCode !== undefined ? { windowsVirtualKeyCode: mapped.windowsVirtualKeyCode } : {}),
+      };
+      try {
+        // keyDown
+        await chrome.debugger.sendCommand(
+          { tabId },
+          "Input.dispatchKeyEvent",
+          { type: "keyDown", key: mapped.key, ...commonParams } as Record<string, unknown>,
+        );
+        // keyUp — same params except type
+        await chrome.debugger.sendCommand(
+          { tabId },
+          "Input.dispatchKeyEvent",
+          { type: "keyUp", key: mapped.key, ...commonParams } as Record<string, unknown>,
+        );
+        return { ok: true, durationMs: performance.now() - start } satisfies DispatchKeyEventResult;
+      } catch (err) {
+        return {
+          ok: false,
+          error: (err as Error)?.message ?? String(err),
+          durationMs: performance.now() - start,
+        } satisfies DispatchKeyEventResult;
       }
     });
   cmdQueues.set(tabId, next.catch(() => undefined));

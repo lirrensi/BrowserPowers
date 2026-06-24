@@ -1,0 +1,28 @@
+<!doctype html>
+<!--
+  FILE: extension/public/offscreen.html
+  PURPOSE: Offscreen document that hosts a real <canvas> for the
+           screenshot overlay feature. The service worker posts
+           the raw PNG + anchor list to this document via
+           chrome.runtime.sendMessage, the document draws the
+           overlay boxes on a real canvas, and posts the
+           modified PNG back. The SW never touches canvas APIs
+           directly — those crash MV3 service workers.
+
+           Created lazily by the SW via chrome.offscreen.createDocument
+           the first time the overlay is needed.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BrowserPowers overlay</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; }
+    #stage { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <script src="offscreen.js"></script>
+</body>
+</html>

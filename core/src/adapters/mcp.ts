@@ -7,6 +7,7 @@ import type { Hono } from "hono";
 import { commandService } from "../command-service/service.js";
 import { loadConfig } from "../config.js";
 import { saveScreenshotToTemp } from "../screenshot.js";
+import { buildHelpIndex, buildTopicHelp, buildToolHelp } from "./help-text.js";
 
 const config = loadConfig();
 
@@ -80,7 +81,7 @@ const pageReadSchema = z.object({
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
-  action: z.enum(["inspect", "content", "text", "html", "attr", "meta", "forms", "count", "select", "summary", "generate_selector"]),
+  action: z.enum(["inspect", "content", "text", "html", "attr", "meta", "forms", "count", "select", "summary", "frames", "generate_selector", "console", "runtime_status", "readable", "full_html"]),
   target: targetSchema.optional(),
   limit: z.number().optional(),
   include_hidden: z.boolean().optional(),
@@ -98,7 +99,7 @@ const pageActSchema = z.object({
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
-  action: z.enum(["click", "fill", "check", "select_option", "press", "scroll", "submit", "wait_for", "type", "smart_click", "fill_form", "upload", "drag", "dblclick", "hover", "dialog_override", "dialog_respond"]),
+  action: z.enum(["click", "fill", "check", "select_option", "press", "scroll", "submit", "wait_for", "type", "smart_click", "fill_form", "upload", "drag", "dblclick", "hover", "dialog_override", "dialog_respond", "click_at", "dblclick_at", "hover_at"]),
   target: targetSchema.optional(),
   anchor: z.string().optional(),
   value: z.string().optional(),
@@ -380,8 +381,24 @@ async function resolveBrowserId(args: { browser_id?: string; browser_name?: stri
 // Help System
 // ============================================================
 
-/** Generate full parameter documentation for a specific tool (#017, #016). */
+/** Generate full parameter documentation for a specific tool (#017, #016).
+ *  Delegates to the auto-generated catalog in `./help-text.ts` for tools
+ *  that are registered there. Falls back to the inline string for any
+ *  tool not yet in the catalog.
+ */
 function generateToolHelp(toolName: string): string {
+  // The catalog covers all MCP tools. Anything else returns the inline fallback.
+  const fromCatalog = buildToolHelp(toolName);
+  if (!fromCatalog.startsWith("No help available")) return fromCatalog;
+  // Fall through to the legacy inline help text (kept for safety).
+  return generateToolHelpLegacy(toolName);
+}
+
+/** Legacy inline help text — kept as a fallback for any tool not in the
+ *  auto-generated catalog. New tools should be added to the catalog
+ *  (MCP_TOOL_CATALOG in help-text.ts) instead of this map.
+ */
+function generateToolHelpLegacy(toolName: string): string {
   const help: Record<string, string> = {
     browsers: [
       "## browsers",
@@ -599,7 +616,7 @@ function generateToolHelp(toolName: string): string {
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
       "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
       "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
-      "- `action` (enum, required) — Action to perform: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond",
+      "- `action` (enum, required) — Action to perform: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond, click_at, dblclick_at, hover_at",
       "- `target` (object, optional) — Element selector: prefer `{ text: \"visible label\" }` for stable targeting",
       "  - `text` (string) — Visible text to match (recommended primary targeting method)",
       "  - `css` (string) — CSS selector",
@@ -688,128 +705,17 @@ function generateToolHelp(toolName: string): string {
   return help[toolName] ?? `No help available for \`${toolName}\`.`;
 }
 
-/** Generate the full system reference document (#018). */
-function getSystemReference(topic?: string): string {
-  const full = [
-    "# BrowserPowers System Reference",
-    "",
-    "## Overview",
-    "BrowserPowers is a browser automation system that exposes browser capabilities through the Model Context Protocol (MCP). It provides programmatic access to browser tabs, page content, cookies, windows, screenshots, and JavaScript execution.",
-    "",
-    "## Tool Groups",
-    "",
-    "### Browser Management",
-    "- `browsers` — List connected browsers with capabilities and status",
-    "- `screenshot` — Capture a screenshot of the active tab",
-    "- `execute_all` — Execute a tool on ALL connected browsers",
-    "- `execute_batch` — Execute multiple tools across browsers in parallel",
-    "- `tabs` — List, navigate, go back/forward, and close browser tabs",
-    "",
-    "### Page Interaction",
-    "- `page_read` — Read page content (inspect, text, html, attr, etc.)",
-    "- `page_act` — Interact with or mutate the page (click, fill, type, etc.)",
-    "- `page_js` — Execute JavaScript on the page (gated escape hatch)",
-    "",
-    "### Browser State",
-    "- `cookies` — Manage cookies (get, set, remove, list)",
-    "- `windows` — Manage windows (list, create, focus, close)",
-    "",
-    "## Navigation Workflow",
-      "1. `browsers` — Find a connected browser by name (preferred) or ID",
-      "2. `tabs({ action: \"navigate\", url })` — Navigate to a URL (use `snapshot: true` for the page tree)",
-      "3. `page_read({ action: \"inspect\" })` — See all interactable elements as a compact tree",
-      "4. `page_act` — Interact using text targeting or anchor fast-path",
-      "",
-      "## Element Targeting (Text-First)",
-      "Three targeting strategies, in order of preference:",
-      "",
-      "1. **Text targeting (most stable)** — `target: { text: \"Submit\" }` survives page reloads",
-      "2. **Anchor fast-path (fastest)** — `anchor: \"a7\"` from inspect output, skips CSS resolution",
-      "3. **CSS / Role targeting** — `target: { css: \"#id\" }` or `target: { role: \"button\", name: \"Submit\" }`",
-      "",
-      "## Gate / Approval Model",
-    "Some tools require gate approval before execution:",
-    "- `page_js` requires explicit gate approval (gated escape hatch)",
-    "- Browser connection requires user approval",
-    "- Cookie and window operations are gated at the group level",
-    "",
-    "## Per-Tool Help",
-    "Every tool accepts a `help: true` parameter that returns full parameter documentation without executing. Use this to explore tool capabilities before making real calls.",
-    "",
-    "Example: call any tool with `{ help: true }` to see its parameter reference.",
-    "",
-    "## Connection Lifecycle",
-    "1. Client connects via MCP over streamable HTTP",
-    "2. Server assigns a session ID",
-    "3. Client sends tool requests within the session",
-    "4. Session ends via DELETE or timeout",
-    "",
-    "## Rate Limits & Constraints",
-    "- `page_js` is intentionally slow — prefer `page_read`/`page_act` for standard operations",
-    "- Screenshots are saved to temp files and the path is returned",
-    "- Each browser connection has its own capabilities set",
-  ].join("\n");
-
-  if (!topic) return full;
-
-  const topics: Record<string, string> = {
-    navigation: [
-      "## Navigation Workflow",
-      "",
-      "Start by listing connected browsers, then navigate to a URL, then interact with the page.",
-      "",
-      "1. `browsers` — Find a connected browser and get its name (or use `browser_id` as fallback)",
-      "2. `tabs` with `action: \"navigate\"` — Navigate to a target URL",
-      "   - Set `snapshot: true` to get the page accessibility tree and anchors",
-      "   - Set `wait_until` to control load timing",
-      "3. `page_read` — Start here to understand the page. Use `action: \"inspect\"` to get a compact tree of all interactable elements with their visible text and anchor IDs.",
-      "   - Text-based targeting is recommended: `page_read({ target: { text: \"Email\" } })`",
-      "4. `page_act` — Interact with elements. Target by visible text, anchor ID, or CSS selector.",
-      "   - Most stable: `page_act({ action: \"click\", target: { text: \"Submit\" } })`",
-      "   - Fastest: `page_act({ action: \"click\", anchor: \"a7\" })`",
-    ].join("\n"),
-
-    anchors: [
-      "## Element Targeting (Text-First)",
-      "",
-      "BrowserPowers supports three targeting strategies, in order of preference:",
-      "",
-      "### 1. Text Targeting (Most Stable)",
-      "Target elements by their visible text. This survives page reloads and is the most intuitive:",
-      "```",
-      "page_act({ action: \"click\", target: { text: \"Submit\" } })",
-      "page_act({ action: \"fill\", target: { text: \"Email\" }, value: \"user@example.com\" })",
-      "page_act({ action: \"check\", target: { text: \"Remember me\" } })",
-      "```",
-      "The `inspect` output shows all element text, making text targeting straightforward.",
-      "",
-      "### 2. Anchor Fast-Path (Fastest)",
-      "Anchors are element IDs returned by `page_read({ action: \"inspect\" })`. They bypass CSS ",
-      "selector resolution for the fastest execution. Invalidated on page navigation:",
-      "```",
-      "page_act({ action: \"click\", anchor: \"a7\" })",
-      "```",
-      "Benefits: No selector ambiguity, works with shadow DOM, fastest path.",
-      "",
-      "### 3. CSS / Role Targeting",
-      "CSS selectors, ARIA role+name, labels, placeholders, and test IDs for precise targeting:",
-    ].join("\n"),
-
-    gates: [
-      "## Gate / Approval Model",
-      "",
-      "BrowserPowers uses a gate system for sensitive operations:",
-      "",
-      "- **Browser connection**: Users must approve browser connections",
-      "- **page_js**: JavaScript execution requires explicit gate approval — this is a gated escape hatch",
-      "- **Cookies**: Cookie operations are gated at the group level (one gate for all cookie ops)",
-      "- **Windows**: Window operations are gated at the group level",
-      "",
-      "When a gate is triggered, the tool returns an error indicating approval is needed.",
-    ].join("\n"),
-  };
-
-  return topics[topic] ?? `No topic found for "${topic}". Available topics: navigation, anchors, gates.`;
+/**
+ * Adapter that maps a help topic to the auto-generated help text. The
+ * new help-text module is the single source of truth; we keep the
+ * `generateToolHelp` legacy function for backward compatibility (per-tool
+ * `help: true` calls still hit it) but the top-level `help` tool now
+ * reads from the same place the CLI's `help` command does — so the two
+ * surfaces cannot drift.
+ */
+function buildHelpTopic(topic: "all" | "navigation" | "anchors" | "gates" | "page-read" | "page-act" | "page-js" | "visual" | "permissions"): string {
+  if (topic === "all") return buildHelpIndex();
+  return buildTopicHelp(topic);
 }
 
 // ============================================================
@@ -1204,13 +1110,17 @@ export function mountMcpServer(app: Hono): void {
   mcpServer.registerTool(
     "help",
     {
-      description: "Get the full system reference — capability summary, workflow guides, tool relationships, and how everything fits together.",
+      description: "Get the full system reference — capability summary, workflow guides, tool relationships, visual layer / overlay docs, and how everything fits together. Pass `topic` to focus on a section (default: 'all').",
       inputSchema: z.object({
-        topic: z.string().optional().describe("Optional topic to focus on (e.g. 'navigation', 'anchors', 'gates')"),
+        topic: z
+          .enum(["all", "navigation", "anchors", "gates", "page-read", "page-act", "page-js", "visual", "permissions"])
+          .optional()
+          .describe("Optional topic to focus on (default: 'all')."),
       }),
     },
-    async ({ topic }: { topic?: string }) => {
-      return { content: [{ type: "text" as const, text: getSystemReference(topic) }] };
+    async ({ topic }: { topic?: "all" | "navigation" | "anchors" | "gates" | "page-read" | "page-act" | "page-js" | "visual" | "permissions" }) => {
+      const text = buildHelpTopic(topic ?? "all");
+      return { content: [{ type: "text" as const, text }] };
     },
   );
 

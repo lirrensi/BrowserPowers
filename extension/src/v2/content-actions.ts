@@ -456,6 +456,29 @@ export function inspectElements(
       if (selected !== undefined) info.selected = selected;
       info.target = leafTarget;
       if (shadowPath) info.shadowPath = shadowPath;
+
+      // Bounding rect — exposes the element's viewport-space rect and a
+      // pre-computed center. Consumers (visual layer, screenshot overlay)
+      // use this to draw labels and to drive `click_at { x, y }`. Integers
+      // only — getBoundingClientRect returns sub-pixel floats that we
+      // don't need for click targeting or label positioning.
+      try {
+        const rect = el.getBoundingClientRect();
+        if (rect && (rect.width > 0 || rect.height > 0)) {
+          info.boundingRect = {
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          };
+          info.center = {
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+          };
+        }
+      } catch (_) {
+        // getBoundingClientRect on a detached element can throw — skip.
+      }
       return info;
     }
 
@@ -2048,4 +2071,54 @@ export function generateSelector(css: string): Record<string, unknown> {
     textContent: (el.textContent || "").trim().slice(0, 100) || undefined,
     elementSummary: tag + (el.id ? "#" + el.id : "") + (classes.length ? "." + classes.slice(0, 2).join(".") : ""),
   };
+}
+
+// ── Readable / Full-HTML ──
+//
+// `readable` runs the existing Trafilatura-style extractor — a self-contained
+// function body in `extension/src/readability.ts` that's designed to be
+// injected as a string. We import the string and wrap it in a `new Function`
+// here in the isolated world. The extractor strips nav / footer / ads and
+// returns the article body, plus title, excerpt, and length. The CS's job
+// is just to evaluate the function body and pass the result back to the SW
+// — the complexity lives in the readability.ts module.
+//
+// `full_html` returns `document.documentElement.outerHTML` — the whole
+// document including the <html>, <head>, <body>, all attributes. No
+// preprocessing. The SW applies the size cap and the `truncated` flag.
+
+import { extractReadable } from "./readability.js";
+
+export function readReadable(): { success: boolean; data?: Record<string, unknown>; message?: string } {
+  const start = performance.now();
+  try {
+    // Call the readability function directly — no `new Function` (which
+    // would require `unsafe-eval` in the extension's CSP, rejected by
+    // MV3). The function lives in `./readability.js` as a real TypeScript
+    // function so the bundle includes it normally.
+    const result = extractReadable(document);
+    return {
+      success: true,
+      data: {
+        title: result.title,
+        content: result.content,
+        excerpt: result.excerpt,
+        byline: result.byline,
+        length: result.length,
+        fallback: result.fallback,
+        _durationMs: performance.now() - start,
+      },
+    };
+  } catch (err) {
+    return {
+      success: false,
+      message: `readable extraction failed: ${(err as Error).message || String(err)}`,
+    };
+  }
+}
+
+export function readFullHtml(): { html: string; length: number; durationMs: number } {
+  const start = performance.now();
+  const html = document.documentElement?.outerHTML ?? "";
+  return { html, length: html.length, durationMs: performance.now() - start };
 }

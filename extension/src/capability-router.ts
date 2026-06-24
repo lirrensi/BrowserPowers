@@ -15,6 +15,7 @@ import { dispatchReadAction } from "./v2/page-read.js";
 import { dispatchActAction } from "./v2/page-act.js";
 import { dispatchJsAction } from "./v2/page-js.js";
 import { diffSnapshots } from "./v2/snapshot-diff.js";
+import { captureWithOverlay } from "./screenshot.js";
 import type { ExecutionVerdict } from "./types.js";
 
 // ═══════════════════════════════════════════
@@ -38,6 +39,7 @@ const requestBuffer = new Map<number, RequestEvent[]>();
 const MUTATION_ACTIONS = new Set([
   "click", "fill", "check", "select_option", "press", "scroll", "submit",
   "type", "smart_click", "fill_form", "drag", "dblclick", "hover",
+  "click_at", "dblclick_at", "hover_at",
 ]);
 
 function addRequestToBuffer(entry: RequestEvent): void {
@@ -169,6 +171,17 @@ async function runExecuteScript(
 export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> {
   try {
     const out = await execute(req.tool, req.params, req.commandMode);
+    // If a tool's error path returned `{ success: false, error }` instead
+    // of throwing (older pattern, kept for compat), propagate it. Otherwise
+    // routeExecute would lie and say success:true with no data.
+    const data = out.data as { success?: boolean; error?: string } | null | undefined;
+    if (data && data.success === false) {
+      return {
+        requestId: req.requestId,
+        success: false,
+        error: data.error ?? `tool "${req.tool}" returned success:false with no error message`,
+      };
+    }
     return {
       requestId: req.requestId,
       success: true,
@@ -316,6 +329,34 @@ async function execute(
       return { data: result, executionVerdict: result.executionVerdict };
     }
 
+    case "self.reload": {
+      // Ask the running extension to reload itself. Used by the manual-test
+      // harness after `node scripts/install.mjs` copies a new build into the
+      // extension folder — the user shouldn't have to open chrome://extensions
+      // and click reload manually.
+      //
+      // We delay 500ms so the response can reach the caller before the SW
+      // tears down. If `confirm: true` is passed and the user has unsaved
+      // popup state, we ask first.
+      const confirm = params?.confirm === true;
+      if (confirm && typeof chrome !== "undefined" && chrome.notifications) {
+        try {
+          await chrome.notifications.create({
+            type: "basic",
+            iconUrl: "icon-128.png",
+            title: "BrowserPowers reloading",
+            message: "The extension is reloading to pick up a new build.",
+          });
+        } catch {
+          // notifications may not be available in all builds
+        }
+      }
+      setTimeout(() => {
+        try { chrome.runtime.reload(); } catch (e) { console.error("[bp-ext] reload failed:", e); }
+      }, 500);
+      return { data: { reloading: true, delayMs: 500 } };
+    }
+
     // ══════════════════════════════════════════
     // Tabs
     // ══════════════════════════════════════════
@@ -446,12 +487,25 @@ async function execute(
 
     case "screenshots.capture": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
-      const dataUrl = await chrome.tabs.captureVisibleTab(
-        (tabId as any)?.windowId,
-        { format: "png" },
-      );
-      const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-      return { data: { base64, format: "png" } };
+      const overlay = (params.overlay as string | undefined) ?? "none";
+      if (overlay === "none" || overlay === undefined) {
+        // Fast path — no overlay, backward compat.
+        const dataUrl = await chrome.tabs.captureVisibleTab(
+          (tabId as any)?.windowId,
+          { format: "png" },
+        );
+        const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+        return { data: { base64, format: "png", overlay: "none" } };
+      }
+      // Overlay path — capture + canvas-paint annotations.
+      const limit = (params.overlay_limit as number | undefined) ?? 50;
+      const colorByType = (params.overlay_color_by_type as boolean | undefined) ?? true;
+      const result = await captureWithOverlay(tabId, {
+        mode: overlay as "labels" | "coords" | "both" | "anchors_only",
+        limit,
+        colorByType,
+      });
+      return { data: { base64: result.base64, format: "png", overlay, drawn: result.drawn } };
     }
 
     // ══════════════════════════════════════════

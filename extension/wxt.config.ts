@@ -32,6 +32,11 @@ export default defineConfig({
       // DevTools-level access on the page, bypassing page CSP. The user is
       // prompted once at install/upgrade.
       "debugger",
+      // Required for chrome.offscreen.createDocument — used by the
+      // screenshot overlay feature to host a real <canvas> in a hidden
+      // page. The SW paints via the offscreen document; service workers
+      // can't paint directly.
+      "offscreen",
     ],
     host_permissions: ["<all_urls>"],
   },

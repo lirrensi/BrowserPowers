@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Click target test</title>
+  <style>
+    body { margin: 0; padding: 0; font-family: system-ui; }
+    button { position: absolute; left: 100px; top: 100px; width: 100px; height: 50px; }
+    #counter { position: absolute; left: 100px; top: 200px; font-size: 30px; }
+  </style>
+</head>
+<body>
+  <button id="target"
+    onclick="document.getElementById('counter').textContent = String(Number(document.getElementById('counter').textContent) + 1);">
+    Click target
+  </button>
+  <div id="counter">0</div>
+</body>
+</html>

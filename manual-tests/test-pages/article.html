@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Article Page — readable test</title>
+</head>
+<body>
+  <nav>navigation junk should be stripped</nav>
+  <header>header junk should be stripped</header>
+  <main>
+    <article>
+      <h1>The Real Article Title</h1>
+      <p>The first paragraph of the real article body. It contains enough text to be the main content of the page and should be the bulk of what readable extracts.</p>
+      <p>The second paragraph continues the real article body. This is what readable should extract and return to the agent that is reading this page.</p>
+      <p>The third paragraph confirms that longer articles are handled too. We want the agent to receive every paragraph of the article, in order, with no truncation.</p>
+    </article>
+  </main>
+  <aside>sidebar junk should be stripped</aside>
+  <footer>footer junk should be stripped</footer>
+  <div class="ad">advertisement junk should be stripped</div>
+  <div class="comments">comments junk should be stripped</div>
+</body>
+</html>

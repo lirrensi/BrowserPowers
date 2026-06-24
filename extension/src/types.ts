@@ -36,27 +36,60 @@ export interface Target {
  *          field names the one actually used, and the `path` field names the
  *          exact code path:
  *            - "isolated" — content script's isolated world (DOM access only,
- *              no page variables, no page CSP). Used for read / wait_for /
+ *              no page variables, no page CSP). Used for: read / wait_for /
  *              click-element-resolution and as the fallback for page.js /
- *              page.act click / fill / type when CDP attach is denied.
- *            - "main"     — CDP-driven `Runtime.evaluate` (page variables
- *              accessible, no page CSP, requires `debugger` permission and
- *              shows the yellow infobar while attached). The previous
- *              meaning — MAIN-world `chrome.scripting.executeScript` — is no
- *              longer in use; the MAIN-world console-capture script that
- *              used it has been retired in favour of CDP.
+ *              page.act click / fill / type / press when CDP attach is denied.
+ *              Also: check / select_option / submit (pure DOM mutations, no
+ *              CDP path), press fallback, click_at / dblclick_at / hover_at
+ *              are NOT isolated — they're pure CDP.
+ *            - "main"     — CDP-driven `Runtime.evaluate` in the page main
+ *              world (page variables accessible, no page CSP, requires
+ *              `debugger` permission and shows the yellow infobar while
+ *              attached). Used for: page.js, setElementValue (fill). The
+ *              legacy MAIN-world `chrome.scripting.executeScript { world: MAIN }`
+ *              path has been retired in favour of CDP.
  *            - "cdp"      — CDP `Input.*` commands (dispatchMouseEvent /
- *              insertText) and any CDP-driven path that doesn't go through
- *              Runtime.evaluate but still requires the `debugger` permission.
- *              Used by the page.act primary paths for click / dblclick /
- *              hover / type.
+ *              insertText / dispatchKeyEvent) and any CDP-driven path that
+ *              doesn't go through Runtime.evaluate but still requires the
+ *              `debugger` permission. Used for: click, dblclick, hover, type
+ *              (insertText), press (dispatchKeyEvent), click_at, dblclick_at,
+ *              hover_at — all bypass page-level synthetic-event handlers and
+ *              are CSP-immune.
+ *          The `path` field disambiguates which surface was used:
+ *            - "cdp.runtime.evaluate"          — page.js, setElementValue
+ *            - "cdp.input.dispatchMouseEvent"  — click, dblclick, hover,
+ *                                                click_at, dblclick_at, hover_at
+ *            - "cdp.input.insertText"          — type (focusElement + insertText)
+ *            - "cdp.input.dispatchKeyEvent"    — press (keyDown + keyUp)
+ *            - "isolated.resolveAndLocate"     — first stage of CDP path
+ *            - "isolated.fallbackClick"        — synthetic event fallback
+ *            - "isolated.fallbackDblclick"     — synthetic event fallback
+ *            - "isolated.fallbackHover"        — synthetic event fallback
+ *            - "isolated.fallbackType"         — synthetic event fallback
+ *            - "isolated.fallbackFill"         — native setter fallback
+ *            - "isolated.fallbackKeyEvent"     — KeyboardEvent fallback for press
+ *            - "isolated.dispatchEvent"        — check, select_option
+ *            - "isolated.form.submit"          — submit
+ *            - "isolated.scrollIntoView"       — scroll-to-element
+ *            - "isolated.scrollBy"             — scroll by amount
+ *            - "isolated.readable"             — readable content extraction
+ *            - "isolated.fullHtml"             — full document HTML
+ *            - "isolated.newFunction"          — page.js fallback, wait_for
+ *                                                function condition
+ *            - "isolated.waitFor"              — wait_for element conditions
+ *            - "isolated.networkIdle"          — wait_for network_idle
+ *            - "isolated.dialogOverride"       — dialog_*
+ *            - "isolated.nativeSetter"         — fill_form
+ *            - "isolated.fileInput"            — upload
+ *            - "selftest.newFunction"          — content-script runtime self-test
  *          The verdict names the world AND the path so callers can always
  *          tell which surface actually ran.
  * OWNS: The shape of execution truth.
  * EXPORTS: ExecutionVerdict
  * DOCS: .agents/reports/plan_runtime-verdict_2026-06-22.md §1,
  *       .agents/reports/plan_cdp-max-authority_2026-06-22.md,
- *       .agents/reports/plan_cdp-input-parity_2026-06-23.md
+ *       .agents/reports/plan_cdp-input-parity_2026-06-23.md,
+ *       .agents/reports/plan_visual-help-csp-tighten_2026-06-23.md
  */
 export interface ExecutionVerdict {
   executed: boolean;                          // did the code actually run?

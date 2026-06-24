@@ -68,6 +68,8 @@ import {
   selectText,
   readSummary,
   generateSelector,
+  readReadable,
+  readFullHtml,
 } from "../src/v2/content-actions";
 import type { Target, ActResult } from "../src/v2/content-actions";
 import type { ExecutionVerdict } from "../src/types.js";
@@ -226,6 +228,20 @@ async function handleRead(
       return readSummary();
     case "frames":
       return { frames: listFrames() };
+    case "readable": {
+      // Trafilatura-style extraction. Result is the readability shape
+      // (title, content, excerpt, length, fallback) — the SW applies the
+      // size cap and the `truncated` flag before returning to the agent.
+      const result = readReadable();
+      if (!result.success) {
+        return { success: false, message: result.message ?? "readable failed", errorCode: "READABLE_FAILED" };
+      }
+      return result.data ?? {};
+    }
+    case "full_html": {
+      const result = readFullHtml();
+      return { html: result.html, length: result.length, durationMs: result.durationMs };
+    }
     case "generate_selector": {
       const target = params.target as Target | undefined;
       const css = target?.css as string | undefined;

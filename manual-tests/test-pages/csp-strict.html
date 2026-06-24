@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CSP Strict — page.js test</title>
+  <!--
+    This meta CSP tag blocks inline scripts and eval in the page's MAIN world.
+    page.js via the isolated-world content script would FAIL here.
+    page.js via CDP `Runtime.evaluate` SUCCEEDS — that's the whole point.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
+</head>
+<body>
+  <h1>CSP Strict Page</h1>
+  <p>page.js must be able to read <code id="secret">SECRET_FROM_CSP_STRICT_PAGE</code> via CDP.</p>
+</body>
+</html>

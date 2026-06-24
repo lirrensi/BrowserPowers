@@ -333,9 +333,16 @@ function getAvailableCapabilities(settings: { permissions: Record<string, string
     // Cookies
     { tool: "cookies.get", description: "Get a cookie by name and URL", group: "cookies" },
     { tool: "cookies.set", description: "Set a cookie for a URL", group: "cookies" },
-    { tool: "cookies.remove", description: "Remove a cookie by name and URL", group: "cookies" },
+    { tool: "cookies.remove", description: "Remove a cookie by name", group: "cookies" },
     { tool: "cookies.list", description: "List all cookies for a URL", group: "cookies" },
+
+    // Self (always-allow: extension lifecycle helpers used by the test harness)
+    { tool: "self.reload", description: "Reload the extension to pick up a new build", group: "self" },
   ];
 
-  return all.filter((c) => settings.permissions[c.group] !== "deny");
+  return all.filter((c) => {
+    // self.* tools are always available (extension lifecycle helpers).
+    if (c.group === "self") return true;
+    return settings.permissions[c.group] !== "deny";
+  });
 }

@@ -424,12 +424,24 @@ The `summary` flag returns a condensed view with fewer fields.
 
 | Property | Value |
 |---|---|
-| Description | Capture a screenshot of the active tab |
-| Input | `{ browser_id: string }` or `{ browser_name: string }` |
+| Description | Capture a screenshot of the active tab, optionally with annotated overlay (boxes + labels) |
+| Input | `{ browser_id: string }` or `{ browser_name: string }`. Optional: `overlay` (see below), `overlay_limit`, `overlay_color_by_type` |
 | Output | On success: file path where the PNG was saved |
 | Error | Returns `isError: true` with error message |
 
 Screenshots are saved as temporary PNG files. Old screenshot files (>1 hour) are cleaned up automatically on each new screenshot.
+
+**Visual layer — `overlay` param**:
+
+| Value | Description |
+|---|---|
+| `"none"` (default) | No overlay — raw screenshot, backward compatible |
+| `"labels"` | Boxes + anchor IDs (a1, a2, …) + tag#id |
+| `"coords"` | Boxes + `(x, y)` center coords |
+| `"both"` | Labels AND coords (default when overlay is enabled) |
+| `"anchors_only"` | Boxes only, no text inside |
+
+Boxes are 2px-stroked, color-coded by tag (button=blue, input/textarea=green, link=orange, select=purple, default=gray). Labels are painted in a semi-transparent pill on the box's top-left so they stay legible on any background. Elements outside the viewport are skipped. `overlay_limit` (default 50) caps the number of boxes drawn. Implementation: `OffscreenCanvas` in the service worker (requires Chrome 94+). On `OffscreenCanvas` failure the tool falls back to the raw capture and surfaces an `overlayError` in the response.
 
 #### 2.3 Tool: `tabs`
 
@@ -490,11 +502,11 @@ Page inspection — discovers interactable elements and assigns lightweight anch
 | `limit` | number | Max anchors to return (default 50) |
 | `include_hidden` | boolean | Include hidden/off-screen elements (default false) |
 
-**Output**: `data` contains `{ url, title, documentId, anchors: [{ anchor, role?, name?, label?, placeholder?, text?, tag, type?, visible, enabled?, checked?, selected?, target }] }`
+**Output**: `data` contains `{ url, title, documentId, anchors: [{ anchor, role?, name?, label?, placeholder?, text?, tag, type?, visible, enabled?, checked?, selected?, target, boundingRect?: { x, y, width, height }, center?: { x, y } }] }`
 
 Anchors are stored in the anchor manager for the current tab and document epoch. See §2.15 Inspect Anchors for lifecycle rules.
 
-The extension MUST scan the page (and same-origin iframes + open shadow roots) for interactable elements, assign anchor IDs (`a1`, `a2`, ...), and return structured anchor data.
+The extension MUST scan the page (and same-origin iframes + open shadow roots) for interactable elements, assign anchor IDs (`a1`, `a2`, ...), and return structured anchor data. The non-compact inspect output also includes `boundingRect: { x, y, width, height }` (all integers) and `center: { x, y }` (rounded center coords) for every visible anchor, sourced from `getBoundingClientRect()`. These let the agent drive `click_at { x, y }` without the screenshot overlay.
 
 ###### `action: "content"`
 
@@ -595,6 +607,22 @@ Retrieve captured console output from the page. Intercepts `console.log`, `conso
 
 **Output**: `data` contains `{ entries: [{ level, messages[], timestamp, stack? }], totalCount: number }`
 
+###### `action: "readable"`
+
+Trafilatura-style article extraction. Strips navigation, footers, sidebars, ads, and other boilerplate to isolate the main page content.
+
+**Input**: No target needed. Operates on the full document.
+
+**Output**: `data` contains `{ title: string, content: string, excerpt: string, byline?: string, length: number, fallback: boolean, truncated?: boolean }`. Hard cap 1 MB; if exceeded, `truncated: true` and content is sliced. The `fallback` flag is `true` when no `<main>` / `<article>` element was found and the extractor fell back to the full body text. Verdict: `world: "isolated"`, `path: "isolated.readable"`.
+
+###### `action: "full_html"`
+
+Return the entire document HTML (the literal `document.documentElement.outerHTML`).
+
+**Input**: No target needed.
+
+**Output**: `data` contains `{ html: string, length: number, originalLength: number, truncated?: boolean }`. Hard cap 5 MB; if exceeded, `truncated: true` and `html` is sliced. Includes the full document with `<html>`, `<head>`, `<body>`, all attributes. Verdict: `world: "isolated"`, `path: "isolated.fullHtml"`.
+
 #### 2.7 Tool: `page_act`
 
 Page Act is the unified tool for interacting with or mutating page elements. It uses an `action` discriminator to select the specific operation. Gated behind the `page.act` permission group.
@@ -623,6 +651,19 @@ Click the element matching the target or anchor.
 The extension MUST find the element via anchor or target resolution, then dispatch an `Input.dispatchMouseEvent` (`mousePressed` + `mouseReleased`) at the element's center coordinates via the `chrome.debugger` CDP layer. This is the same browser-level input injection Playwright uses and bypasses shadow DOM (open and closed), iframes, overlays, and CSP. If CDP attach is denied, MUST fall back to `HTMLElement.click()` and report the verdict as `world: "isolated"`, `path: "isolated.fallbackClick"`. If the element is disabled, MUST return `not_performed`. If multiple elements match for critical actions (click, submit, check), MUST return `ambiguous` with `errorCode: "AMBIGUOUS_TARGET"`.
 
 For `action: "dblclick"`, the extension MUST dispatch TWO press/release pairs at the same coordinates with `clickCount: 1` on the first pair and `clickCount: 2` on the second pair — this is what causes the browser to synthesize a `dblclick` DOM event with `detail: 2`.
+
+###### `action: "click_at"` / `dblclick_at` / `hover_at`
+
+Click, double-click, or hover at LITERAL viewport coordinates. No selector resolution, no shadow walk — just (x, y).
+
+| Field | Type | Description |
+|---|---|---|
+| `x` | number (required) | Viewport x coordinate |
+| `y` | number (required) | Viewport y coordinate |
+| `button` | string (optional) | `"left"` (default), `"right"`, or `"middle"` |
+| `clickCount` | number (optional) | For `click_at` only (default 1) |
+
+The extension MUST dispatch `Input.dispatchMouseEvent` at the literal (x, y) coords via the `chrome.debugger` CDP layer. There is no selector resolution, no shadow walk, no content-script involvement. Verdict is `world: "cdp"`, `path: "cdp.input.dispatchMouseEvent"`. Use this action when the agent has read coords off a screenshot with `overlay=coords` or `overlay=both`, or when interacting with canvas-rendered UI where element targeting is impossible.
 
 ###### `action: "fill"`
 
@@ -669,9 +710,10 @@ Press a keyboard key on a focused element.
 |---|---|---|
 | `target` | Target (optional) | Structured target for the element (will be focused) |
 | `anchor` | string (optional) | Anchor ID from inspect |
-| `key` | string (required) | Key to press (e.g. `"Enter"`, `"Tab"`, `"Escape"`) |
+| `key` | string (required if no `keys`) | Key to press (e.g. `"Enter"`, `"Tab"`, `"Escape"`) |
+| `keys` | array (optional) | Playwright-style key combination (last entry is the active key, earlier entries are modifiers) |
 
-The extension MUST focus the element, then dispatch `keydown`, `keypress`, and `keyup` KeyboardEvents with the specified key.
+The extension MUST focus the element first, then dispatch `Input.dispatchKeyEvent` (`keyDown` + `keyUp`) via the `chrome.debugger` CDP layer, with the key→code mapping (Playwright parity). The key name is mapped to the CDP `key` / `code` / `windowsVirtualKeyCode` triple. Modifier keys in `keys` are flattened into the CDP modifier bit field. If CDP attach is denied, MUST fall back to synthetic `KeyboardEvent` (`keydown` / `keypress` / `keyup`) and report the verdict as `world: "isolated"`, `path: "isolated.fallbackKeyEvent"`. On success, the verdict is `world: "cdp"`, `path: "cdp.input.dispatchKeyEvent"`. `press` without a target dispatches a global key event.
 
 ###### `action: "scroll"`
 

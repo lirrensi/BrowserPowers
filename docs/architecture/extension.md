@@ -231,11 +231,11 @@ Used by:
 
 ### 7. Readability Extractor (`src/readability.ts`)
 
-Simplified Readability-style content extractor that strips navigation, sidebars, footers, ads, and other boilerplate from page content. Exports `readabilityFunctionBody` — a string body injected into the page via `chrome.scripting.executeScript`.
+Simplified Readability-style content extractor that strips navigation, sidebars, footers, ads, and other boilerplate from page content. Exports `readabilityFunctionBody` — a string body that's wrapped in a `new Function` and evaluated in the content script's isolated world.
 
 Returns a `ReadableResult` with `title`, `content`, `excerpt`, `byline`, `length`, and `fallback` flag. Designed to produce clean article text for agent consumption.
 
-> **Status**: Defined and exported but not yet wired into any action handler. Available for future `page.read({ action: "readable" })` or similar content-extraction action.
+> **Status**: Wired as `page.read action=readable` (see §13). The SW dispatches the function body via the content script, which `new Function`s it and returns the result. Hard cap 1 MB; if exceeded, content is sliced and `truncated: true` is added.
 
 ### 8. Shared Settings Surface (`entrypoints/popup/`, `entrypoints/options/`)
 
@@ -288,8 +288,8 @@ The v2 Page Interaction API is implemented by a set of modules under `src/v2/`. 
 | `src/v2/target-resolver.ts` | `targetResolverBody` | Injectable string body that resolves structured Target or anchor to a DOM element in page context. Penetrates same-origin iframes and open shadow roots. |
 | `src/v2/anchor-manager.ts` | `setAnchors()`, `getAnchor()`, `clearAnchors()`, `clearAllAnchors()` | Per-tab anchor storage with documentId staleness detection. Anchors live in service worker memory only. |
 | `src/v2/inspector.ts` | `inspectFunctionBody` | Injectable string body for page inspection — scans interactable elements, penetrates iframes and shadow roots, returns structured anchor data with anchor IDs |
-| `src/v2/page-read.ts` | `dispatchReadAction()` | Dispatches read actions (inspect, content, text, html, attr, meta, forms, count, select, console) via `chrome.scripting.executeScript`, stores inspect anchors |
-| `src/v2/page-act.ts` | `dispatchActAction()` | Dispatches act actions (click, fill, check, select_option, press, scroll, submit, wait_for) with anchor fast path and structured target resolution |
+| `src/v2/page-read.ts` | `dispatchReadAction()` | Dispatches read actions (inspect, content, text, html, attr, meta, forms, count, select, summary, frames, generate_selector, console, runtime_status, readable, full_html) via the content script; stores inspect anchors. `readable` invokes `extension/src/readability.ts`; `full_html` returns `document.documentElement.outerHTML` |
+| `src/v2/page-act.ts` | `dispatchActAction()` | Dispatches act actions (click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, click_at, dblclick_at, hover_at, dialog_override, dialog_respond) with anchor fast path and structured target resolution. Five act actions (click, dblclick, hover, type, press) use a CDP primary path; three (click_at, dblclick_at, hover_at) are pure CDP at literal viewport coords (no resolution). |
 | `src/v2/page-js.ts` | `dispatchJsAction()` | Executes arbitrary JavaScript on the page via `chrome.scripting.executeScript`, wraps result in ActionResult envelope |
 | `src/v2/snapshot-diff.ts` | `diffSnapshots()`, `AnchorSnapshot`, `SnapshotDiff` | Compares two inspect snapshots by semantic key (`role|name|tag|text`), returns added/removed/changed anchors plus top-level url/title changes |
 
@@ -422,6 +422,89 @@ Playwright-launched Chrome may need `--enable-unsafe-experimental-debugger-exten
 | `extension/src/v2/page-read.ts` | `consoleRead` (from `cdp.getConsoleBuffer`); `runtimeStatus` (merges `cdp` block) |
 | `extension/entrypoints/content.ts` | No longer owns console capture; keeps `RUNTIME_SELFTEST` + `handleJs` (fallback) |
 | `extension/src/types.ts` | `ExecutionVerdict.world` comment disambiguates "isolated" vs "main" (CDP-driven) |
+
+### 12. Visual Layer
+
+The visual layer is the bridge between the agent's text understanding of the page and the literal pixel coordinates it needs to drive CDP `Input.dispatchMouseEvent` at. Three components:
+
+**12.1 `boundingRect` + `center` on inspect anchors**
+
+The non-compact inspect output (`page.read action=inspect`) now exposes per-anchor `boundingRect: { x, y, width, height }` (all integers) and `center: { x, y }` (rounded center coords), sourced from `getBoundingClientRect()`. The agent can read these directly and use them as the `x` / `y` parameters of `click_at` / `dblclick_at` / `hover_at` without taking a screenshot first.
+
+Implementation: `extension/src/v2/content-actions.ts` `inspectElements` → `getAnchorInfo` (non-compact branch).
+
+**12.2 Coordinate-based act actions: `click_at` / `dblclick_at` / `hover_at`**
+
+Three new act actions take literal viewport coordinates. No selector resolution, no shadow walk, no content-script round-trip — pure CDP `Input.dispatchMouseEvent` at (x, y):
+
+| Action | Behaviour | Verdict |
+|---|---|---|
+| `click_at` | `mousePressed` + `mouseReleased` at (x, y) | `world: "cdp"`, `path: "cdp.input.dispatchMouseEvent"` |
+| `dblclick_at` | Two press/release pairs (clickCount: 1, then 2) at (x, y) | same |
+| `hover_at` | `mouseMoved` to (x, y) | same |
+
+There is no fallback for these actions — if CDP attach is denied, they fail with `CDP_ATTACH_FAILED`. Use the regular `click` / `dblclick` / `hover` actions (which route through the content-script resolve step first) when you need fallback behaviour.
+
+Implementation: `extension/src/v2/page-act.ts` `actAtCoords` + the per-action wrappers.
+
+**12.3 Screenshot overlay (`screenshots.capture overlay=...`)**
+
+`overlay` is a new parameter on `screenshots.capture`. When set, the SW collects the interactable anchors from the content script (each with `boundingRect` + `center`), decodes the captured PNG with `OffscreenCanvas`, and paints 2px-stroked boxes + label pills on the canvas, then re-encodes as PNG.
+
+| Mode | What gets drawn |
+|---|---|
+| `"none"` (default) | No overlay — raw screenshot, backward compat |
+| `"labels"` | Boxes + `a1 button#Submit` style labels |
+| `"coords"` | Boxes + `(x, y)` center coords |
+| `"both"` (default when overlay is enabled) | Labels AND coords |
+| `"anchors_only"` | Boxes only, no text inside |
+
+Boxes are color-coded by tag: button=blue, input/textarea=green, link=orange, select=purple, default=gray. Label backgrounds are semi-transparent pills so they stay legible. Elements outside the viewport are skipped; `overlay_limit` (default 50, max 200) caps the number of boxes drawn — for very large pages, take multiple screenshots.
+
+The canvas path uses `OffscreenCanvas` + `createImageBitmap`, both available in MV3 service workers since Chrome 94. The capability router falls back to the raw capture (no overlay) on `OffscreenCanvas` failure and surfaces an `overlayError` in the response.
+
+Implementation: `extension/src/screenshot.ts` (`captureWithOverlay`) + `extension/src/capability-router.ts` (`case "screenshots.capture"`).
+
+### 13. Help System
+
+The help system lives in `core/src/adapters/help-text.ts` and is consumed by both the CLI (`browserpowers help [topic]`) and the MCP `help` tool. It auto-generates from the registered commander program + MCP tool catalog + v2 action enums, so adding a new command / tool / action automatically flows into the help output.
+
+**13.1 Three help call patterns**
+
+| Call | Output |
+|---|---|
+| `browserpowers --help` | One-page cheat sheet (commander built-in) |
+| `browserpowers help` | Full reference (~3-8 KB) |
+| `browserpowers help <command>` | Deep-dive on a single command (e.g. `help page.act click`) |
+| `browserpowers help <topic>` | Section deep-dive (e.g. `help page-read`, `help visual`) |
+| `browserpowers help topics` | List of available topics |
+| `browserpowers help commands` | List of all commander commands |
+
+**13.2 Help topics**
+
+| Topic | Section |
+|---|---|
+| `all` | The full system reference (default) |
+| `navigation` | Connect / navigate / inspect / act workflow |
+| `anchors` | Element targeting strategies (text, anchor, CSS, role) |
+| `gates` | Approval model for sensitive tools |
+| `page-read` | All `page.read` actions with one-line descriptions |
+| `page-act` | All `page.act` actions with one-line descriptions |
+| `page-js` | The `page.js` escape hatch |
+| `visual` | Screenshot overlay, click_at, hover_at, boundingRect |
+| `permissions` | Permission groups, default levels, and the gate model |
+
+**13.3 No string duplication**
+
+The help module reads the actual registered commander program (`Command.commands`) and the MCP tool catalog (`MCP_TOOL_CATALOG`) — there's no hand-typed copy of the command list. New commands added to `cli.ts` show up in `help commands` automatically. New page actions added to `PAGE_READ_ACTIONS` / `PAGE_ACT_ACTIONS` show up in `help page-read` / `help page-act` automatically.
+
+**13.4 Implementation**
+
+| File | Role |
+|---|---|
+| `core/src/adapters/help-text.ts` | Single source of truth — `buildHelpIndex`, `buildCommandHelp`, `buildTopicHelp`, `buildToolHelp`, `getCommandNames`, `getTopics` |
+| `core/src/adapters/cli.ts` | Registers the `help [topic...]` subcommand; per-command `--help` text is the standard commander one-liner |
+| `core/src/adapters/mcp.ts` | The `help` MCP tool — same content as the CLI's `help` |
 
 ---
 

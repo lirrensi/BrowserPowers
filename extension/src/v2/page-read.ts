@@ -26,7 +26,7 @@ import { setAnchors } from "./anchor-manager.js";
 import { getState as getCdpState, getConsoleBuffer } from "../cdp.js";
 import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
-type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console" | "runtime_status";
+type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console" | "runtime_status" | "readable" | "full_html";
 
 export async function dispatchReadAction(
   action: ReadAction,
@@ -63,6 +63,10 @@ export async function dispatchReadAction(
       return consoleRead(params, tabId, frameId);
     case "runtime_status":
       return runtimeStatus(tabId, frameId);
+    case "readable":
+      return readable(params, tabId, frameId);
+    case "full_html":
+      return fullHtml(params, tabId, frameId);
     default:
       return notPerformed("read", `Unknown read action: ${action}`);
   }
@@ -450,4 +454,98 @@ function contentScriptNotReady(action: string): ActionResult {
     recoverable: true,
     suggestions: ["Wait for the page to finish loading", "Retry the operation"],
   });
+}
+
+// ── Readable (Trafilatura-style) ──
+
+/** Hard cap on `readable` content. Pages with massive article bodies
+ * (long-form essays, documentation, etc.) get truncated to this size.
+ * Bigger than 1 MB usually means the page is a giant archive / search
+ * result — not the article the agent wants. */
+const READABLE_MAX_BYTES = 1 * 1024 * 1024; // 1 MB
+
+async function readable(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  try {
+    const data = await sendReadMessage(tabId, "readable", {});
+    if (!data) return contentScriptNotReady("readable");
+    if (data.success === false) {
+      return notPerformed("readable", data.message as string, {
+        errorCode: data.errorCode as string | undefined,
+      });
+    }
+
+    const title = (data.title as string) ?? "";
+    let content = (data.content as string) ?? "";
+    const excerpt = (data.excerpt as string) ?? "";
+    const length = (data.length as number) ?? content.length;
+    const fallback = (data.fallback as boolean) ?? true;
+    const byline = data.byline as string | undefined;
+    const _durationMs = data._durationMs as number | undefined;
+
+    let truncated = false;
+    if (content.length > READABLE_MAX_BYTES) {
+      content = content.slice(0, READABLE_MAX_BYTES);
+      truncated = true;
+    }
+
+    return performed("readable", `Readable extracted (${content.length} chars${truncated ? ", truncated" : ""})`, {
+      evidence: { length, truncated, fallback },
+      data: { title, content, excerpt, byline, length, fallback, truncated, ...(truncated ? { _sizeCap: READABLE_MAX_BYTES } : {}), ...(_durationMs !== undefined ? { _durationMs } : {}) },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        durationMs: _durationMs ?? 0,
+        path: "isolated.readable",
+      },
+    });
+  } catch (err) {
+    return blocked("readable", `Content script error: ${(err as Error).message}`, {
+      errorCode: "CONTENT_SCRIPT_ERROR",
+      recoverable: true,
+    });
+  }
+}
+
+// ── Full HTML ──
+
+/** Hard cap on `full_html` content. Most pages are well under 1 MB of
+ * HTML, but a few (heavily-injected SPAs, scraped mirrors) can blow
+ * past 5 MB. We cap at 5 MB to avoid OOM in the SW. */
+const FULL_HTML_MAX_BYTES = 5 * 1024 * 1024; // 5 MB
+
+async function fullHtml(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  try {
+    const data = await sendReadMessage(tabId, "full_html", {});
+    if (!data) return contentScriptNotReady("full_html");
+    if (data.success === false) {
+      return notPerformed("full_html", data.message as string, {
+        errorCode: data.errorCode as string | undefined,
+      });
+    }
+
+    let html = (data.html as string) ?? "";
+    const originalLength = (data.length as number) ?? html.length;
+    const _durationMs = data.durationMs as number | undefined;
+    let truncated = false;
+    if (html.length > FULL_HTML_MAX_BYTES) {
+      html = html.slice(0, FULL_HTML_MAX_BYTES);
+      truncated = true;
+    }
+
+    return performed("full_html", `Full HTML extracted (${html.length} chars${truncated ? ", truncated" : ""})`, {
+      evidence: { originalLength, returnedLength: html.length, truncated },
+      data: { html, length: html.length, originalLength, truncated, ...(truncated ? { _sizeCap: FULL_HTML_MAX_BYTES } : {}), ...(_durationMs !== undefined ? { _durationMs } : {}) },
+      executionVerdict: {
+        executed: true,
+        world: "isolated",
+        durationMs: _durationMs ?? 0,
+        path: "isolated.fullHtml",
+      },
+    });
+  } catch (err) {
+    return blocked("full_html", `Content script error: ${(err as Error).message}`, {
+      errorCode: "CONTENT_SCRIPT_ERROR",
+      recoverable: true,
+    });
+  }
 }

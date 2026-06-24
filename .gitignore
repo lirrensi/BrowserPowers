@@ -26,6 +26,7 @@ pnpm-debug.log*
 
 # ── Test artifacts ────────────────────────────────────
 test-results/
+manual-tests/results/
 
 # ── IDE ───────────────────────────────────────────────
 .vscode/

@@ -1,8 +1,8 @@
 /**
  * FILE: extension/src/v2/page-act.ts
  * PURPOSE: Dispatch act actions (click, fill, check, select_option, press, scroll, submit, wait_for,
- *          type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond)
- *          via chrome.tabs.sendMessage to the persistent content script.
+ *          type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond,
+ *          click_at, dblclick_at, hover_at) via chrome.tabs.sendMessage to the persistent content script.
  *          Surfaces the content-script ExecutionVerdict at the top level of
  *          the ActionResult and forwards shadowPath from anchors.
  *          After the CDP-input-parity refactor (2026-06-23), five act actions
@@ -16,14 +16,22 @@
  *            fill — CDP `setElementValue` (Runtime.evaluate in main world
  *              that sets .value and dispatches input/change). Fallback to
  *              bp:fallback-fill.
- *          Other act actions (press, check, select_option, submit, scroll,
- *          drag, upload, dialog_*) still go through the content script
- *          directly — synthetic events work fine for them.
+ *            press — CDP `Input.dispatchKeyEvent` (keyDown + keyUp) with key
+ *              name mapping (Playwright parity). Fallback to bp:act press
+ *              (synthetic KeyboardEvent).
+ *            click_at / dblclick_at / hover_at — pure CDP `Input.dispatchMouseEvent`
+ *              at literal viewport coords. No selector resolution, no shadow
+ *              walk. Used when the agent has read the coords off a screenshot
+ *              overlay and just needs to hit literal (x, y).
+ *          Other act actions (check, select_option, submit, scroll, drag, upload,
+ *          dialog_*) still go through the content script directly — synthetic
+ *          events work fine for them.
  * OWNS: page.act dispatch — each act action implementation in the service worker.
  * EXPORTS: dispatchActAction
  * DOCS: .agents/reports/plan_content-script-arch_2026-05-28.md,
  *       .agents/reports/plan_runtime-verdict_2026-06-22.md,
- *       .agents/reports/plan_cdp-input-parity_2026-06-23.md
+ *       .agents/reports/plan_cdp-input-parity_2026-06-23.md,
+ *       .agents/reports/plan_visual-help-csp-tighten_2026-06-23.md
  */
 
 import { getAnchor } from "./anchor-manager.js";
@@ -32,6 +40,7 @@ import {
   ensureAttached,
   dispatchMouseEvent,
   insertText,
+  dispatchKeyEvent,
   focusElement,
   setElementValue,
 } from "../cdp.js";
@@ -40,7 +49,8 @@ import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 type ActAction =
   | "click" | "fill" | "check" | "select_option" | "press" | "scroll" | "submit"
   | "wait_for" | "type" | "smart_click" | "fill_form" | "upload" | "drag"
-  | "dblclick" | "hover" | "dialog_override" | "dialog_respond";
+  | "dblclick" | "hover" | "dialog_override" | "dialog_respond"
+  | "click_at" | "dblclick_at" | "hover_at";
 
 type WaitCondition =
   | "exists" | "visible" | "hidden" | "enabled" | "disabled" | "stable"
@@ -70,6 +80,9 @@ export async function dispatchActAction(
     case "hover": return hoverAction(params, tabId, frameId);
     case "dialog_override": return dialogOverride(params, tabId, frameId);
     case "dialog_respond": return dialogRespond(params, tabId, frameId);
+    case "click_at": return clickAt(params, tabId, frameId);
+    case "dblclick_at": return dblclickAt(params, tabId, frameId);
+    case "hover_at": return hoverAt(params, tabId, frameId);
     default:
       return notPerformed("act", `Unknown act action: ${action}`);
   }
@@ -307,7 +320,11 @@ async function selectOption(params: Record<string, unknown>, tabId: number, fram
 async function press(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
   const target = params.target as Target | undefined;
   const anchor = params.anchor as string | undefined;
+  const key = params.key as string | undefined;
+  const keys = params.keys as string[] | undefined;
 
+  // Allow press without a target — useful for global key handling. In that
+  // case we skip the focus step and just dispatch the key event.
   const resolved = resolveTargetParams(tabId, target, anchor);
   if (resolved === "STALE") {
     return blocked("press", `Anchor ${anchor} is no longer valid`, {
@@ -316,14 +333,105 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
       suggestions: ["Run page.read with action=inspect again", "Use a semantic target instead"],
     });
   }
-  if (resolved === "NONE") {
-    return notPerformed("press", "No target or anchor provided");
+
+  // Pick the actual key to send. `keys` (Playwright-style combination) is
+  // normalised to the last key — the modifiers are flattened into the CDP
+  // modifier bit field.
+  const modifierMap: Record<string, number> = { Control: 1, Alt: 2, Shift: 4, Meta: 8 };
+  let modifiers = 0;
+  let activeKey: string | undefined;
+  if (keys && Array.isArray(keys) && keys.length > 0) {
+    for (let i = 0; i < keys.length - 1; i++) {
+      const flag = modifierMap[keys[i]];
+      if (flag !== undefined) modifiers |= flag;
+    }
+    activeKey = keys[keys.length - 1];
+  } else if (key) {
+    activeKey = key;
   }
 
-  const actParams = resolved as Record<string, unknown>;
-  actParams.key = params.key;
-  actParams.keys = params.keys;
-  return sendActMessage(tabId, "press", actParams);
+  if (!activeKey) {
+    return notPerformed("press", "No key provided (use 'key' or 'keys')");
+  }
+
+  // CDP path: focus the target first (if we have one), then dispatchKeyEvent.
+  // attach failure → fall back to the content-script synthetic KeyboardEvent.
+  if (resolved !== "NONE") {
+    // We have a target. Try to focus it via CDP first, so the keystroke
+    // lands on the right element. If focus fails (closed shadow root,
+    // detached element), fall back to the isolated-world key dispatch
+    // which lets the page focus the target itself.
+    const actParams = resolved as Record<string, unknown>;
+    const attach = await ensureAttached(tabId, "input.press");
+    if (attach.attached) {
+      // Build a jsExpression if we have one (anchor-resolved). Otherwise
+      // the press still works — the CS will resolve and focus.
+      const resolveResp = await sendMessageRaw(tabId, "bp:resolve", { ...actParams, action: "press" });
+      const jsExpression = (resolveResp?.jsExpression as string | undefined) ?? null;
+      if (jsExpression) {
+        const focus = await focusElement(tabId, jsExpression);
+        if (!focus.ok) {
+          // Fall through to the fallback path
+          return await sendActFallbackPress(tabId, actParams, key, keys, attach.error);
+        }
+      }
+      const sent = await dispatchKeyEvent(tabId, activeKey, { modifiers });
+      if (!sent.ok) {
+        return await sendActFallbackPress(tabId, actParams, key, keys, sent.error);
+      }
+      return performed("press", `Pressed ${activeKey} via CDP`, {
+        evidence: { key: activeKey, modifiers },
+        data: { key: activeKey, modifiers },
+        executionVerdict: {
+          executed: true,
+          world: "cdp",
+          durationMs: sent.durationMs || 0,
+          path: "cdp.input.dispatchKeyEvent",
+        },
+      });
+    }
+    // CDP attach failed — fall through to the CS synthetic event path.
+    actParams.key = key;
+    actParams.keys = keys;
+    return sendActMessage(tabId, "press", actParams);
+  }
+
+  // No target — global press (e.g. page-level Escape). Try CDP first.
+  const attach = await ensureAttached(tabId, "input.press");
+  if (attach.attached) {
+    const sent = await dispatchKeyEvent(tabId, activeKey, { modifiers });
+    if (sent.ok) {
+      return performed("press", `Pressed ${activeKey} via CDP`, {
+        evidence: { key: activeKey, modifiers },
+        data: { key: activeKey, modifiers },
+        executionVerdict: {
+          executed: true,
+          world: "cdp",
+          durationMs: sent.durationMs || 0,
+          path: "cdp.input.dispatchKeyEvent",
+        },
+      });
+    }
+  }
+  // CDP attach failed (or no target) — fall back to CS synthetic event.
+  return sendActMessage(tabId, "press", { key, keys });
+}
+
+async function sendActFallbackPress(
+  tabId: number,
+  actParams: Record<string, unknown>,
+  key: string | undefined,
+  keys: string[] | undefined,
+  cdpError: string | undefined,
+): Promise<ActionResult> {
+  const csResult = await sendActMessage(tabId, "press", { ...actParams, key, keys });
+  if (csResult.success) {
+    return {
+      ...csResult,
+      data: { ...(csResult.data || {}), _fallback: "isolated", _cdpAttachError: cdpError },
+    };
+  }
+  return csResult;
 }
 
 async function scrollAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -612,6 +720,150 @@ async function hoverAction(params: Record<string, unknown>, tabId: number, frame
   }
 
   return await dispatchHoverViaCdp(resolved as Record<string, unknown>, tabId);
+}
+
+// ── Coordinate-based act actions (no selector resolution) ──
+
+/**
+ * Shared helper for `click_at` / `dblclick_at` / `hover_at`. The agent
+ * passes literal viewport (x, y) coords — typically read off a screenshot
+ * with `overlay=coords` or `overlay=both`. We bypass the content-script
+ * resolve step entirely and dispatch mouse events at the literal coords
+ * via CDP. Verdict: `world: "cdp"`, `path: "cdp.input.dispatchMouseEvent"`.
+ */
+async function actAtCoords(
+  action: "click_at" | "dblclick_at" | "hover_at",
+  params: Record<string, unknown>,
+  tabId: number,
+): Promise<ActionResult> {
+  const x = params.x as number | undefined;
+  const y = params.y as number | undefined;
+  if (typeof x !== "number" || typeof y !== "number") {
+    return notPerformed(action, "x and y required (numbers)");
+  }
+  const button = (params.button as "left" | "right" | "middle" | undefined) ?? "left";
+  const clickCount = (params.clickCount as number | undefined) ?? (action === "dblclick_at" ? 2 : 1);
+
+  const attach = await ensureAttached(tabId, `input.${action}`);
+  if (!attach.attached) {
+    return blocked(action, `CDP attach failed: ${attach.error}`, {
+      errorCode: "CDP_ATTACH_FAILED",
+      recoverable: true,
+      suggestions: ["Close Chrome DevTools on this tab and retry"],
+      executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+    });
+  }
+
+  if (action === "hover_at") {
+    const moved = await dispatchMouseEvent(tabId, "mouseMoved", x, y);
+    if (!moved.ok) {
+      return blocked(action, `Mouse-move failed: ${moved.error}`, {
+        errorCode: "CDP_DISPATCH_FAILED",
+        recoverable: true,
+        executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+      });
+    }
+    return performed(action, `Hovered at (${Math.round(x)}, ${Math.round(y)}) via CDP`, {
+      evidence: { x: Math.round(x), y: Math.round(y) },
+      data: { x, y },
+      executionVerdict: {
+        executed: true,
+        world: "cdp",
+        durationMs: moved.durationMs || 0,
+        path: "cdp.input.dispatchMouseEvent",
+      },
+    });
+  }
+
+  // click_at / dblclick_at — mousePressed + mouseReleased at the coords.
+  // dblclick uses TWO pairs (clickCount: 1 on the first, clickCount: 2 on the
+  // second) so the browser synthesises a `dblclick` DOM event with detail: 2.
+  if (action === "dblclick_at") {
+    const down1 = await dispatchMouseEvent(tabId, "mousePressed", x, y, { button, clickCount: 1 });
+    if (!down1.ok) {
+      return blocked(action, `Mouse-down failed: ${down1.error}`, {
+        errorCode: "CDP_DISPATCH_FAILED",
+        recoverable: true,
+        executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+      });
+    }
+    const up1 = await dispatchMouseEvent(tabId, "mouseReleased", x, y, { button, clickCount: 1 });
+    if (!up1.ok) {
+      return blocked(action, `Mouse-up failed: ${up1.error}`, {
+        errorCode: "CDP_DISPATCH_FAILED",
+        recoverable: true,
+        executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+      });
+    }
+    const down2 = await dispatchMouseEvent(tabId, "mousePressed", x, y, { button, clickCount: 2 });
+    if (!down2.ok) {
+      return blocked(action, `Mouse-down failed: ${down2.error}`, {
+        errorCode: "CDP_DISPATCH_FAILED",
+        recoverable: true,
+        executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+      });
+    }
+    const up2 = await dispatchMouseEvent(tabId, "mouseReleased", x, y, { button, clickCount: 2 });
+    if (!up2.ok) {
+      return blocked(action, `Mouse-up failed: ${up2.error}`, {
+        errorCode: "CDP_DISPATCH_FAILED",
+        recoverable: true,
+        executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+      });
+    }
+    const totalDuration = (down1.durationMs || 0) + (up1.durationMs || 0) + (down2.durationMs || 0) + (up2.durationMs || 0);
+    return performed(action, `Double-clicked at (${Math.round(x)}, ${Math.round(y)}) via CDP`, {
+      evidence: { x: Math.round(x), y: Math.round(y), button },
+      data: { x, y, button },
+      executionVerdict: {
+        executed: true,
+        world: "cdp",
+        durationMs: totalDuration,
+        path: "cdp.input.dispatchMouseEvent",
+      },
+    });
+  }
+
+  // click_at
+  const down = await dispatchMouseEvent(tabId, "mousePressed", x, y, { button, clickCount });
+  if (!down.ok) {
+    return blocked(action, `Mouse-down failed: ${down.error}`, {
+      errorCode: "CDP_DISPATCH_FAILED",
+      recoverable: true,
+      executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+    });
+  }
+  const up = await dispatchMouseEvent(tabId, "mouseReleased", x, y, { button, clickCount });
+  if (!up.ok) {
+    return blocked(action, `Mouse-up failed: ${up.error}`, {
+      errorCode: "CDP_DISPATCH_FAILED",
+      recoverable: true,
+      executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+    });
+  }
+  const totalDuration = (down.durationMs || 0) + (up.durationMs || 0);
+  return performed(action, `Clicked at (${Math.round(x)}, ${Math.round(y)}) via CDP`, {
+    evidence: { x: Math.round(x), y: Math.round(y), button, clickCount },
+    data: { x, y, button, clickCount },
+    executionVerdict: {
+      executed: true,
+      world: "cdp",
+      durationMs: totalDuration,
+      path: "cdp.input.dispatchMouseEvent",
+    },
+  });
+}
+
+async function clickAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
+  return actAtCoords("click_at", params, tabId);
+}
+
+async function dblclickAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
+  return actAtCoords("dblclick_at", params, tabId);
+}
+
+async function hoverAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
+  return actAtCoords("hover_at", params, tabId);
 }
 
 // ── Dialog actions ──

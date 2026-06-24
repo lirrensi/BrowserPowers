@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { loadConfig } from "../config.js";
 import { stringify } from "yaml";
+import { buildHelpIndex, buildCommandHelp, buildTopicHelp, getCommandNames, getTopics, buildToolHelp } from "./help-text.js";
 
 const config = loadConfig();
 const BASE = `http://${config.host}:${config.port}${config.rest.path}`;
@@ -119,7 +120,7 @@ function parseParamArgs(args: string[]): Record<string, unknown> {
 // ── list ──
 program
   .command("list")
-  .description("List all connected browsers")
+  .description("List all connected browsers (id, name, capabilities, last heartbeat).")
   .action(async () => {
     const res = await apiFetch(`${BASE}/browsers`);
     const { browsers } = await res.json() as { browsers: any[] };
@@ -135,7 +136,7 @@ program
 // ── navigate ──
 program
   .command("navigate <browserId> <url>")
-  .description("Navigate a browser to a URL")
+  .description("Navigate a browser to a URL. Creates a new tab. For existing-tab navigation, use `page read <browser> inspect` first to discover tab IDs.")
   .action(async (browserId: string, url: string) => {
     const result = await executeViaRest(browserId, "tabs.create", { url }) as any;
     if (result === null) return; // async mode
@@ -145,7 +146,7 @@ program
 // ── screenshot ──
 program
   .command("screenshot <browserId> [filepath]")
-  .description("Take a screenshot of a browser tab")
+  .description("Take a screenshot of a browser tab. Pass overlay=both|labels|coords|anchors_only via the tool call to get an annotated PNG. Saves to filepath or prints base64 JSON.")
   .action(async (browserId: string, filepath?: string) => {
     const result = await executeViaRest(browserId, "screenshots.capture", {}) as any;
     if (result === null) return; // async mode
@@ -164,7 +165,7 @@ program
 // ── content ──
 program
   .command("content <browserId> [selector]")
-  .description("Get page content from a browser")
+  .description("Get page content from a browser. If selector is omitted, returns the page's visible text (`document.body.innerText`); otherwise returns the matched element's text.")
   .action(async (browserId: string, selector?: string) => {
     const result = await executeViaRest(browserId, "page.read", { action: "content", target: selector ? { css: selector } : undefined }) as any;
     if (result === null) return; // async mode
@@ -177,7 +178,7 @@ program
 // ── select ──
 program
   .command("select <browserId>")
-  .description("Get selected text from a browser")
+  .description("Get the currently selected text on the page. Returns an empty string if nothing is selected.")
   .action(async (browserId: string) => {
     const result = await executeViaRest(browserId, "page.read", { action: "select" }) as any;
     if (result === null) return; // async mode
@@ -190,7 +191,7 @@ program
 // ── tabs ──
 program
   .command("tabs <browserId>")
-  .description("List all tabs in a browser")
+  .description("List all open tabs in a browser. Returns id, url, title, and active status for each tab.")
   .action(async (browserId: string) => {
     const result = await executeViaRest(browserId, "tabs.list", {}) as any;
     if (result === null) return; // async mode
@@ -203,7 +204,7 @@ program
 // ── exec ──
 program
   .command("exec <browserId> <tool> [params...]")
-  .description("Execute any tool with JSON params")
+  .description("Execute any tool with raw JSON params (escape hatch for tools not yet on the CLI). Example: `browserpowers exec my-browser page.read '{\"action\":\"inspect\"}'`")
   .action(async (browserId: string, tool: string, paramArgs: string[]) => {
     let params: Record<string, unknown> = {};
     if (paramArgs.length > 0) {
@@ -275,13 +276,13 @@ program
 // ── page read ──
 program
   .command("page")
-  .description("Page operations (read or act)")
+  .description("Page operations — read (no mutation) or act (mutation). Sub-commands: `page read <browserId> <action>`, `page act <browserId> <action>`. Run `browserpowers help page-read` or `browserpowers help page-act` for the full action list.")
   .addCommand(
     new Command("read")
-      .description("Read page content without mutating it")
+      .description("Read page content without mutating it. Use `browserpowers help page-read` to list all read actions.")
       .argument("<browserId>", "Target browser ID")
-      .argument("<action>", "Read action: inspect, content, text, html, attr, meta, forms, count, select, summary, generate_selector")
-      .argument("[params...]", "key=value params or JSON")
+      .argument("<action>", "Read action (e.g. inspect, content, text, html, attr, meta, forms, count, select, summary, frames, generate_selector, console, runtime_status, readable, full_html). Run `help page-read` for the full list with descriptions.")
+      .argument("[params...]", "key=value params or JSON. Examples: target=#my-button, target={text:Submit}, limit=20")
       .option("--json", "Output raw JSON")
       .action(async (browserId: string, action: string, paramArgs: string[], options: { json?: boolean }) => {
         const params = parseParamArgs(paramArgs);
@@ -305,10 +306,10 @@ program
   )
   .addCommand(
     new Command("act")
-      .description("Interact with or mutate the page")
+      .description("Interact with or mutate the page. Most actions run via CDP `Input.*` (CSP-immune). Use `browserpowers help page-act` to list all act actions.")
       .argument("<browserId>", "Target browser ID")
-      .argument("<action>", "Act action: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond")
-      .argument("[params...]", "key=value params or JSON (e.g. target=#my-button or css=.btn)")
+      .argument("<action>", "Act action: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, click_at, dblclick_at, hover_at, dialog_override, dialog_respond. Run `help page-act` for the full list with descriptions.")
+      .argument("[params...]", "key=value params or JSON. Examples: target=#my-button, target={text:Submit}, x=120, y=200")
       .option("--json", "Output raw JSON")
       .action(async (browserId: string, action: string, paramArgs: string[], options: { json?: boolean }) => {
         const params = parseParamArgs(paramArgs);
@@ -669,13 +670,63 @@ program
 // ── serve ──
 program
   .command("serve")
-  .description("Start the BrowserPowers core server (HTTP + WebSocket + MCP)")
+  .description("Start the BrowserPowers core server (HTTP + WebSocket + MCP). The server runs in the foreground; press Ctrl+C to stop.")
   .option("--pid-file <path>", "Path to write PID file for process management")
   .action(() => {
     // Serve mode is handled in index.ts, not here.
     // This command exists so --pid-file appears in --help output.
     console.log("To start the server, run: browserpowers serve");
     console.log("The server will start in the foreground. Press Ctrl+C to stop.");
+  });
+
+// ── help [topic] — comprehensive reference (overrides commander's default) ──
+//
+// Commander ships a built-in `help` that just prints `--help` output. We
+// override it with a richer reference that auto-generates from the
+// registered commander program + MCP tool catalog + v2 action enums. The
+// generated output is also reachable via the `help` topic in `help all`.
+
+program
+  .command("help [topic...]")
+  .description("Show the full help reference. No arg = full reference. `help <command>` (e.g. `help page.act`) deep-dives a command. `help <topic>` (e.g. `help page-read`) deep-dives a section. `help topics` lists available topics. `help commands` lists all commands.")
+  .action((topicParts?: string[]) => {
+    const topic = topicParts && topicParts.length > 0 ? topicParts.join(".") : undefined;
+    if (!topic) {
+      console.log(buildHelpIndex());
+      return;
+    }
+    if (topic === "topics") {
+      console.log(buildTopicHelp("topics"));
+      return;
+    }
+    if (topic === "commands") {
+      const names = getCommandNames(program);
+      console.log("# Available commands\n");
+      for (const n of names) console.log(`- \`${n}\``);
+      return;
+    }
+    // Recognised topics?
+    if (getTopics().includes(topic)) {
+      console.log(buildTopicHelp(topic));
+      return;
+    }
+    // Try MCP tool name first (e.g. `help page_act`), then commander
+    // command (e.g. `help page.act` or `help status`).
+    if (topic.includes(".") || /^[\w-]+$/.test(topic)) {
+      const toolHelp = buildToolHelp(topic);
+      if (!toolHelp.startsWith("No help available")) {
+        console.log(toolHelp);
+        return;
+      }
+      const cmdHelp = buildCommandHelp(program, topic);
+      if (!cmdHelp.startsWith("Unknown command")) {
+        console.log(cmdHelp);
+        return;
+      }
+    }
+    // Last resort: surface the available topics + commands.
+    console.log(`Unknown help target: "${topic}".\n`);
+    console.log(buildTopicHelp("topics"));
   });
 
 export function runCli(args: string[]): void {
