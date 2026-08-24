@@ -2,7 +2,7 @@
 node_type: architecture
 title: BrowserPowers — Core Server Architecture
 status: active
-updated: 2026-06-11
+updated: 2026-06-25
 tags: [core, architecture, nodejs, hono, websocket]
 links:
   depends_on: [../overview/product.md, ../spec/spec.md]
@@ -152,12 +152,16 @@ HonoRouter exposing:
 |---|---|---|
 | GET | `/browsers` | List all connected browsers |
 | GET | `/browsers/:id` | Get specific browser |
+| DELETE | `/browsers/:id` | Disconnect a browser |
 | GET | `/browsers/:id/capabilities` | Get browser capabilities |
 | POST | `/browsers/:id/execute` | Execute a tool on one browser (sync) |
 | POST | `/browsers/:id/execute-async` | Execute a tool on one browser (async, returns requestId) |
 | POST | `/execute-all` | Execute a tool on all browsers |
+| POST | `/execute-batch` | Execute multiple tools across browsers in parallel |
 | GET | `/browsers/:id/screenshot` | Screenshot convenience endpoint |
 | GET | `/results/:requestId` | Poll for async execution result |
+| GET | `/approvals` | List all pending approval requests |
+| DELETE | `/approvals/:id` | Cancel a pending approval request |
 | GET | `/health` | Server health |
 
 ### 9. MCP Adapter (`src/adapters/mcp.ts`)
@@ -183,15 +187,26 @@ Model Context Protocol server using streamable HTTP transport:
 **Meta tool**:
 - `help` — full system reference and workflow guides
 
-- Session management via `Map<sessionId, Transport>`
-- Supports multiple simultaneous MCP clients
-- Uses `zod` for input schema validation
+- Built on `@modelcontextprotocol/server` v2 — `createMcpHandler(buildMcpServer)` invokes the factory once per HTTP request (stateless per-request serving)
+- No sessions or transport state persist between requests; sequential/concurrent MCP clients cannot collide on a shared connection
+- Legacy 2025-era protocol clients are served under the SDK default `legacy: 'stateless'` posture; legacy GET (SSE stream) and DELETE (session teardown) answer 405
+- Uses `zod` v4 schemas (Standard Schema) for input schema validation
 
 ### 10. CLI Adapter (`src/adapters/cli.ts`)
 
 Commander.js program with commands:
 
 - `list`, `navigate <id> <url>`, `screenshot <id> [file]`, `content <id> [selector]`, `select <id>`, `page read <id> <action> [params...]`, `page act <id> <action> [params...]`, `page js <id> <code>`, `tabs <id>`, `exec <id> <tool> [params...]`, `exec-all <tool> [params...]`
+- `status` — Check daemon status, uptime, connected browsers
+- `stop` — Stop the running daemon
+- `disconnect <id>` — Disconnect a browser from the daemon
+- `capabilities <id>` — List capabilities for a specific browser
+- `approvals list` / `approvals cancel <requestId>` — Manage pending approvals
+- `config show` / `config path` — Show configuration
+- `init` — First-time setup wizard
+- `mcp-config [--client claude|cursor|generic]` — Generate MCP client config
+- `help [topic...]` — Full help reference (auto-generated from registered tools + commands)
+- Global flag: `--async` — Execute asynchronously across all tool-execution commands
 - All CLI commands are thin wrappers that call the REST API internally
 
 ### 11. Auth Middleware (`src/auth.ts`)

@@ -2,7 +2,7 @@
 node_type: spec
 title: BrowserPowers — Behavioral Specification
 status: active
-updated: 2026-06-11
+updated: 2026-06-25
 tags: [spec, websocket, mcp, rest-api, cli, permissions, configuration, auth]
 links:
   depends_on: [../overview/product.md, ../reference/glossary.md]
@@ -282,12 +282,13 @@ Sent by the core to command the extension to perform a tool call.
   "payload": {
     "requestId": "<uuid>",
     "tool": "tabs.create",
-    "params": { "url": "https://example.com" }
+    "params": { "url": "https://example.com" },
+    "commandMode": "sync"
   }
 }
 ```
 
-The extension MUST respond with either `result` or `error` using the same `requestId`.
+The `commandMode` field (`"sync"` | `"async"`) tells the extension whether to enrich responses (auto-snapshot on navigate, post-action diff on page.act). The extension MUST respond with either `result` or `error` using the same `requestId`.
 
 ##### heartbeat_ack
 
@@ -408,7 +409,7 @@ On reconnect, the extension MUST send a fresh `register` message.
 
 ### 2. MCP Tools
 
-The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport. The server registers 11 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `cookies`, `windows`, and `help`.
+The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport, served statelessly: every HTTP request is handled by a freshly constructed server instance, and no session state persists between requests. The server registers 11 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `cookies`, `windows`, and `help`.
 
 #### 2.1 Tool: `browsers`
 
@@ -487,7 +488,7 @@ Page Read is the unified tool for extracting information from a loaded page with
 | Property | Value |
 |---|---|
 | Description | Read page content without mutating it. Use `action` to specify what to read. |
-| Input | `{ browser_id: string, action: string, target?: Target, limit?: number, include_hidden?: boolean, name?: string }` |
+| Input | `{ browser_id: string, action: string, target?: Target, limit?: number, include_hidden?: boolean, name?: string, frameId?: number, frame_url?: string, frame_name?: string, compact?: boolean, timeout_ms?: number, mode?: "sync" \| "async" }` |
 | Output | ActionResult envelope with `data` containing read results |
 
 **Read actions:**
@@ -623,6 +624,34 @@ Return the entire document HTML (the literal `document.documentElement.outerHTML
 
 **Output**: `data` contains `{ html: string, length: number, originalLength: number, truncated?: boolean }`. Hard cap 5 MB; if exceeded, `truncated: true` and `html` is sliced. Includes the full document with `<html>`, `<head>`, `<body>`, all attributes. Verdict: `world: "isolated"`, `path: "isolated.fullHtml"`.
 
+###### `action: "summary"`
+
+Lightweight page overview — button count, form count, link count, content detection. No target needed.
+
+**Output**: `data` contains a summary object with counts and page overview.
+
+###### `action: "frames"`
+
+List all frames in the page with their URLs and names.
+
+**Output**: `data` contains `{ frames: [{ frameId: number, url: string, name?: string }] }`.
+
+###### `action: "generate_selector"`
+
+Generate ranked CSS selectors for a target element. Useful for finding the most robust selector.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (required) | Element to generate selectors for |
+
+**Output**: `data` contains `{ selectors: string[] }` — ranked by specificity and robustness.
+
+###### `action: "runtime_status"`
+
+Check the CDP attach state and runtime status for the current tab.
+
+**Output**: `data` contains `{ cdp: { attached: boolean, consoleCapture: { status: "ready" \| "not-attached", source: "cdp", bufferSize: number } } }`.
+
 #### 2.7 Tool: `page_act`
 
 Page Act is the unified tool for interacting with or mutating page elements. It uses an `action` discriminator to select the specific operation. Gated behind the `page.act` permission group.
@@ -630,7 +659,7 @@ Page Act is the unified tool for interacting with or mutating page elements. It 
 | Property | Value |
 |---|---|
 | Description | Interact with or mutate the page. Use `action` to specify what to do. |
-| Input | `{ browser_id: string, action: string, target?: Target, anchor?: string, value?: string, checked?: boolean, key?: string, direction?: string, amount?: number, timeout_ms?: number }` |
+| Input | `{ browser_id: string, action: string, target?: Target, anchor?: string, value?: string, checked?: boolean, key?: string, keys?: string[], direction?: string, amount?: number, timeout_ms?: number, frameId?: number, frame_url?: string, frame_name?: string, mode?: "sync" \| "async", condition?: string, text?: string, delay?: number, file_data?: string, file_name?: string, file_type?: string, x?: number, y?: number, response?: object, fields?: object[] }` |
 | Output | ActionResult envelope |
 
 **Target resolution order** (see §2.14 Structured Target for details):
@@ -752,12 +781,97 @@ Wait for an element to appear, or for a timeout.
 
 If a selector or anchor is provided, the extension MUST poll `document.querySelector(selector)` at 100ms intervals until a match is found or `timeout_ms` elapses. If neither is provided, the extension MUST simply wait `timeout_ms` milliseconds.
 
+###### `action: "type"`
+
+Type text character by character with configurable delay between keystrokes. Uses CDP `Input.insertText` after focusing the element.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target for the element |
+| `anchor` | string (optional) | Anchor ID from inspect |
+| `text` | string (required) | Text to type |
+| `delay` | number (optional) | Ms between keystrokes (default 30) |
+
+###### `action: "smart_click"`
+
+Click with automatic retry — scrolls element into view, waits for actionability, then clicks. Falls back through CDP → synthetic events.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target |
+| `anchor` | string (optional) | Anchor ID from inspect |
+
+###### `action: "fill_form"`
+
+Fill multiple form fields in one operation.
+
+| Field | Type | Description |
+|---|---|---|
+| `fields` | array (required) | Array of `{ anchor?, target?, value }` objects |
+
+###### `action: "upload"`
+
+Upload a file to a file input element.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target for the file input |
+| `anchor` | string (optional) | Anchor ID from inspect |
+| `file_data` | string (required) | Base64-encoded file content |
+| `file_name` | string (optional) | Upload file name |
+| `file_type` | string (optional) | Upload file MIME type |
+
+###### `action: "drag"`
+
+Drag an element to a target position.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target |
+| `anchor` | string (optional) | Anchor ID from inspect |
+| `x` | number (required) | Target X coordinate |
+| `y` | number (required) | Target Y coordinate |
+
+###### `action: "dblclick"`
+
+Double-click the element. Dispatches TWO press/release pairs with clickCount: 1 then 2.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target |
+| `anchor` | string (optional) | Anchor ID from inspect |
+
+###### `action: "hover"`
+
+Hover over an element.
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | Target (optional) | Structured target |
+| `anchor` | string (optional) | Anchor ID from inspect |
+
+###### `action: "dialog_override"`
+
+Override the next dialog (alert, confirm, prompt) to auto-accept or auto-dismiss.
+
+| Field | Type | Description |
+|---|---|---|
+| `response` | object (optional) | `{ confirm?: boolean, prompt?: string }` — response for confirm/prompt dialogs |
+
+###### `action: "dialog_respond"`
+
+Respond to a pending dialog.
+
+| Field | Type | Description |
+|---|---|---|
+| `response` | object (required) | `{ confirm?: boolean, prompt?: string }` |
+
 #### 2.8 Tool: `page_js`
 
 | Property | Value |
 |---|---|
 | Description | Execute arbitrary JavaScript code on the page — gated escape hatch. Use only when `page_read` and `page_act` cannot express the task. |
-| Input | `{ browser_id: string, code: string }` |
+| Input | `{ browser_id: string, code: string, frameId?: number, frame_url?: string, frame_name?: string, timeout_ms?: number, mode?: "sync" \| "async" }` |
 | Output | ActionResult envelope with `data.result` containing the return value of the executed code (which must be JSON-serializable) |
 
 > **Security**: This tool is gated behind the `page.execute` permission group (the old group name is preserved for backward compatibility). It MUST NOT be accessible if `page.execute` is set to `deny` or `ask` (without approval). It is intentionally the highest-risk tool in the system. The MCP tool name is `page_js`; internally it dispatches as tool `page.js` which maps to permission group `page.execute`.
@@ -798,7 +912,7 @@ If a selector or anchor is provided, the extension MUST poll `document.querySele
 | Input | `{ topic?: string }` |
 | Output | Formatted reference text |
 
-Available topics: `navigation`, `anchors`, `gates`. If no topic is provided, the complete system reference is returned.
+Available topics: `all`, `navigation`, `anchors`, `gates`, `page-read`, `page-act`, `page-js`, `visual`, `permissions`. If no topic is provided, the complete system reference is returned.
 
 #### 2.12 Legacy Aliases
 
@@ -1154,7 +1268,24 @@ Body: { tool: string, params?: object }
 → 500 { success: false, error: string }
 ```
 
-#### 3.4 Execute on All
+#### 3.4 Async Tool Execution
+
+```
+POST /api/browsers/:id/execute-async
+Body: { tool: string, params?: object }
+→ 200 { requestId: string, status: "queued" }
+→ 500 { success: false, error: string }
+```
+
+#### 3.5 Poll Async Result
+
+```
+GET /api/results/:requestId
+→ 200 { status: "pending" | "complete" | "error", result?: ToolResult }
+→ 500 { success: false, error: string }
+```
+
+#### 3.6 Execute on All
 
 ```
 POST /api/execute-all
@@ -1162,7 +1293,35 @@ Body: { tool: string, params?: object }
 → 200 { results: [{ browserId, tool, success, data?, error? }, ...] }
 ```
 
-#### 3.5 Screenshot Convenience
+#### 3.7 Execute Batch
+
+```
+POST /api/execute-batch
+Body: { commands: [{ browser_id?: string, browserId?: string, tool: string, params?: object }] }
+→ 200 { results: [{ browserId, tool, success, data?, error? }, ...] }
+```
+
+#### 3.8 Disconnect Browser
+
+```
+DELETE /api/browsers/:id
+→ 200 { success: true }
+→ 404 { error: "Browser not found" }
+→ 500 { error: "Failed to disconnect browser" }
+```
+
+#### 3.9 Approvals
+
+```
+GET /api/approvals
+→ 200 { approvals: [{ requestId, tool, browserId, requestedAt }] }
+
+DELETE /api/approvals/:id
+→ 200 { success: true, id }
+→ 404 { error: "Approval not found" }
+```
+
+#### 3.10 Screenshot Convenience
 
 ```
 GET /api/browsers/:id/screenshot
@@ -1170,14 +1329,14 @@ GET /api/browsers/:id/screenshot
 → 500 { error: string }
 ```
 
-#### 3.6 Health
+#### 3.11 Health
 
 ```
 GET /api/health
 → 200 { status: "ok", browsers: <count>, uptime: <seconds> }
 ```
 
-#### 3.7 CORS
+#### 3.12 CORS
 
 The REST API MUST allow all origins via CORS (`Access-Control-Allow-Origin: *`) to support browser extension and MCP client access.
 
@@ -1205,18 +1364,36 @@ The CLI is available via `browserpowers <command>` (or `pnpm run cli -- <command
 | `tabs <browserId>` | List tabs |
 | `exec <browserId> <tool> [params...]` | Execute any tool with JSON params |
 | `exec-all <tool> [params...]` | Execute a tool on all browsers |
+| `status` | Check daemon status, uptime, and connected browsers |
+| `stop` | Stop the running daemon |
+| `disconnect <browserId>` | Disconnect a browser from the daemon |
+| `capabilities <browserId>` | List capabilities for a specific browser |
+| `approvals list` | List all pending approval requests |
+| `approvals cancel <requestId>` | Cancel a pending approval request |
+| `config show` | Print current configuration |
+| `config path` | Print config file location |
 | `init` | Run the first-time setup wizard — creates config interactively |
 | `mcp-config [--client claude|cursor|generic]` | Generate MCP client configuration snippet |
+| `help [topic...]` | Show full help reference (auto-generated from registered tools + commands) |
 
 #### 4.2 CLI vs Server Mode
 
 ```
-browserpowers serve       # Start the server (default)
+browserpowers serve       # Start the server (default, foreground)
+browserpowers start       # Start daemon in background (no window, idempotent)
+browserpowers restart     # Stop + start daemon (no window)
+browserpowers stop        # Stop the daemon
 browserpowers cli <cmd>   # Run a single CLI command and exit
 browserpowers <cmd>       # Implicit CLI mode (auto-detected)
 ```
 
-If the first argument is not `serve` or `start`, the CLI assumes CLI mode and runs the command directly.
+If the first argument is not `serve`, `start`, `restart`, or `stop`, the CLI assumes CLI mode and runs the command directly.
+
+**Global flags:**
+
+| Flag | Description |
+|---|---|
+| `--async` | Execute asynchronously — print requestId and exit immediately (applies to all tool-execution commands) |
 
 ---
 
@@ -1421,8 +1598,10 @@ Stored in `chrome.storage.local` under key `settings`:
 |---|---|---|
 | `browserName` | generated unique name | Human-readable name (generated on first init until user overrides it) |
 | `coreUrl` | `"ws://127.0.0.1:4199/ws"` | Core WebSocket URL |
+| `authKey` | `""` | API key for servers with authentication enabled |
 | `approvalNotificationsEnabled` | `true` | Show native approval notifications for pending requests |
 | `permissions` | see below | Per-group permission levels |
+| `pageSitePermissions` | see §5.4 | Per-domain page tool permission overrides |
 
 > The same settings and approvals UI is exposed in both the popup and the options page.
 > The surfaces are intentionally duplicated for convenience; both read and write the same stored state,
@@ -1435,7 +1614,7 @@ Stored in `chrome.storage.local` under key `settings`:
   "tabs": "allow",
   "page.read": "allow",
   "page.act": "ask",
-  "page.execute": "deny",
+  "page.execute": "ask",
   "screenshots": "allow",
   "history.read": "allow",
   "history.delete": "ask",
@@ -1446,7 +1625,8 @@ Stored in `chrome.storage.local` under key `settings`:
   "network": "deny",
   "storage": "deny",
   "windows": "allow",
-  "cookies": "ask"
+  "cookies": "ask",
+  "self": "allow"
 }
 ```
 
@@ -1510,7 +1690,7 @@ ServerConfig { port, host, mcp, rest, ws, gates, browsers }
 | Port already in use | Node.js `EADDRINUSE` error — server fails to start |
 | Browser reconnects rapidly | Each connection is fresh; old browser ID is abandoned |
 | Heartbeat delayed but within limit | OK — only triggers cleanup after 2× interval |
-| Multiple MCP clients | Each gets a separate session via streamable HTTP transport |
+| Multiple MCP clients | Served statelessly — each request gets a fresh server instance, so sequential/concurrent clients never share state |
 
 ---
 

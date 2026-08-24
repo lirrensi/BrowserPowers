@@ -2,7 +2,7 @@
 node_type: architecture
 title: BrowserPowers — Browser Extension Architecture
 status: active
-updated: 2026-06-11
+updated: 2026-06-25
 tags: [extension, architecture, wxt, mv3, chrome-extension]
 links:
   depends_on: [../overview/product.md, ../spec/spec.md]
@@ -152,6 +152,7 @@ Thin wrapper around `chrome.storage.local` with safe defaults.
 interface ExtensionSettings {
   browserName: string;                     // Default: generated unique name
   coreUrl: string;                         // Default: "ws://127.0.0.1:4199/ws"
+  authKey: string;                         // Default: "" — API key for authenticated servers
   approvalNotificationsEnabled: boolean;   // Default: true
   permissions: Record<string, PermissionLevel>;
   pageSitePermissions: Record<PagePermissionGroup, SitePermissionLists>;  // Site-level page tool overrides
@@ -182,6 +183,7 @@ interface ExtensionSettings {
 | storage | deny | |
 | windows | allow | |
 | cookies | ask | |
+| self | allow | Extension self-management (e.g. self.reload) |
 
 **Exports**:
 
@@ -529,6 +531,7 @@ The help module reads the actual registered commander program (`Command.commands
 interface ExtensionSettings {
   browserName: string;
   coreUrl: string;
+  authKey: string;
   approvalNotificationsEnabled: boolean;
   permissions: {
     tabs: "allow" | "ask" | "deny";
@@ -536,13 +539,17 @@ interface ExtensionSettings {
     "page.act": "allow" | "ask" | "deny";
     "page.execute": "allow" | "ask" | "deny";
     screenshots: "allow" | "ask" | "deny";
-    history: "allow" | "ask" | "deny";
-    bookmarks: "allow" | "ask" | "deny";
+    "history.read": "allow" | "ask" | "deny";
+    "history.delete": "allow" | "ask" | "deny";
+    "bookmarks.read": "allow" | "ask" | "deny";
+    "bookmarks.modify": "allow" | "ask" | "deny";
+    "bookmarks.delete": "allow" | "ask" | "deny";
     downloads: "allow" | "ask" | "deny";
     network: "allow" | "ask" | "deny";
     storage: "allow" | "ask" | "deny";
     windows: "allow" | "ask" | "deny";
     cookies: "allow" | "ask" | "deny";
+    self: "allow" | "ask" | "deny";
   };
   pageSitePermissions: Record<PagePermissionGroup, SitePermissionLists>;
 }
