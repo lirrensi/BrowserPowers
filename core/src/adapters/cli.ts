@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { loadConfig } from "../config.js";
 import { stringify } from "yaml";
 import { buildHelpIndex, buildCommandHelp, buildTopicHelp, getCommandNames, getTopics, buildToolHelp } from "./help-text.js";
+import { VERSION } from "../version.js";
 
 const config = loadConfig();
 const BASE = `http://${config.host}:${config.port}${config.rest.path}`;
@@ -67,7 +68,7 @@ const program = new Command();
 program
   .name("browserpowers")
   .description("CLI for multi-browser agent control")
-  .version("1.0.0")
+  .version(VERSION)
   .option("--async", "Execute asynchronously — print requestId and exit immediately");
 
 // ── Helper: auto-detect target type from shorthand string (#028) ──
