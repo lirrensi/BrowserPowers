@@ -1,10 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+// FILE: core/src/adapters/mcp.ts
+// PURPOSE: Expose BrowserPowers commands as MCP tools over a stateless per-request HTTP endpoint.
+// OWNS: MCP tool registrations (11 tools), tool result formatting, help meta-tool, endpoint mounting.
+// EXPORTS: mountMcpServer(app: Hono): void
+// DOCS: docs/architecture/core.md (MCP section), docs/spec/spec.md
+// NOTES: Built on @modelcontextprotocol/server v2 — createMcpHandler(buildMcpServer) constructs a
+//        fresh McpServer per HTTP request, so double-connect across sessions is structurally impossible.
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Hono } from "hono";
 import { commandService } from "../command-service/service.js";
+import { VERSION } from "../version.js";
 import { loadConfig } from "../config.js";
 import { saveScreenshotToTemp } from "../screenshot.js";
 import { buildHelpIndex, buildTopicHelp, buildToolHelp } from "./help-text.js";
@@ -723,21 +728,16 @@ function buildHelpTopic(topic: "all" | "navigation" | "anchors" | "gates" | "pag
 // ============================================================
 
 /**
- * Creates the MCP server and mounts it on the Hono app at config.mcp.path.
- * Uses streamable HTTP transport — supports multiple simultaneous clients.
- * Each client gets its own session, but all share the same McpServer tools.
+ * Builds a fresh McpServer instance with all tool registrations.
+ * Invoked once per HTTP request by createMcpHandler (stateless serving),
+ * so no transport state is ever shared between client sessions.
  */
-export function mountMcpServer(app: Hono): void {
-  if (!config.mcp.enabled) {
-    console.log("[mcp] MCP endpoint disabled in config");
-    return;
-  }
-
-  // MCP Server — tool definitions live here (shared across all sessions)
+function buildMcpServer(): McpServer {
+  // MCP Server — tool definitions live here
   const mcpServer = new McpServer(
     {
       name: "browserpowers",
-      version: "1.0.0",
+      version: VERSION,
     },
     {
       instructions: [
@@ -1124,83 +1124,24 @@ export function mountMcpServer(app: Hono): void {
     },
   );
 
-  // ── Session management (streamable HTTP) ──
+  return mcpServer;
+}
 
-  // Map of sessionId → transport (for stateful sessions)
-  const transports = new Map<string, WebStandardStreamableHTTPServerTransport>();
+/**
+ * Mounts the MCP endpoint on the Hono app at config.mcp.path.
+ * Stateless per-request serving: createMcpHandler invokes buildMcpServer()
+ * once per request, so there are no sessions or transports to manage and
+ * sequential/concurrent clients can never collide on a shared connection.
+ * Legacy GET (SSE stream) and DELETE (session teardown) answer 405
+ * (spec-sanctioned under the default legacy: 'stateless' posture).
+ */
+export function mountMcpServer(app: Hono): void {
+  if (!config.mcp.enabled) {
+    console.log("[mcp] MCP endpoint disabled in config");
+    return;
+  }
 
-  const mcpPath = config.mcp.path;
-
-  // POST — all MCP requests come through here
-  app.post(mcpPath, async (c) => {
-    const req = c.req.raw;
-    const sessionId = req.headers.get("mcp-session-id");
-
-    if (sessionId && transports.has(sessionId)) {
-      // Reuse existing transport for this session
-      const transport = transports.get(sessionId)!;
-      const res = await transport.handleRequest(req);
-      return res;
-    }
-
-    // New initialization — check if this is an initialize request
-    const body = await req.clone().json().catch(() => null);
-
-    if (sessionId && !transports.has(sessionId)) {
-      // Session ID provided but not found — server was restarted
-      return c.json({
-        error: "Session not found",
-        code: "SESSION_STALE",
-        message: "The server was restarted. The client must send a new initialize request.",
-      }, 410);
-    }
-
-    if (!body || !isInitializeRequest(body)) {
-      return c.json({ error: "Invalid MCP request — expected initialize request for new session" }, 400);
-    }
-
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sid) => {
-        transports.set(sid, transport);
-        console.log(`[mcp] New session initialized: ${sid}`);
-      },
-    });
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        transports.delete(transport.sessionId);
-        console.log(`[mcp] Session closed: ${transport.sessionId}`);
-      }
-    };
-
-    await mcpServer.connect(transport);
-    const res = await transport.handleRequest(req);
-    return res;
-  });
-
-  // DELETE — session cleanup (clients send DELETE to close sessions)
-  app.delete(mcpPath, async (c) => {
-    const sessionId = c.req.header("mcp-session-id");
-    if (sessionId && transports.has(sessionId)) {
-      const transport = transports.get(sessionId)!;
-      await transport.close();
-      transports.delete(sessionId);
-      console.log(`[mcp] Session deleted: ${sessionId}`);
-    }
-    return c.body(null, 204);
-  });
-
-  // GET — SSE stream (for server-initiated notifications)
-  app.get(mcpPath, async (c) => {
-    const sessionId = c.req.header("mcp-session-id");
-    if (sessionId && transports.has(sessionId)) {
-      const transport = transports.get(sessionId)!;
-      const res = await transport.handleRequest(c.req.raw);
-      return res;
-    }
-    return c.json({ error: "No active session" }, 400);
-  });
-
-  console.log(`[mcp] MCP server mounted at http://localhost:${config.port}${mcpPath}`);
+  const handler = createMcpHandler(buildMcpServer);
+  app.all(config.mcp.path, (c) => handler.fetch(c.req.raw));
+  console.log(`[mcp] MCP server mounted at http://localhost:${config.port}${config.mcp.path}`);
 }
