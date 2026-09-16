@@ -4,6 +4,65 @@ All notable changes to BrowserPowers are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-09-17
+
+Agent skill, human-loop, observation/interaction depth, and a two-layer test
+story — all verified live against a real Edge (`pnpm test:live` 17/17).
+
+### Added
+- **Agent skill** (`skill/browserpowers/SKILL.md`): workflow, text-first
+  targeting, WSL-safe screenshot rules, approvals, human steps, error recovery —
+  plus a full **CLI equivalents table** (every MCP tool mapped to its
+  `browserpowers` command).
+- **Human-loop, no borrow** (`request_help`, `human.helpStatus`): OS
+  notification with Continue/Cancel, `completion_criteria` URL auto-complete,
+  `continued/completed/cancelled/timed_out` envelopes. Termination-proof by
+  design — the extension answers pending immediately and the core polls on its
+  own clock, so service-worker restarts mid-wait can't strand the agent.
+  CLI: `browserpowers request-help`.
+- **Observation hardening**: per-tab ref generations (every inspect replaces the
+  map), `cursor`/`next_cursor` continuation, `max_tokens` budget, `snapshot`
+  cheap-tree alias.
+- **Interaction hardening**: native `wheel`, element-only `scroll_to` with
+  visible bounds, verified `focus`/`blur`, honest `FILL_VALUE_MISMATCH`
+  (read-and-correct-diff, never blind refill).
+- **Canvas clicks** (`visual_click` + `capture_id`): single-use screenshot-bound
+  clicks in ORIGINAL PNG coords with generation guards.
+- **Screenshots**: MCP returns filePath AND inline image (WSL/host-split safe),
+  `overlay`/`full_page`/`ref` passthrough, CDP renderer fallback for readback
+  failures.
+- **Record lite** (`record start|stop|status`, CLI + MCP): redacted op buffer +
+  VOM states → `trace.json`; refuses banking/SSO/password-manager pages.
+- **Audit read API** (redacted by construction): `GET/DELETE /api/audit`,
+  `browserpowers audit list|show|rm`, origin-only URLs, 30-day retention.
+- **Test story**: `pnpm test:safe` (mocked, no browser, plus a static
+  non-destructive scan) and `pnpm test:live` (isolated daemon + temp Edge
+  profile + localhost fixtures, 17 cases, auto-teardown).
+  `BROWSERPOWERS_HOME` shared-home override, `browserpowers doctor`,
+  `docs/testing.md`, `docs/sandboxed-agents.md`.
+- Shipped `icon-128.png` notification/extension icon (`pnpm icon` regenerates it).
+
+### Changed
+- `page.read` actions: `snapshot`; `page.act` actions: `scroll_to`, `wheel`,
+  `focus`, `blur`, `visual_click`; `screenshot`: `ref`, `full_page`.
+- `status` shows heartbeat staleness, pending approvals, uptime, `--json`.
+- Extension capabilities: `human.*`, `record.*`; new `human`/`record` gate groups.
+
+### Fixed
+- **Route errors swallowed**: `routeExecute` now surfaces ActionResult
+  `message` + `[errorCode]` instead of "success:false with no error message".
+- **Inspect zeroed every anchor map**: a value-level `|` (bitwise OR) where a
+  type-level `| undefined` belonged coerced the anchor array to `0` — found by
+  live test, not mocks.
+- **Anchor selectors that match nothing**: placeholder/text-targeted anchors
+  got synthetic `[data-bp-anchor=...]` selectors no page ever sets. Content now
+  returns a working `cssPath` per anchor (`#id` wins, else nth-of-type chain).
+- **Approval/human notifications never appeared**: referenced icon file never
+  shipped and data-URL icons are rejected by Chromium — now a real PNG.
+- Housekeeping from COMPLAINTS.md (not committed): dropped the deprecated
+  `pnpm.onlyBuiltDependencies` (already covered by `allowBuilds`; warning gone),
+  documented workspace-root-relative vitest filters; `get-port` already declared.
+
 ## [1.4.0] — 2026-08-24
 
 ### Fixed
