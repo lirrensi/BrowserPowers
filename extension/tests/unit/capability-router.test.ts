@@ -106,4 +106,18 @@ describe("capability-router", () => {
     expect(result.data).toHaveProperty("name", "test");
     expect(result.data).toHaveProperty("value", "val");
   });
+
+  it("surfaces ActionResult failure messages instead of a shrug", async () => {
+    // sendMessage → undefined simulates a dead content script; inspect must
+    // report WHY (message + code), not "success:false with no error message".
+    const { routeExecute } = await import("../../src/capability-router.js");
+    const result = await routeExecute({
+      requestId: "test-6",
+      tool: "page.read",
+      params: { action: "inspect" },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Content script not available");
+    expect(result.error).not.toContain("no error message");
+  });
 });

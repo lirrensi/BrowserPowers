@@ -19,7 +19,9 @@ export type ToolGroup =
   | "downloads"
   | "network"
   | "storage"
-  | "windows";
+  | "windows"
+  | "human"
+  | "record";
 
 /** Permissions map: toolgroup → permission level */
 export type PermissionProfile = Partial<Record<ToolGroup, Permission>>;

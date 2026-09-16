@@ -4,7 +4,25 @@ import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import type { Permission, ServerConfig } from "./types.js";
 
-const CONFIG_DIR = join(homedir(), ".config", "browserpowers");
+/**
+ * Home override for sandboxed/WSL-split setups (equiv BSK_HOME).
+ * When BROWSERPOWERS_HOME is set, config + audit + pid all live under it,
+ * so host and sandbox (or Win + WSL sharing a mount) see the SAME dir.
+ * Same text is NOT enough — must be same underlying mount.
+ */
+export function getHomeDir(): string {
+  const override = process.env.BROWSERPOWERS_HOME?.trim();
+  if (override) return override;
+  return homedir();
+}
+
+function configDir(): string {
+  const override = process.env.BROWSERPOWERS_HOME?.trim();
+  if (override) return join(override, "config");
+  return join(homedir(), ".config", "browserpowers");
+}
+
+const CONFIG_DIR = configDir();
 const CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
 
 const DEFAULT_CONFIG: ServerConfig = {
@@ -89,6 +107,13 @@ export function saveConfig(config: ServerConfig): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, stringify(config), "utf-8");
   chmodSync(CONFIG_PATH, 0o600);
+}
+
+/** Daemon PID file path (respects BROWSERPOWERS_HOME for shared-mount setups). */
+export function getPidPath(): string {
+  const override = process.env.BROWSERPOWERS_HOME?.trim();
+  if (override) return join(override, "daemon.pid");
+  return join(homedir(), ".browserpowers", "daemon.pid");
 }
 
 export { CONFIG_DIR, CONFIG_PATH };

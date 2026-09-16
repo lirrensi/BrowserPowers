@@ -73,6 +73,8 @@ function createDefaultSettings(): ExtensionSettings {
       storage: "deny",
       windows: "allow",
       cookies: "ask",
+      human: "allow",
+      record: "allow",
       self: "allow",
     },
     pageSitePermissions: createDefaultPageSitePermissions(),

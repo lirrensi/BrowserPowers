@@ -1,0 +1,14 @@
+{
+  "$schema": "../../schemas/case.schema.json",
+  "schemaVersion": 1,
+  "id": "readable-extract",
+  "title": "Readable extraction returns article text",
+  "suite": "core",
+  "tags": ["read", "readable"],
+  "seed": 5,
+  "fixture": { "startPath": "https://example.com" },
+  "prompts": { "en": "Extract the article text" },
+  "coverage": ["page.read.readable"],
+  "assertions": { "site": [], "response": ["Example"], "adapter": [] },
+  "smoke": { "steps": [{ "action": "readable" }] }
+}

@@ -1,53 +1,54 @@
 {
-    "name": "browserpowers",
-    "version": "1.4.0",
-    "private": false,
-    "description": "Multi-browser LLM agent control — core server + browser extension",
-    "author": "lirrensi",
-    "license": "MIT",
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/lirrensi/BrowserPowers.git"
-    },
-    "bugs": {
-        "url": "https://github.com/lirrensi/BrowserPowers/issues"
-    },
-    "homepage": "https://github.com/lirrensi/BrowserPowers#readme",
-    "keywords": [
-        "browser-automation",
-        "llm",
-        "ai-agent",
-        "multi-browser",
-        "mcp"
-    ],
-    "scripts": {
-        "dev": "pnpm --parallel -r dev",
-        "dev:core": "pnpm --filter browserpowers dev",
-        "dev:ext": "pnpm --filter browserpowers-extension dev",
-        "dev:ext:chrome": "pnpm --filter browserpowers-extension dev:chrome",
-        "dev:ext:firefox": "pnpm --filter browserpowers-extension dev:firefox",
-        "build": "pnpm --parallel -r build",
-        "test": "vitest run",
-        "predev": "pnpm build",
-        "prepare": "pnpm --filter browserpowers-extension prepare",
-        "clean": "pnpm --parallel -r clean",
-        "test:core": "vitest run --project core",
-        "test:ext": "vitest run --project extension",
-        "test:manual": "node manual-tests/run-all.mjs",
-        "smoke": "node manual-tests/test-smoke.mjs"
-    },
-    "devDependencies": {
-        "vitest": "^4.1.9",
-        "ws": "^8.21.0"
-    },
-    "pnpm": {
-        "onlyBuiltDependencies": [
-            "esbuild",
-            "spawn-sync"
-        ]
-    },
-    "engines": {
-        "node": ">=20",
-        "pnpm": ">=9"
-    }
+  "name": "browserpowers",
+  "version": "1.4.0",
+  "private": false,
+  "description": "Multi-browser LLM agent control — core server + browser extension",
+  "author": "lirrensi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lirrensi/BrowserPowers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lirrensi/BrowserPowers/issues"
+  },
+  "homepage": "https://github.com/lirrensi/BrowserPowers#readme",
+  "keywords": [
+    "browser-automation",
+    "llm",
+    "ai-agent",
+    "multi-browser",
+    "mcp"
+  ],
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "dev:core": "pnpm --filter browserpowers dev",
+    "dev:ext": "pnpm --filter browserpowers-extension dev",
+    "dev:ext:chrome": "pnpm --filter browserpowers-extension dev:chrome",
+    "dev:ext:firefox": "pnpm --filter browserpowers-extension dev:firefox",
+    "build": "pnpm --parallel -r build",
+    "test": "vitest run",
+    "predev": "pnpm build",
+    "prepare": "pnpm --filter browserpowers-extension prepare",
+    "clean": "pnpm --parallel -r clean",
+    "test:core": "vitest run --project core",
+    "test:ext": "vitest run --project extension",
+    "test:manual": "node manual-tests/run-all.mjs",
+    "smoke": "node manual-tests/test-smoke.mjs",
+    "eval": "node evals/browser/cli.mjs validate",
+    "eval:list": "node evals/browser/cli.mjs list",
+    "eval:coverage": "node evals/browser/cli.mjs coverage",
+    "eval:smoke": "node evals/browser/cli.mjs smoke",
+    "test:safe": "node scripts/test-safe.mjs",
+    "test:live": "node scripts/test-live.mjs",
+    "icon": "node scripts/make-icon.mjs"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11",
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  }
 }

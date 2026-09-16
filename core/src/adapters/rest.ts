@@ -126,10 +126,19 @@ restApp.post("/execute-batch", async (c) => {
 // ── Screenshot convenience endpoint ──
 
 // GET /api/browsers/:id/screenshot — take a screenshot (accepts UUID or name)
+// Query: ?overlay=none|labels|coords|both|anchors_only&overlay_limit=50&full_page=true
+// Returns { base64, format, overlay, ... } inline — WSL/host-safe (no FS dependency).
 restApp.get("/browsers/:id/screenshot", async (c) => {
   const browserId = resolveBrowserId(c.req.param("id"));
   if (!browserId) return c.json({ error: "Browser not found" }, 500);
-  const result = await commandService.execute(browserId, "screenshots.capture", {});
+  const overlay = c.req.query("overlay");
+  const overlay_limit = c.req.query("overlay_limit");
+  const full_page = c.req.query("full_page");
+  const params: Record<string, unknown> = {};
+  if (overlay) params.overlay = overlay;
+  if (overlay_limit) params.overlay_limit = Number(overlay_limit);
+  if (full_page) params.full_page = full_page === "true" || full_page === "1";
+  const result = await commandService.execute(browserId, "screenshots.capture", params);
   if (!result.success) {
     return c.json({ error: result.error }, 500);
   }
@@ -153,6 +162,32 @@ restApp.delete("/approvals/:id", async (c) => {
     return c.json({ error: "Approval not found" }, 404);
   }
   return c.json({ success: true, id });
+});
+
+// ── Audit (redacted read API) ──
+restApp.get("/audit", async (c) => {
+  const { listAudits, auditStats } = await import("../audit.js");
+  return c.json({ ...(await auditStats()), files: listAudits() });
+});
+restApp.get("/audit/:file", async (c) => {
+  const { getAuditEntries } = await import("../audit.js");
+  const offset = Number(c.req.query("offset") ?? 0) || 0;
+  const limit = Math.min(Number(c.req.query("limit") ?? 100) || 100, 500);
+  try {
+    return c.json(await getAuditEntries(c.req.param("file"), offset, limit));
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+});
+restApp.delete("/audit/:file", async (c) => {
+  const { deleteAudit } = await import("../audit.js");
+  try {
+    const ok = deleteAudit(c.req.param("file"));
+    if (!ok) return c.json({ error: "Audit file not found" }, 404);
+    return c.json({ success: true });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
 });
 
 // ── Health ──

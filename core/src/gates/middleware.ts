@@ -53,6 +53,15 @@ const TOOL_TO_GROUP: Record<string, ToolGroup> = {
   "page.read": "page.read",
   "page.act": "page.act",
   "page.js": "page.execute",
+
+  // ── Human-loop (no borrow, dedicated automation browser) ──
+  "human.requestHelp": "human",
+  "human.helpStatus": "human",
+
+  // ── Record lite (trace.json textbook) ──
+  "record.start": "record",
+  "record.stop": "record",
+  "record.status": "record",
 };
 
 export function checkGate(
@@ -66,6 +75,9 @@ export function checkGate(
     // Unknown tool — allow by default (browser extension declared it as a capability)
     return { allowed: true, mode: "allow" };
   }
+
+  // Human-loop is the human step itself — never gate it (avoids "approval to ask for help").
+  if (group === "human") return { allowed: true, mode: "allow" };
 
   const permission = browserPermissions[group] ?? config.gates.defaultPermission;
 

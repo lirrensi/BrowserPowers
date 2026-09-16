@@ -26,15 +26,17 @@ export interface StoredAnchor {
 }
 
 const tabAnchors = new Map<number, Map<string, AnchorEntry>>();
+const tabGenerations = new Map<number, number>();
 
 /**
  * Store a batch of anchors for a given tab + documentId.
+ * Bumps the per-tab generation — every inspect replaces the ref map.
  */
 export function setAnchors(
   tabId: number,
   documentId: string,
   anchors: Array<{ anchor: string; target: Target; selector: string; shadowPath?: string[] }>,
-): void {
+): number {
   const map = new Map<string, AnchorEntry>();
   for (const a of anchors) {
     map.set(a.anchor, {
@@ -46,6 +48,9 @@ export function setAnchors(
     });
   }
   tabAnchors.set(tabId, map);
+  const gen = (tabGenerations.get(tabId) ?? 0) + 1;
+  tabGenerations.set(tabId, gen);
+  return gen;
 }
 
 /**
@@ -74,6 +79,14 @@ export function getDocumentId(tabId: number): string | null {
   if (!map || map.size === 0) return null;
   // All entries in a batch have the same documentId — grab from first
   return map.values().next().value?.documentId ?? null;
+}
+
+/**
+ * Get the current ref generation for a tab (bumps on every inspect).
+ * Used to guard canvas capture_id + detect stale maps.
+ */
+export function getGeneration(tabId: number): number {
+  return tabGenerations.get(tabId) ?? 0;
 }
 
 /**

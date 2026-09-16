@@ -30,6 +30,7 @@ import {
   // Act actions — resolve-and-locate (used by both `bp:act` and `bp:resolve`)
   clickElement,
   fillElement,
+  focusElementResolve,
   dblclickElement,
   hoverElement,
   typeText,
@@ -476,6 +477,8 @@ async function handleResolve(params: Record<string, unknown>): Promise<ActResult
       if (value === undefined) return { success: false, message: "No value provided" };
       return fillElement(el, value, anchor);
     }
+    case "focus":
+      return focusElementResolve(el, anchor);
     default:
       return { success: false, message: `Unknown resolve action: ${action}`, errorCode: "UNKNOWN_ACTION" };
   }

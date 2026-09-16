@@ -32,6 +32,7 @@ const mockChrome = {
     session: {
       get: vi.fn().mockResolvedValue({}),
       set: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined),
     },
   },
   action: {
@@ -48,6 +49,7 @@ const mockChrome = {
   },
   alarms: {
     create: vi.fn(),
+    clear: vi.fn().mockResolvedValue(true),
     onAlarm: { addListener: vi.fn() },
   },
   windows: {

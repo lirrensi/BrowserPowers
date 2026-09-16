@@ -31,16 +31,16 @@ import type { Command } from "commander";
 // ── Page action enums (mirrored from extension/src/v2) ────────────────
 
 export const PAGE_READ_ACTIONS = [
-  "inspect", "content", "text", "html", "attr", "meta", "forms", "count",
+  "inspect", "snapshot", "content", "text", "html", "attr", "meta", "forms", "count",
   "select", "summary", "frames", "generate_selector", "console",
   "runtime_status", "readable", "full_html",
 ] as const;
 
 export const PAGE_ACT_ACTIONS = [
-  "click", "fill", "check", "select_option", "press", "scroll", "submit",
+  "click", "fill", "check", "select_option", "press", "scroll", "scroll_to", "wheel", "focus", "blur", "submit",
   "wait_for", "type", "smart_click", "fill_form", "upload", "drag",
   "dblclick", "hover", "dialog_override", "dialog_respond",
-  "click_at", "dblclick_at", "hover_at",
+  "click_at", "dblclick_at", "hover_at", "visual_click",
 ] as const;
 
 // ── MCP tool catalog ───────────────────────────────────────────────────
@@ -65,11 +65,13 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
   {
     name: "screenshot",
     group: "browser-management",
-    description: "Capture a screenshot of the active tab in a browser. Supports `overlay` for annotated visual layer.",
+    description: "Capture a screenshot of the active tab. Returns filePath (core FS) + inline image (WSL/host-safe). Supports overlay and full_page.",
     params: `- browser_id or browser_name (one required)
 - overlay (string, optional): "none" | "labels" | "coords" | "both" | "anchors_only"
 - overlay_limit (number, optional): Max anchors to draw (default 50)
-- overlay_color_by_type (boolean, optional): Color boxes by tag (default true)`,
+- overlay_color_by_type (boolean, optional): Color boxes by tag (default true)
+- full_page (boolean, optional): Attempt CDP full-page capture (captureBeyondViewport)
+- max_inline_bytes (number, optional): Inline first N base64 chars in text (default 0, image block always sent)`,
   },
   {
     name: "tabs",
@@ -120,6 +122,22 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     group: "browser-state",
     description: "Manage browser windows (list, create, focus, close).",
     actions: ["list", "create", "focus", "close"],
+  },
+  {
+    name: "request_help",
+    group: "human",
+    description: "Ask human to complete in-page step (login/CAPTCHA/OTP/confirm). No borrow — dedicated browser.",
+    params: `- browser_id or browser_name (one required)
+- prompt (string, required): Precise instruction
+- target/anchor (optional): Element context
+- timeout_ms (optional): 10000-600000 default 300000
+- completion_criteria (optional): { url_contains?, url_matches? }`,
+  },
+  {
+    name: "record",
+    group: "record",
+    description: "Record ops into trace.json textbook (start/stop/status). Never banking/SSO.",
+    actions: ["start", "stop", "status"],
   },
   {
     name: "help",
@@ -416,6 +434,9 @@ function quickReference(): string {
     "",
     "### MCP Tools (consumed via MCP clients)",
     ...tools,
+    "",
+    "### Human-loop",
+    "- `request_help({ prompt })` — Ask human to do login/CAPTCHA/OTP/confirm (no borrow, walk-away browser)",
   ].join("\n");
 }
 
@@ -427,7 +448,8 @@ function permissionTable(): string {
     "| `page.read` | `allow` | inspect, content, text, html, attr, meta, forms, count, select, summary, readable, full_html |",
     "| `page.act` | `ask` | click, fill, check, select_option, press, scroll, submit, type, click_at, dblclick_at, hover_at, … |",
     "| `page.execute` | `deny` | page.js (gated escape hatch) |",
-    "| `screenshots` | `allow` | capture |",
+    "| `screenshots` | `allow` | capture (overlay, full_page) |",
+    "| `human` | `allow` | requestHelp (login/CAPTCHA/OTP/confirm, no borrow) |",
     "| `history` | `deny` | search, delete |",
     "| `bookmarks` | `deny` | list, create, remove |",
     "| `downloads` | `deny` | search, open |",
@@ -529,8 +551,10 @@ function gateModel(): string {
     "- **`page.execute` / `page_js`** — gated escape hatch; default deny.",
     "- **`page.act`** — default `ask`; user approves each invocation in the extension popup.",
     "- **`cookies` / `windows`** — gated at the group level (one gate for the whole group).",
+    "- **`human.requestHelp`** — always `allow` (no gate); it *is* the human step for login/CAPTCHA/OTP/confirm.",
     "",
     "Pending approvals are listed via `approvals list` (CLI) or in the extension popup.",
+    "After human help (`continued`/`completed`), re-inspect — refs are stale.",
   ].join("\n");
 }
 
@@ -556,7 +580,8 @@ function actionReference(toolName: "page.read" | "page.act", actions: readonly s
 function actionOneLiner(tool: "page.read" | "page.act", action: string): string {
   const m: Record<string, Record<string, string>> = {
     "page.read": {
-      inspect: "Return a tree of interactable elements with anchor IDs",
+      inspect: "Return a tree of interactable elements with anchor IDs (+generation/cursor/next_cursor)",
+      snapshot: "Static compact tree alias (cheap, limit 30) — prefer inspect for fresh refs",
       content: "Return the page's visible text",
       text: "Return text of elements matching a CSS selector",
       html: "Return outerHTML of elements matching a CSS selector",
@@ -575,11 +600,15 @@ function actionOneLiner(tool: "page.read" | "page.act", action: string): string 
     },
     "page.act": {
       click: "Click the element (CDP `Input.dispatchMouseEvent`)",
-      fill: "Set an input value (CDP `Runtime.evaluate` in main world)",
+      fill: "Set an input value (CDP `Runtime.evaluate` in main world, honest FILL_VALUE_MISMATCH)",
       check: "Toggle a checkbox/radio",
       select_option: "Select a `<select>` option by value or label",
       press: "Press a key on a focused element (CDP `Input.dispatchKeyEvent`)",
-      scroll: "Scroll the page or scroll to an element",
+      scroll: "Scroll the page (up/down) — for element use scroll_to",
+      scroll_to: "Scroll element into view, returns visible bounds (partial ok, not occlusion-tested)",
+      wheel: "Native wheel input (delta_x/delta_y, one nonzero) at target or viewport centre",
+      focus: "Focus element via CDP with verification",
+      blur: "Remove focus via Runtime.evaluate",
       submit: "Submit a form",
       wait_for: "Wait for an element/condition/URL",
       type: "Type text into a focused element (CDP `Input.insertText`)",
@@ -588,12 +617,13 @@ function actionOneLiner(tool: "page.read" | "page.act", action: string): string 
       upload: "Upload a file to a file input",
       drag: "Drag an element to (x, y) — synthetic",
       dblclick: "Double-click the element (CDP — two press/release pairs)",
-      hover: "Hover the element (CDP `Input.dispatchMouseEvent` mouseMoved)",
+      hover: "Hover the element (CDP `Input.dispatchMouseEvent` mouseMoved, latch reasserted)",
       dialog_override: "Install dialog interceptors",
       dialog_respond: "Set the next dialog response",
       click_at: "Click at literal viewport coords (CDP — no resolution)",
       dblclick_at: "Double-click at literal viewport coords (CDP)",
       hover_at: "Hover at literal viewport coords (CDP)",
+      visual_click: "Screenshot-bound click: capture_id + ORIGINAL PNG image_x/image_y (single-use, 2m TTL)",
     },
   };
   return m[tool]?.[action] ?? "(see `help page.act " + action + "`)";

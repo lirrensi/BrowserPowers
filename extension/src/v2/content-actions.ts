@@ -415,6 +415,29 @@ export function inspectElements(
     return { css: tag + (el.className ? "." + el.className.trim().split(/\s+/).join(".") : "") };
   }
 
+  /**
+   * Build a working unique CSS selector for an element (id wins, else a
+   * parent-chained nth-of-type path). Unlike the semantic `target`, this is
+   * guaranteed querySelector-resolvable — the SW stores it on the anchor so
+   * later `bp:resolve` calls don't depend on placeholder/text matching.
+   */
+  function cssPath(el: Element): string {
+    const id = el.getAttribute("id");
+    if (id && /^[A-Za-z][\w:.-]*$/.test(id)) return "#" + CSS.escape(id);
+    const parts: string[] = [];
+    let cur: Element | null = el;
+    while (cur && cur.nodeType === 1 && parts.length < 6) {
+      const t = cur.tagName.toLowerCase();
+      if (cur === document.body || cur === document.documentElement) { parts.unshift(t); break; }
+      let nth = 1;
+      let sib = cur.previousElementSibling;
+      while (sib) { if (sib.tagName.toLowerCase() === t) nth++; sib = sib.previousElementSibling; }
+      parts.unshift(nth > 1 ? `${t}:nth-of-type(${nth})` : t);
+      cur = cur.parentElement;
+    }
+    return parts.join(" > ");
+  }
+
   function getAnchorInfo(el: Element, compact: boolean, pathStack: string[]): Record<string, unknown> {
     const tag = el.tagName.toLowerCase();
     const role = el.getAttribute("role");
@@ -427,12 +450,17 @@ export function inspectElements(
     anchorIndex++;
     const id = "a" + anchorIndex;
 
-    // The leaf selector is what getTarget() produces. The shadow path is the
-    // chain of HOST tag names leading to this element (the element's own tag
-    // is NOT in the path — it's the leaf, identified by the existing
-    // `target.css`). Together: `walkShadowPath(shadowPath, target.css)`.
+    // The semantic `target` comes from getTarget(); the WORKING `selector`
+    // comes from cssPath() below (id wins, else parent-chained nth-of-type).
+    // The shadow path is the chain of HOST tag names (element's own tag is
+    // NOT in the path). Together they drive bp:resolve without depending on
+    // placeholder/text matching.
     const leafTarget = getTarget(el);
     const shadowPath = pathStack.length > 0 ? [...pathStack] : undefined;
+    // Working selector for later bp:resolve calls (see cssPath — the SW
+    // prefers this over guessing from semantic target fields).
+    let selector: string | undefined;
+    try { selector = cssPath(el); } catch { selector = undefined; }
 
     if (!compact) {
       const visible = !!(htmlEl.offsetParent !== null || tag === "a");
@@ -456,6 +484,7 @@ export function inspectElements(
       if (selected !== undefined) info.selected = selected;
       info.target = leafTarget;
       if (shadowPath) info.shadowPath = shadowPath;
+      if (selector) info.selector = selector;
 
       // Bounding rect — exposes the element's viewport-space rect and a
       // pre-computed center. Consumers (visual layer, screenshot overlay)
@@ -489,6 +518,7 @@ export function inspectElements(
     };
     info.target = leafTarget;
     if (shadowPath) info.shadowPath = shadowPath;
+    if (selector) info.selector = selector;
     return info;
   }
 
@@ -692,6 +722,37 @@ export function clickElement(el: Element, anchor?: string): ActResult {
     message: `Resolved ${tag} at (${Math.round(cx)}, ${Math.round(cy)})`,
     coords: { x: cx, y: cy },
     elementInfo: buildElementInfo(el, anchor, rect),
+    executionVerdict: resolveAndLocateVerdict(start, true),
+  };
+}
+
+export function focusElementResolve(el: Element, anchor?: string): ActResult {
+  // Resolve-and-locate for the `focus` act action. Pre-focuses in the
+  // isolated world (mirrors typeText) and returns a main-world jsExpression
+  // so the SW can verify focus via CDP Runtime.evaluate.
+  const start = performance.now();
+  if (!el) {
+    return { success: false, message: "No element", executionVerdict: resolveAndLocateVerdict(start, false) };
+  }
+  try {
+    (el as HTMLElement).focus();
+  } catch (_) {
+    // focus() can throw on detached elements — non-fatal, SW verifies.
+  }
+  const chain = getShadowPathFromElement(el);
+  const leafSelector = generateLeafSelector(el);
+  const jsExpression = buildJsExpression(chain, leafSelector);
+  const tag = el.tagName.toLowerCase();
+  const rect = (() => { try { return el.getBoundingClientRect(); } catch { return null; } })();
+
+  return {
+    success: true,
+    message: `Resolved ${tag} for focus`,
+    jsExpression,
+    coords: rect && (rect.width > 0 || rect.height > 0)
+      ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+      : undefined,
+    elementInfo: buildElementInfo(el, anchor, rect ?? undefined),
     executionVerdict: resolveAndLocateVerdict(start, true),
   };
 }

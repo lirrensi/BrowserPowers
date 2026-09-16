@@ -1,0 +1,14 @@
+{
+  "$schema": "../../schemas/case.schema.json",
+  "schemaVersion": 1,
+  "id": "tabs-list",
+  "title": "List tabs (at least one open)",
+  "suite": "core",
+  "tags": ["tabs"],
+  "seed": 3,
+  "fixture": { "startPath": "https://example.com" },
+  "prompts": { "en": "List open tabs" },
+  "coverage": ["tabs.list"],
+  "assertions": { "site": [], "response": [], "adapter": ["tabsNonEmpty"] },
+  "smoke": { "steps": [{ "action": "tabs_list" }] }
+}

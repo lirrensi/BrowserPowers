@@ -59,6 +59,12 @@ const screenshotSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
   mode: z.enum(["sync", "async"]).optional(),
+  overlay: z.enum(["none", "labels", "coords", "both", "anchors_only"]).optional().describe("Annotated overlay mode (default none)"),
+  overlay_limit: z.number().optional().describe("Max anchors to draw (default 50, max 200)"),
+  overlay_color_by_type: z.boolean().optional().describe("Color boxes by tag (default true)"),
+  full_page: z.boolean().optional().describe("Attempt full-page capture via CDP captureBeyondViewport (falls back with honest error on virtualized/nested scrollers)"),
+  ref: z.string().optional().describe("Anchor ID for element screenshot — returns single-use capture_id for visual_click"),
+  max_inline_bytes: z.number().optional().describe("Max base64 chars to inline in text (default 0 = no inline text, image block only). Set >0 for WSL/host-split debugging"),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -86,11 +92,13 @@ const pageReadSchema = z.object({
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
-  action: z.enum(["inspect", "content", "text", "html", "attr", "meta", "forms", "count", "select", "summary", "frames", "generate_selector", "console", "runtime_status", "readable", "full_html"]),
+  action: z.enum(["inspect", "snapshot", "content", "text", "html", "attr", "meta", "forms", "count", "select", "summary", "frames", "generate_selector", "console", "runtime_status", "readable", "full_html"]),
   target: targetSchema.optional(),
   limit: z.number().optional(),
   include_hidden: z.boolean().optional(),
   compact: z.boolean().optional(),
+  cursor: z.string().optional().describe("Continuation offset from prior inspect next_cursor (@more)"),
+  max_tokens: z.number().optional().describe("Approx token budget (4 chars/token) for anchor truncation"),
   name: z.string().optional(),
   timeout_ms: z.number().optional(),
   mode: z.enum(["sync", "async"]).optional(),
@@ -104,7 +112,7 @@ const pageActSchema = z.object({
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
-  action: z.enum(["click", "fill", "check", "select_option", "press", "scroll", "submit", "wait_for", "type", "smart_click", "fill_form", "upload", "drag", "dblclick", "hover", "dialog_override", "dialog_respond", "click_at", "dblclick_at", "hover_at"]),
+  action: z.enum(["click", "fill", "check", "select_option", "press", "scroll", "scroll_to", "wheel", "focus", "blur", "submit", "wait_for", "type", "smart_click", "fill_form", "upload", "drag", "dblclick", "hover", "dialog_override", "dialog_respond", "click_at", "dblclick_at", "hover_at", "visual_click"]),
   target: targetSchema.optional(),
   anchor: z.string().optional(),
   value: z.string().optional(),
@@ -128,6 +136,11 @@ const pageActSchema = z.object({
   file_type: z.string().optional(),
   x: z.number().optional(),
   y: z.number().optional(),
+  delta_x: z.number().optional().describe("Wheel delta X (at least one of delta_x/delta_y nonzero)"),
+  delta_y: z.number().optional().describe("Wheel delta Y (+down, -up)"),
+  capture_id: z.string().optional().describe("Single-use visual capture ID from screenshot ref (visual_click)"),
+  image_x: z.number().optional().describe("ORIGINAL PNG x for visual_click"),
+  image_y: z.number().optional().describe("ORIGINAL PNG y for visual_click"),
   response: z.object({ confirm: z.boolean().optional(), prompt: z.string().optional() }).optional(),
   fields: z.array(z.object({
     anchor: z.string().optional(),
@@ -187,6 +200,30 @@ const windowsSchema = z.object({
   url: z.string().optional(),
   window_id: z.number().optional(),
   mode: z.enum(["sync", "async"]).optional(),
+}).refine(data => data.browser_id || data.browser_name, {
+  message: "Either browser_id or browser_name is required",
+});
+
+const requestHelpSchema = z.object({
+  browser_id: z.string().optional(),
+  browser_name: z.string().optional(),
+  prompt: z.string().min(1).describe("Precise human instruction, e.g. 'Please complete sign-in'"),
+  target: targetSchema.optional().describe("Optional element context (css/text/role/...) shown alongside prompt"),
+  anchor: z.string().optional().describe("Optional anchor ID for element context"),
+  timeout_ms: z.number().optional().describe("Max wait 10s-10m (default 300000)"),
+  completion_criteria: z.object({
+    url_contains: z.string().optional(),
+    url_matches: z.string().optional().describe("Regex tested against active tab URL for auto-complete"),
+  }).optional().describe("Optional auto-complete polling (url_contains/url_matches only in this version)"),
+}).refine(data => data.browser_id || data.browser_name, {
+  message: "Either browser_id or browser_name is required",
+});
+
+const recordSchema = z.object({
+  action: z.enum(["start", "stop", "status"]),
+  browser_id: z.string().optional(),
+  browser_name: z.string().optional(),
+  purpose: z.string().optional().describe("Goal label for trace.json (start only)"),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
 });
@@ -420,14 +457,20 @@ function generateToolHelpLegacy(toolName: string): string {
     screenshot: [
       "## screenshot",
       "",
-      "Capture a screenshot of the active tab in a browser.",
+      "Capture a screenshot of the active tab. Returns BOTH filePath (core FS) and inline image (WSL/host-safe).",
       "",
       "### Parameters",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
+      "- `overlay` (string, optional) — none|labels|coords|both|anchors_only (default none)",
+      "- `overlay_limit` (number, optional) — Max anchors to draw (default 50, max 200)",
+      "- `overlay_color_by_type` (boolean, optional) — Color boxes by tag (default true)",
+      "- `full_page` (boolean, optional) — Attempt CDP full-page capture (captureBeyondViewport). Virtualized/nested scrollers unsupported.",
+      "- `max_inline_bytes` (number, optional) — Inline first N base64 chars in text for debugging (default 0, image block always sent)",
       "",
       "### Output",
-      "Returns the file path where the screenshot PNG was saved, or an error if capture failed.",
+      "Text with filePath + overlay/full_page notes, plus an image block with PNG bytes.",
+      "When caller FS differs from core FS (WSL↔Win, VM, container), filePath may be unreadable — use the image block or REST base64.",
     ].join("\n"),
 
 
@@ -705,6 +748,40 @@ function generateToolHelpLegacy(toolName: string): string {
       "### Output",
       "Returns window list for list, success confirmation for create/focus/close.",
     ].join("\n"),
+
+    request_help: [
+      "## request_help",
+      "",
+      "Ask the human to complete an in-page step (login, CAPTCHA, OTP, payment, consent).",
+      "Dedicated automation browser — no borrow, walk-away by default.",
+      "",
+      "### Parameters",
+      "- `browser_name`/`browser_id` (one required)",
+      "- `prompt` (string, required) — Precise instruction, e.g. 'Please complete sign-in'",
+      "- `target` (object, optional) — Element context shown alongside prompt",
+      "- `anchor` (string, optional) — Anchor ID for element context",
+      "- `timeout_ms` (number, optional) — 10000-600000, default 300000",
+      "- `completion_criteria` (object, optional) — { url_contains?, url_matches? (regex) } for auto-complete",
+      "",
+      "### Output",
+      "{ outcome: continued|completed|cancelled|timed_out, completed_by?, elapsed_ms, hint }",
+      "continued/completed → re-inspect (refs stale). cancelled/timed_out → respect, don't repeat.",
+    ].join("\n"),
+
+    record: [
+      "## record",
+      "",
+      "Record ops into a trace.json textbook (lite: semantic ops + last 10 VOM states).",
+      "Never record banking/SSO/password-manager pages.",
+      "",
+      "### Parameters",
+      "- `action` (enum, required) — start|stop|status",
+      "- `purpose` (string, optional) — Goal label (start only)",
+      "",
+      "### Output",
+      "start/status: { recording, ops }. stop: trace { version, ops, states }.",
+      "Follow trace targets/values in order, not old refs. Trace grants no extra auth.",
+    ].join("\n"),
   };
 
   return help[toolName] ?? `No help available for \`${toolName}\`.`;
@@ -782,7 +859,7 @@ function buildMcpServer(): McpServer {
   mcpServer.registerTool(
     "screenshot",
     {
-      description: "Capture a screenshot of the active tab in a browser.",
+      description: "Capture a screenshot of the active tab. Returns BOTH filePath (core FS) and inline image (WSL/host-safe). Supports overlay and full_page.",
       inputSchema: helpStub,
     },
     async (args: Record<string, unknown>) => {
@@ -790,21 +867,41 @@ function buildMcpServer(): McpServer {
       const parsed = screenshotSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
 
+      const toolParams: Record<string, unknown> = {};
+      if (parsed.overlay !== undefined) toolParams.overlay = parsed.overlay;
+      if (parsed.overlay_limit !== undefined) toolParams.overlay_limit = parsed.overlay_limit;
+      if (parsed.overlay_color_by_type !== undefined) toolParams.overlay_color_by_type = parsed.overlay_color_by_type;
+      if (parsed.full_page !== undefined) toolParams.full_page = parsed.full_page;
+      if ((parsed as Record<string, unknown>).ref !== undefined) toolParams.ref = (parsed as Record<string, unknown>).ref;
+
       if (parsed.mode === "async") {
-        const { requestId } = await commandService.executeAsync(browser_id, "screenshots.capture", {});
+        const { requestId } = await commandService.executeAsync(browser_id, "screenshots.capture", toolParams);
         return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
-      const result = await commandService.execute(browser_id, "screenshots.capture", {});
+      const result = await commandService.execute(browser_id, "screenshots.capture", toolParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
-      const data = result.data as { base64?: string } | undefined;
+      const data = result.data as { base64?: string; format?: string; overlay?: string; drawn?: number; full_page?: boolean; fullPageFallback?: string } | undefined;
       if (data?.base64) {
         const { filePath } = await saveScreenshotToTemp(data.base64, browser_id);
-        return {
-          content: [{ type: "text" as const, text: `Screenshot saved to ${filePath}` }],
-        };
+        const overlayNote = data.overlay && data.overlay !== "none" ? ` overlay=${data.overlay}${data.drawn !== undefined ? ` drawn=${data.drawn}` : ""}` : "";
+        const fullNote = data.full_page ? ` full_page=true` : "";
+        const fallbackNote = (data as Record<string, unknown>).fullPageFallback ? ` note=${(data as Record<string, unknown>).fullPageFallback}` : "";
+        const text = `Screenshot saved to ${filePath}${overlayNote}${fullNote}${fallbackNote}\nWSL/host-split: filePath lives on CORE fs and may be unreadable from caller FS — use the attached image (or base64 via REST GET /api/browsers/${browser_id}/screenshot).`;
+        // Return text + image block (MCP image content). Text carries path for local-FS callers,
+        // image block carries bytes for split-FS callers (WSL↔Win, VM, container).
+        const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+          { type: "text" as const, text },
+          { type: "image" as const, data: data.base64, mimeType: "image/png" },
+        ];
+        // Opt-in inline base64 in text for debugging (can be huge — default off).
+        if (parsed.max_inline_bytes && parsed.max_inline_bytes > 0) {
+          const sliced = data.base64.slice(0, parsed.max_inline_bytes);
+          content.push({ type: "text" as const, text: `base64[0:${sliced.length} of ${data.base64.length}]: ${sliced}${sliced.length < data.base64.length ? "...(truncated)" : ""}` });
+        }
+        return { content };
       }
       return {
         content: [{ type: "text" as const, text: "Screenshot returned no data" }],
@@ -1098,6 +1195,55 @@ function buildMcpServer(): McpServer {
       }
 
       const result = await commandService.execute(browser_id, command, params);
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: formatResult(result.data) }] };
+    },
+  );
+
+  // ── request_help (human-loop, no borrow) ──
+  mcpServer.registerTool(
+    "request_help",
+    {
+      description: "Ask the human to complete an in-page step (login, CAPTCHA, OTP, confirm). Shows OS notification with Continue/Cancel.",
+      inputSchema: helpStub,
+    },
+    async (args: Record<string, unknown>) => {
+      if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("request_help") }] };
+      const parsed = requestHelpSchema.parse(args);
+      const browser_id = await resolveBrowserId(parsed);
+      const params: Record<string, unknown> = { prompt: parsed.prompt };
+      if (parsed.target !== undefined) params.target = parsed.target;
+      if (parsed.anchor !== undefined) params.anchor = parsed.anchor;
+      if (parsed.timeout_ms !== undefined) params.timeout_ms = parsed.timeout_ms;
+      if (parsed.completion_criteria !== undefined) params.completion_criteria = parsed.completion_criteria;
+      // Human waits can exceed default 120s queue timeout — clamp via timeout_ms passthrough.
+      // commandService strips timeout_ms before forwarding, but uses it for queue timeout (max 5m).
+      if (parsed.timeout_ms === undefined) params.timeout_ms = 300_000;
+      const result = await commandService.execute(browser_id, "human.requestHelp", params);
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: formatResult(result.data) }] };
+    },
+  );
+
+  // ── record lite (trace.json textbook) ──
+  mcpServer.registerTool(
+    "record",
+    {
+      description: "Record ops into trace.json textbook (start/stop/status). Never record banking/SSO/password-manager.",
+      inputSchema: helpStub,
+    },
+    async (args: Record<string, unknown>) => {
+      if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("record") }] };
+      const parsed = recordSchema.parse(args);
+      const browser_id = await resolveBrowserId(parsed);
+      const tool = `record.${parsed.action}`;
+      const params: Record<string, unknown> = {};
+      if (parsed.purpose !== undefined) params.purpose = parsed.purpose;
+      const result = await commandService.execute(browser_id, tool, params);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }

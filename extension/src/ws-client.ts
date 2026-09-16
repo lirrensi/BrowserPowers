@@ -336,6 +336,15 @@ function getAvailableCapabilities(settings: { permissions: Record<string, string
     { tool: "cookies.remove", description: "Remove a cookie by name", group: "cookies" },
     { tool: "cookies.list", description: "List all cookies for a URL", group: "cookies" },
 
+    // Human-loop (dedicated automation browser — no borrow, walk-away model)
+    { tool: "human.requestHelp", description: "Ask human to complete in-page step (login/CAPTCHA/OTP/confirm)", group: "human" },
+    { tool: "human.helpStatus", description: "Poll a human help request (used internally by request_help orchestration)", group: "human" },
+
+    // Record lite (trace.json textbook)
+    { tool: "record.start", description: "Start recording ops into trace buffer", group: "record" },
+    { tool: "record.stop", description: "Stop recording and return trace.json", group: "record" },
+    { tool: "record.status", description: "Recording status (ops count, startedAt)", group: "record" },
+
     // Self (always-allow: extension lifecycle helpers used by the test harness)
     { tool: "self.reload", description: "Reload the extension to pick up a new build", group: "self" },
   ];

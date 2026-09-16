@@ -25,7 +25,7 @@ vi.mock("../../src/config.js", () => ({
   loadConfig: vi.fn(() => mockConfig),
 }));
 
-/** All 11 MCP tools the server must expose. */
+/** All 13 MCP tools the server must expose. */
 const EXPECTED_TOOL_NAMES = [
   "browsers",
   "screenshot",
@@ -37,6 +37,8 @@ const EXPECTED_TOOL_NAMES = [
   "page_js",
   "cookies",
   "windows",
+  "request_help",
+  "record",
   "help",
 ];
 

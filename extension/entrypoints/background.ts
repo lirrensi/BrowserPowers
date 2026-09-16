@@ -4,7 +4,7 @@
  */
 
 import { connect, reconnect, onMessage, isConnected, send, getConnectionStatus, disconnect } from "../src/ws-client";
-import { routeExecute, type ExecuteRequest } from "../src/capability-router";
+import { routeExecute, rehydrateHelpRequests, type ExecuteRequest } from "../src/capability-router";
 import { isExtensionContext } from "../src/safety";
 import { getSettings, saveSettings, saveSessionPermissionOverride, clearSessionPermissionOverride, getPageSitePermissions, addSitePattern } from "../src/storage";
 import { normalizeHostname, resolvePagePermission } from "../src/site-permissions";
@@ -166,6 +166,11 @@ async function handleCoreMessage(msg: any): Promise<void> {
 function init(): void {
   // Connect when service worker starts
   connect();
+
+  try { console.log("[bp-ext] SW started"); } catch { /* ignore */ }
+
+  // Sweep orphaned human-help waits left by a terminated worker.
+  try { rehydrateHelpRequests(); } catch { /* hygiene best-effort */ }
 
   // MV3 service worker stability: re-check connection on browser startup
   // (fires when the browser fully restarts, not on service worker wake)
@@ -339,8 +344,8 @@ async function getActiveTabContext(): Promise<{ title?: string; url?: string }> 
 }
 
 function buildNotificationIconUrl(): string {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none"><rect width="128" height="128" rx="28" fill="#1a1a25"/><circle cx="64" cy="64" r="34" fill="#a78bfa"/><path d="M46 58h36v12H46z" fill="#0f0f14"/><path d="M54 48h20v8H54z" fill="#0f0f14"/></svg>`;
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  // File icon — data: URLs are rejected by notifications in some Chromium builds.
+  return "icon-128.png";
 }
 
 async function createApprovalNotification(approval: PendingApproval): Promise<void> {

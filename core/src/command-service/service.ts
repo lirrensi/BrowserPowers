@@ -49,6 +49,11 @@ class CommandServiceImpl implements CommandService {
 
     // If gate is "ask", enter approval flow
     if (gate.mode === "ask") {
+      // TEST ONLY: automated harnesses (test:live) have no human to click the
+      // popup. Never set in production — it silently approves everything.
+      if (process.env.BROWSERPOWERS_AUTO_APPROVE === "1") {
+        console.warn(`[gates] TEST MODE: auto-approving "${tool}" for ${browserId} (BROWSERPOWERS_AUTO_APPROVE=1)`);
+      } else {
       const requestId = `${browserId}:approval:${randomUUID()}`;
       const description = `Agent wants to run "${tool}" with params: ${JSON.stringify(params)}`;
       const approvalTimeoutMs = config.gates.approvalTimeoutMs ?? 60_000;
@@ -101,7 +106,8 @@ class CommandServiceImpl implements CommandService {
           error: (err as Error).message,
         };
       }
-    }
+      } // end else: normal approval flow (auto-approve path falls through)
+    } // end if (ask)
 
     // Check capability
     const cap = browser.capabilities.find((c: { tool: string }) => c.tool === tool);
@@ -119,10 +125,21 @@ class CommandServiceImpl implements CommandService {
     // Clamp timeout to reasonable bounds (1s – 5min) to prevent abuse:
     //   timeout_ms=0  → instant timeout (DoS),
     //   timeout_ms >5min → memory leak vector
-    const timeoutMs = Math.max(1_000, Math.min(rawTimeout, 300_000));
+    let timeoutMs = Math.max(1_000, Math.min(rawTimeout, 300_000));
 
     // Remove timeout_ms from params before forwarding to extension
     const { timeout_ms, ...cleanParams } = params as Record<string, unknown>;
+
+    // Human-loop orchestration: the extension answers requestHelp IMMEDIATELY
+    // with {outcome:"pending"} (MV3 workers can't survive long waits), then
+    // the CORE polls helpStatus on its own clock — which never sleeps, so the
+    // agent always gets a terminal envelope even across worker restarts.
+    let helpDeadlineMs = 0;
+    if (tool === "human.requestHelp") {
+      helpDeadlineMs = Math.max(10_000, Math.min(Number(params.timeout_ms ?? 300_000) || 300_000, 600_000));
+      (cleanParams as Record<string, unknown>).deadline_ms = helpDeadlineMs;
+      timeoutMs = 30_000; // first dispatch returns pending immediately
+    }
 
     const { requestId, promise } = registry.enqueue(browserId, tool, cleanParams, timeoutMs);
 
@@ -132,6 +149,12 @@ class CommandServiceImpl implements CommandService {
 
     try {
       const result = await promise;
+      if (tool === "human.requestHelp") {
+        const data = result.data as { outcome?: string; notif_id?: string } | undefined;
+        if (data?.outcome === "pending" && data?.notif_id) {
+          return await this.pollHumanHelp(browserId, data.notif_id, helpDeadlineMs);
+        }
+      }
       await logAudit({ browserId, tool, params: cleanParams, result: { success: true } });
       return result;
     } catch (err) {
@@ -142,6 +165,42 @@ class CommandServiceImpl implements CommandService {
         success: false,
         error: (err as Error).message,
       };
+    }
+  }
+
+  /**
+   * Poll human.helpStatus until a terminal outcome or the deadline.
+   * Each poll is a short independent dispatch, so worker restarts between
+   * polls are harmless — state lives in extension storage, not memory.
+   */
+  private async pollHumanHelp(browserId: string, notifId: string, deadlineMs: number): Promise<ToolResult> {
+    const start = Date.now();
+    const tool = "human.requestHelp";
+    for (;;) {
+      if (Date.now() - start >= deadlineMs) {
+        const data = { outcome: "timed_out", elapsed_ms: Date.now() - start, hint: "No human response in time — report blocker, do not loop request." };
+        await logAudit({ browserId, tool, params: { notif_id: notifId }, result: { success: true } });
+        return { browserId, tool, success: true, data };
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+      let s: ToolResult;
+      try {
+        s = await this.execute(browserId, "human.helpStatus", { notif_id: notifId, timeout_ms: 15_000 });
+      } catch (err) {
+        continue; // transient dispatch failure — keep polling till deadline
+      }
+      if (!s.success) {
+        // Old extension without helpStatus? Fail fast with upgrade hint.
+        return {
+          browserId, tool, success: false,
+          error: `human.helpStatus unavailable (${s.error}) — update the extension to use request_help`,
+        };
+      }
+      const env = s.data as { outcome?: string } | undefined;
+      if (env?.outcome && env.outcome !== "pending") {
+        await logAudit({ browserId, tool, params: { notif_id: notifId }, result: { success: true } });
+        return { browserId, tool, success: true, data: s.data };
+      }
     }
   }
 

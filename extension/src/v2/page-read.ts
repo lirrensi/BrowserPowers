@@ -22,11 +22,11 @@
  */
 
 import { performed, notPerformed, blocked } from "./action-result.js";
-import { setAnchors } from "./anchor-manager.js";
+import { setAnchors, getGeneration } from "./anchor-manager.js";
 import { getState as getCdpState, getConsoleBuffer } from "../cdp.js";
 import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
-type ReadAction = "inspect" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console" | "runtime_status" | "readable" | "full_html";
+type ReadAction = "inspect" | "snapshot" | "content" | "text" | "html" | "attr" | "meta" | "forms" | "count" | "select" | "summary" | "frames" | "generate_selector" | "console" | "runtime_status" | "readable" | "full_html";
 
 export async function dispatchReadAction(
   action: ReadAction,
@@ -37,6 +37,8 @@ export async function dispatchReadAction(
   switch (action) {
     case "inspect":
       return inspect(params, tabId, frameId);
+    case "snapshot":
+      return snapshot(params, tabId, frameId);
     case "content":
       return content(params, tabId, frameId);
     case "text":
@@ -123,12 +125,16 @@ async function sendReadMessage(
 // ── Read action handlers ──
 
 async function inspect(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
-  const limit = (params.limit as number) ?? 50;
+  const limit = Math.min((params.limit as number) ?? 50, 200);
   const includeHidden = (params.include_hidden as boolean) ?? false;
   const compact = (params.compact as boolean) ?? false;
+  // Continuation: cursor is a base-10 anchor offset into the full list.
+  // New inspect replaces the ref map (generation bump); cursor reads same capture.
+  const cursorOffset = Math.max(0, Number(params.cursor ?? 0) || 0);
+  const maxTokens = (params.max_tokens as number) | 0;
 
   try {
-    const data = await sendReadMessage(tabId, "inspect", { limit, includeHidden, compact });
+    const data = await sendReadMessage(tabId, "inspect", { limit: 200, includeHidden, compact });
     if (!data) {
       return blocked("inspect", "Content script not available — page may not be loaded", {
         errorCode: "CONTENT_SCRIPT_NOT_READY",
@@ -140,26 +146,63 @@ async function inspect(params: Record<string, unknown>, tabId: number, frameId?:
       return blocked("inspect", data.message as string, { errorCode: data.errorCode as string });
     }
 
-    const anchors = data.anchors as Array<Record<string, unknown>> | undefined;
+    const allAnchors = (data.anchors as Array<Record<string, unknown>> | undefined) ?? [];
     const { executionVerdict, runtimeStatus } = extractVerdicts(data);
 
-    if (anchors) {
-      const anchorEntries = anchors.map((a: Record<string, unknown>) => {
+    // Store FULL map (generation bump), but return paged slice.
+    if (allAnchors.length > 0) {
+      const anchorEntries = allAnchors.map((a: Record<string, unknown>) => {
         const target = a.target as Target;
         const shadowPath = a.shadowPath as string[] | undefined;
         return {
           anchor: a.anchor as string,
           target,
-          selector: target?.css || `[data-bp-anchor="${a.anchor as string}"]`,
+          selector: (a.selector as string) || target?.css || `[unresolvable:${a.anchor as string}]`,
           shadowPath,
         };
       });
       setAnchors(tabId, data.documentId as string, anchorEntries);
     }
+    const generation = getGeneration(tabId);
 
-    return performed("inspect", `Found ${anchors?.length || 0} interactable elements`, {
-      data,
-      evidence: { anchorCount: anchors?.length || 0 },
+    // Paginate + optional token-budget truncation (approx 4 chars/token).
+    let sliced = allAnchors.slice(cursorOffset, cursorOffset + limit);
+    let nextCursor: string | undefined;
+    const fullNext = cursorOffset + sliced.length;
+    if (fullNext < allAnchors.length) nextCursor = String(fullNext);
+
+    let truncatedForTokens = false;
+    if (maxTokens > 0) {
+      const budget = maxTokens * 4;
+      let used = 0;
+      const kept: typeof sliced = [];
+      for (const a of sliced) {
+        const s = JSON.stringify(a).length;
+        if (used + s > budget && kept.length > 0) { truncatedForTokens = true; break; }
+        kept.push(a);
+        used += s;
+      }
+      // If we cut inside the page, next_cursor points at first omitted index.
+      if (truncatedForTokens) nextCursor = String(cursorOffset + kept.length);
+      sliced = kept;
+    }
+
+    const pagedData = {
+      ...(data as Record<string, unknown>),
+      anchors: sliced,
+      totalCount: allAnchors.length,
+      generation,
+      cursor: String(cursorOffset),
+      ...(nextCursor ? { next_cursor: nextCursor, has_more: true } : { has_more: false }),
+      ...(truncatedForTokens ? { truncated_for_tokens: true } : {}),
+      notice: nextCursor
+        ? `Showing ${sliced.length} of ${allAnchors.length}. Use cursor=${nextCursor} for @more. Refs replaced (gen ${generation}) — use these refs, never older pages.`
+        : undefined,
+    };
+
+    return performed("inspect", `Found ${allAnchors.length} interactable elements (gen ${generation})`, {
+      data: pagedData,
+      evidence: { anchorCount: sliced.length, totalCount: allAnchors.length, generation },
       executionVerdict,
       runtimeStatus,
     });
@@ -169,6 +212,19 @@ async function inspect(params: Record<string, unknown>, tabId: number, frameId?:
       recoverable: true,
     });
   }
+}
+
+/**
+ * Snapshot: static aria-tree alias (compact inspect, limit 30).
+ * Prefer inspect for fresh refs + generation; snapshot for cheap static tree.
+ */
+async function snapshot(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  const merged = { compact: true, limit: Math.min((params.limit as number) ?? 30, 100), ...params, compact: true };
+  const res = await inspect(merged, tabId, frameId);
+  if (res.success && res.data) {
+    return { ...res, action: "snapshot", message: (res.message || "").replace("interactable elements", "snapshot nodes") };
+  }
+  return { ...res, action: "snapshot" };
 }
 
 async function content(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {

@@ -801,6 +801,65 @@ export function getConsoleBuffer(tabId: number, limit: number, offset: number): 
   return { entries: slice, totalCount };
 }
 
+// ── Full-page screenshot (CDP captureBeyondViewport) ────────────────────
+
+export interface FullPageScreenshotResult {
+  ok: boolean;
+  base64?: string;
+  error?: string;
+  durationMs: number;
+}
+
+/**
+ * Attempt a full-page screenshot via CDP `Page.captureScreenshot` with
+ * `captureBeyondViewport: true`. Lazy-attaches, queues per-tab, never throws.
+ *
+ * This is a best-effort single-shot capture — NOT tiled stitching. It works
+ * for ordinary documents but fails honestly on virtualized lists, nested
+ * scrollers, or Chrome-internal pages (returns ok:false so caller can fall
+ * back to viewport + readable/scroll guidance).
+ */
+export async function captureFullPageScreenshot(tabId: number): Promise<FullPageScreenshotResult> {
+  return captureViaCdp(tabId, { captureBeyondViewport: true });
+}
+
+/**
+ * Viewport screenshot via CDP — the fallback when
+ * `chrome.tabs.captureVisibleTab` fails with image readback errors
+ * (occluded/minimized window, Windows surface issues). `fromSurface: true`
+ * prefers the renderer source over the stale window surface.
+ */
+export async function captureViewportScreenshot(tabId: number): Promise<FullPageScreenshotResult> {
+  return captureViaCdp(tabId, { captureBeyondViewport: false, fromSurface: true });
+}
+
+async function captureViaCdp(tabId: number, opts: { captureBeyondViewport: boolean; fromSurface?: boolean }): Promise<FullPageScreenshotResult> {
+  const tail = cmdQueues.get(tabId) ?? Promise.resolve();
+  const next = tail
+    .catch(() => undefined)
+    .then(async () => {
+      const attach = await ensureAttached(tabId, "screenshot.cdp");
+      if (!attach.attached) {
+        return { ok: false, error: attach.error ?? "CDP attach failed", durationMs: 0 } satisfies FullPageScreenshotResult;
+      }
+      const start = performance.now();
+      try {
+        const res = (await chrome.debugger.sendCommand(
+          { tabId },
+          "Page.captureScreenshot",
+          { format: "png", ...opts } as unknown as object,
+        )) as { data?: string } | undefined;
+        const base64 = res?.data;
+        if (!base64) return { ok: false, error: "Empty CDP screenshot response", durationMs: performance.now() - start };
+        return { ok: true, base64, durationMs: performance.now() - start } satisfies FullPageScreenshotResult;
+      } catch (err) {
+        return { ok: false, error: (err as Error)?.message ?? String(err), durationMs: performance.now() - start } satisfies FullPageScreenshotResult;
+      }
+    });
+  cmdQueues.set(tabId, next.catch(() => undefined));
+  return next;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function classifyAttachError(message: string): AttachResult["reason"] {

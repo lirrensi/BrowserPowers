@@ -1,0 +1,26 @@
+{
+  "$schema": "../../schemas/case.schema.json",
+  "schemaVersion": 1,
+  "id": "navigate-inspect",
+  "title": "Navigate to example.com and inspect",
+  "suite": "core",
+  "tags": ["navigation", "inspect"],
+  "seed": 1,
+  "fixture": { "startPath": "https://example.com" },
+  "prompts": {
+    "en": "Open {url} and list interactable elements",
+    "zh-CN": "打开 {url} 并列出可交互元素"
+  },
+  "coverage": ["tabs.navigate", "page.read.inspect"],
+  "assertions": {
+    "site": [],
+    "response": ["Example Domain"],
+    "adapter": ["inspectNonEmpty", "sessionCleanupN/A"]
+  },
+  "smoke": {
+    "steps": [
+      { "action": "navigate", "url": "https://example.com", "snapshot": true },
+      { "action": "inspect", "saveAs": "tree" }
+    ]
+  }
+}

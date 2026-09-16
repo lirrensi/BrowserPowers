@@ -147,9 +147,17 @@ program
 // ── screenshot ──
 program
   .command("screenshot <browserId> [filepath]")
-  .description("Take a screenshot of a browser tab. Pass overlay=both|labels|coords|anchors_only via the tool call to get an annotated PNG. Saves to filepath or prints base64 JSON.")
-  .action(async (browserId: string, filepath?: string) => {
-    const result = await executeViaRest(browserId, "screenshots.capture", {}) as any;
+  .description("Take a screenshot. Saves to filepath if given, else prints base64 JSON (WSL/host-safe). Options: --overlay, --full-page, --json.")
+  .option("--overlay <mode>", "Overlay mode: none|labels|coords|both|anchors_only (default none)")
+  .option("--overlay-limit <n>", "Max anchors to draw (default 50)", (v) => Number(v))
+  .option("--full-page", "Attempt full-page capture via CDP captureBeyondViewport")
+  .option("--json", "Print raw JSON with base64 inline")
+  .action(async (browserId: string, filepath?: string, options?: { overlay?: string; overlayLimit?: number; fullPage?: boolean; json?: boolean }) => {
+    const params: Record<string, unknown> = {};
+    if (options?.overlay) params.overlay = options.overlay;
+    if (options?.overlayLimit !== undefined) params.overlay_limit = options.overlayLimit;
+    if (options?.fullPage) params.full_page = true;
+    const result = await executeViaRest(browserId, "screenshots.capture", params) as any;
     if (result === null) return; // async mode
     if (!result.success) {
       cliError(result.error ?? "Screenshot failed");
@@ -157,7 +165,8 @@ program
     if (filepath && result.data?.base64) {
       const { writeFileSync } = await import("node:fs");
       writeFileSync(filepath, Buffer.from(result.data.base64, "base64"));
-      console.log(`✅ Screenshot saved to ${filepath}`);
+      console.log(`✅ Screenshot saved to ${filepath}${result.data.full_page ? " (full_page)" : ""}${result.data.overlay && result.data.overlay !== "none" ? ` overlay=${result.data.overlay} drawn=${result.data.drawn ?? 0}` : ""}`);
+      if (options?.json) console.log(JSON.stringify(result.data));
     } else {
       console.log(JSON.stringify(result.data));
     }
@@ -352,17 +361,36 @@ program
       }),
   );
 
-// ── status ──
+// ── status (health) ──
+// Health = daemon alive + browser connected + heartbeat fresh.
+// Dedicated automation browser model: user does NOT use this browser day-to-day,
+// so stale heartbeat (>60s) means extension asleep/crashed — reload extension.
 program
   .command("status")
-  .description("Check daemon status, uptime, and connected browsers")
-  .action(async () => {
+  .description("Check daemon health, uptime, and connected browsers (heartbeat fresh = healthy)")
+  .option("--json", "Output raw JSON health")
+  .action(async (options: { json?: boolean }) => {
     // Check if REST API is alive
     try {
-      const healthRes = await apiFetch(`${BASE}/browsers`, {
+      const browsersRes = await apiFetch(`${BASE}/browsers`, {
         signal: AbortSignal.timeout(3000),
       });
-      const { browsers } = await healthRes.json() as { browsers: any[] };
+      const { browsers } = await browsersRes.json() as { browsers: any[] };
+      let approvals: any[] = [];
+      try {
+        const apprRes = await apiFetch(`${BASE}/approvals`, { signal: AbortSignal.timeout(3000) });
+        approvals = ((await apprRes.json()) as { approvals: any[] }).approvals ?? [];
+      } catch { /* approvals best-effort */ }
+      let health: { status?: string; uptime?: number } = {};
+      try {
+        const hRes = await apiFetch(`${BASE.replace(/\/api$/, "/api")}/health`, { signal: AbortSignal.timeout(3000) });
+        if (hRes.ok) health = await hRes.json();
+      } catch { /* health best-effort — /health lives under /api */ }
+
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, health, browsers, pendingApprovals: approvals.length }, null, 2));
+        return;
+      }
 
       // Try to read PID file
       const { homedir } = await import("node:os");
@@ -382,15 +410,20 @@ program
       }
 
       console.log(`  API:      ${BASE}`);
-      console.log(`  Browsers: ${browsers.length} connected\n`);
+      if (health.uptime !== undefined) console.log(`  Uptime:   ${health.uptime}s`);
+      console.log(`  Browsers: ${browsers.length} connected`);
+      console.log(`  Approvals pending: ${approvals.length}\n`);
 
       if (browsers.length === 0) {
         console.log("  No browsers connected. Load the extension and check it's connecting to this server.");
       } else {
         for (const b of browsers) {
           const age = Math.round((Date.now() - b.connectedAt) / 1000);
-          console.log(`    • ${b.id}  "${b.name}"  [${(b.capabilities || []).map((c: any) => c.tool || c).join(", ")}]  connected ${age}s ago`);
+          const hbAgeMs = Date.now() - (b.lastHeartbeat ?? Date.now());
+          const hbNote = hbAgeMs > 60_000 ? `  ⚠️ STALE heartbeat ${Math.round(hbAgeMs / 1000)}s ago — reload extension` : `  heartbeat ${Math.round(hbAgeMs / 1000)}s ago`;
+          console.log(`    • ${b.id}  "${b.name}"  [${(b.capabilities || []).map((c: any) => c.tool || c).join(", ")}]  connected ${age}s ago${hbNote}`);
         }
+        if (approvals.length > 0) console.log(`\n  ${approvals.length} approval(s) waiting in extension popup (Approve Once/Session/Forever or Reject).`);
       }
       console.log("");
     } catch (err) {
@@ -400,6 +433,45 @@ program
       console.log(`  Error:    ${(err as Error).message}\n`);
       console.log("  Start the daemon:  browserpowers serve\n");
       cliError("Daemon not responding");
+    }
+  });
+
+// ── request-help (human-loop, no borrow) ──
+program
+  .command("request-help <browserId>")
+  .description("Ask the human to complete an in-page step (login/CAPTCHA/OTP/confirm). Shows OS notification with Continue/Cancel.")
+  .requiredOption("--prompt <text>", "Precise human instruction, e.g. \"Please complete sign-in\"")
+  .option("--target <target>", "Element context: shorthand (#id/.class/text:.../bare text) or JSON")
+  .option("--anchor <id>", "Anchor ID for element context")
+  .option("--timeout <ms>", "Max wait 10s-10m in ms (default 300000)", (v) => Number(v))
+  .option("--url-contains <s>", "Auto-complete when active tab URL contains this string")
+  .option("--url-matches <re>", "Auto-complete when active tab URL matches this regex")
+  .option("--json", "Output raw JSON")
+  .action(async (browserId: string, options: { prompt: string; target?: string; anchor?: string; timeout?: number; urlContains?: string; urlMatches?: string; json?: boolean }) => {
+    const params: Record<string, unknown> = { prompt: options.prompt };
+    if (options.target) {
+      try {
+        params.target = JSON.parse(options.target);
+      } catch {
+        params.target = autoDetectTarget(options.target);
+      }
+    }
+    if (options.anchor) params.anchor = options.anchor;
+    if (options.timeout !== undefined) params.timeout_ms = options.timeout;
+    if (options.urlContains || options.urlMatches) {
+      params.completion_criteria = {
+        ...(options.urlContains ? { url_contains: options.urlContains } : {}),
+        ...(options.urlMatches ? { url_matches: options.urlMatches } : {}),
+      };
+    }
+    const result = await executeViaRest(browserId, "human.requestHelp", params) as any;
+    if (result === null) return; // async mode
+    if (!result.success) cliError(result.error ?? "request-help failed");
+    if (options.json) console.log(JSON.stringify(result.data, null, 2));
+    else {
+      const d = result.data as Record<string, unknown>;
+      console.log(`  ${d.outcome === "continued" || d.outcome === "completed" ? "✅" : "❌"} ${d.outcome} (${d.elapsed_ms}ms) — ${d.hint ?? ""}`);
+      if (d.outcome === "continued" || d.outcome === "completed") console.log("  Re-inspect before next action — refs are stale.");
     }
   });
 
@@ -668,6 +740,45 @@ program
     }
   });
 
+// ── record lite ──
+program
+  .command("record <browserId> <action>")
+  .description("Record ops into trace.json textbook (start|stop|status). Never banking/SSO. stop prints trace JSON.")
+  .option("--purpose <text>", "Goal label (start only)")
+  .option("--out <file>", "Write trace JSON to file (stop only)")
+  .action(async (browserId: string, action: string, options: { purpose?: string; out?: string }) => {
+    if (!["start", "stop", "status"].includes(action)) cliError(`record action must be start|stop|status (got ${action})`);
+    const params: Record<string, unknown> = {};
+    if (options.purpose) params.purpose = options.purpose;
+    const result = await executeViaRest(browserId, `record.${action}`, params) as any;
+    if (result === null) return;
+    if (!result.success) cliError(result.error ?? "record failed");
+    if (action === "stop" && options.out) {
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(options.out, JSON.stringify(result.data, null, 2));
+      console.log(`✅ Trace written to ${options.out} (${(result.data as { ops?: unknown[] }).ops?.length ?? 0} ops)`);
+    } else {
+      console.log(JSON.stringify(result.data, null, 2));
+    }
+  });
+
+// ── audit (redacted read API) ──
+program
+  .command("audit")
+  .description("Inspect redacted audit log (list|show|rm). 30d retention, origin-only URLs, values redacted.")
+  .addCommand(new Command("list").description("List audit files").action(async () => {
+    const res = await apiFetch(`${BASE}/audit`);
+    console.log(JSON.stringify(await res.json(), null, 2));
+  }))
+  .addCommand(new Command("show <file>").description("Show entries (paginated)").option("--offset <n>", "Offset", (v) => Number(v), 0).option("--limit <n>", "Limit 1-500", (v) => Number(v), 100).action(async (file: string, options: { offset: number; limit: number }) => {
+    const res = await apiFetch(`${BASE}/audit/${encodeURIComponent(file)}?offset=${options.offset}&limit=${options.limit}`);
+    console.log(JSON.stringify(await res.json(), null, 2));
+  }))
+  .addCommand(new Command("rm <file>").description("Delete an audit file").action(async (file: string) => {
+    const res = await apiFetch(`${BASE}/audit/${encodeURIComponent(file)}`, { method: "DELETE" });
+    console.log(JSON.stringify(await res.json(), null, 2));
+  }));
+
 // ── serve ──
 program
   .command("serve")
@@ -678,6 +789,86 @@ program
     // This command exists so --pid-file appears in --help output.
     console.log("To start the server, run: browserpowers serve");
     console.log("The server will start in the foreground. Press Ctrl+C to stop.");
+  });
+
+// ── doctor lite (health triage) ──
+program
+  .command("doctor")
+  .description("Run diagnostics: home writable, config, daemon, extension, skill. Prints ok/WARN/FAIL per check.")
+  .option("--json", "Machine-readable output")
+  .action(async (options: { json?: boolean }) => {
+    const rows: Array<{ check: string; status: "ok" | "WARN" | "FAIL"; detail: string; hint?: string }> = [];
+    // 1. home writable
+    try {
+      const { getHomeDir, CONFIG_DIR, CONFIG_PATH } = await import("../config.js");
+      const { mkdirSync, writeFileSync, unlinkSync, existsSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const home = getHomeDir();
+      const probeDir = process.env.BROWSERPOWERS_HOME?.trim() ? home : CONFIG_DIR;
+      mkdirSync(probeDir, { recursive: true });
+      const probe = join(probeDir, ".doctor-probe");
+      writeFileSync(probe, "ok");
+      unlinkSync(probe);
+      rows.push({ check: "home writable", status: "ok", detail: process.env.BROWSERPOWERS_HOME ? `BROWSERPOWERS_HOME=${home}` : probeDir });
+    } catch (e) {
+      rows.push({ check: "home writable", status: "FAIL", detail: (e as Error).message, hint: "Check BROWSERPOWERS_HOME mount + permissions (same mount on host/sandbox, not just same text)" });
+    }
+    // 2. config
+    try {
+      const { loadConfig, CONFIG_PATH } = await import("../config.js");
+      loadConfig();
+      rows.push({ check: "config", status: "ok", detail: CONFIG_PATH });
+    } catch (e) {
+      rows.push({ check: "config", status: "FAIL", detail: (e as Error).message, hint: "Fix or delete config YAML to regenerate defaults" });
+    }
+    // 3. daemon
+    let browsers: any[] = [];
+    try {
+      const res = await apiFetch(`${BASE}/browsers`, { signal: AbortSignal.timeout(3000) });
+      browsers = ((await res.json()) as { browsers: any[] }).browsers ?? [];
+      rows.push({ check: "daemon running", status: "ok", detail: BASE });
+    } catch (e) {
+      rows.push({ check: "daemon running", status: "FAIL", detail: (e as Error).message, hint: "Run: browserpowers serve (or pnpm dev:core)" });
+    }
+    // 4. extension
+    if (browsers.length > 0) {
+      const stale = browsers.filter((b: any) => Date.now() - (b.lastHeartbeat ?? Date.now()) > 60_000);
+      rows.push(stale.length === 0
+        ? { check: "extension connected", status: "ok", detail: `${browsers.length} browser(s), heartbeats fresh` }
+        : { check: "extension connected", status: "WARN", detail: `${stale.length}/${browsers.length} stale heartbeat >60s`, hint: "Reload extension, check WS URL + API key" });
+    } else {
+      rows.push({ check: "extension connected", status: "FAIL", detail: "0 browsers", hint: "Load extension (chrome://extensions → Load unpacked), check core URL" });
+    }
+    // 5. skill
+    try {
+      const { existsSync } = await import("node:fs");
+      const { resolve, dirname } = await import("node:path");
+      const { fileURLToPath } = await import("node:url");
+      // CLI runs from core/dist — walk up to repo root for skill/SKILL.md.
+      const here = dirname(fileURLToPath(import.meta.url));
+      const candidates = [resolve(here, "../../../skill/SKILL.md"), resolve(process.cwd(), "skill/SKILL.md")];
+      const found = candidates.find((p) => existsSync(p));
+      rows.push(found
+        ? { check: "skill", status: "ok", detail: found }
+        : { check: "skill", status: "WARN", detail: "skill/SKILL.md not found", hint: "Copy skill/SKILL.md into your agent harness skills dir" });
+    } catch (e) {
+      rows.push({ check: "skill", status: "WARN", detail: (e as Error).message });
+    }
+    // 6. version
+    rows.push({ check: "version", status: "ok", detail: VERSION });
+    const hasFail = rows.some((r) => r.status === "FAIL");
+    if (options.json) {
+      console.log(JSON.stringify({ ok: !hasFail, checks: rows }, null, 2));
+    } else {
+      console.log("\n  🩺 BrowserPowers Doctor\n");
+      for (const r of rows) {
+        const icon = r.status === "ok" ? "✅" : r.status === "WARN" ? "⚠️" : "❌";
+        console.log(`  ${icon} ${r.check}: ${r.detail}`);
+        if (r.hint) console.log(`     → ${r.hint}`);
+      }
+      console.log(hasFail ? "\n  1+ FAIL — follow hints above, re-run doctor.\n" : "\n  All green (WARN ok).\n");
+    }
+    if (hasFail) process.exitCode = 1;
   });
 
 // ── help [topic] — comprehensive reference (overrides commander's default) ──

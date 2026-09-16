@@ -1,0 +1,14 @@
+{
+  "$schema": "../../schemas/case.schema.json",
+  "schemaVersion": 1,
+  "id": "screenshot-viewport",
+  "title": "Viewport screenshot returns PNG bytes",
+  "suite": "core",
+  "tags": ["screenshot", "visual"],
+  "seed": 4,
+  "fixture": { "startPath": "https://example.com" },
+  "prompts": { "en": "Screenshot the page" },
+  "coverage": ["screenshots.capture"],
+  "assertions": { "site": [], "response": [], "adapter": ["screenshotNonEmpty"] },
+  "smoke": { "steps": [{ "action": "screenshot", "evidence": "screenshotCreated" }] }
+}

@@ -43,11 +43,12 @@ import {
   dispatchKeyEvent,
   focusElement,
   setElementValue,
+  runtimeEvaluate,
 } from "../cdp.js";
 import type { ActionResult, Target, ExecutionVerdict } from "../types.js";
 
 type ActAction =
-  | "click" | "fill" | "check" | "select_option" | "press" | "scroll" | "submit"
+  | "click" | "fill" | "check" | "select_option" | "press" | "scroll" | "scroll_to" | "wheel" | "focus" | "blur" | "submit"
   | "wait_for" | "type" | "smart_click" | "fill_form" | "upload" | "drag"
   | "dblclick" | "hover" | "dialog_override" | "dialog_respond"
   | "click_at" | "dblclick_at" | "hover_at";
@@ -69,6 +70,10 @@ export async function dispatchActAction(
     case "select_option": return selectOption(params, tabId, frameId);
     case "press": return press(params, tabId, frameId);
     case "scroll": return scrollAction(params, tabId, frameId);
+    case "scroll_to": return scrollToAction(params, tabId, frameId);
+    case "wheel": return wheelAction(params, tabId, frameId);
+    case "focus": return focusAction(params, tabId, frameId);
+    case "blur": return blurAction(params, tabId, frameId);
     case "submit": return submit(params, tabId, frameId);
     case "wait_for": return waitFor(params, tabId, frameId);
     case "type": return typeAction(params, tabId, frameId);
@@ -442,24 +447,117 @@ async function scrollAction(params: Record<string, unknown>, tabId: number, fram
   const needsTarget = direction === "to_element";
 
   if (needsTarget) {
-    const resolved = resolveTargetParams(tabId, target, anchor);
-    if (resolved === "STALE") {
-      return blocked("scroll", `Anchor ${anchor} is no longer valid`, {
-        errorCode: "ANCHOR_STALE",
-        recoverable: true,
-        suggestions: ["Run page.read with action=inspect again", "Use a semantic target instead"],
-      });
-    }
-    if (resolved === "NONE") {
-      return notPerformed("scroll", "No target or anchor provided for to_element scroll");
-    }
-    const actParams = resolved as Record<string, unknown>;
-    actParams.direction = direction;
-    actParams.amount = amount;
-    return sendActMessage(tabId, "scroll", actParams);
+    return scrollToAction({ ...params, direction: "to_element" }, tabId, frameId);
   }
 
   return sendActMessage(tabId, "scroll", { direction, amount });
+}
+
+/**
+ * scroll_to: element target only. Returns ancestor-clipped visible bounds
+ * in top-level viewport CSS px. Partial visibility suffices; hidden/fully
+ * clipped fails. Does NOT test occlusion/hit-test (use click to verify).
+ */
+async function scrollToAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  const target = params.target as Target | undefined;
+  const anchor = params.anchor as string | undefined;
+  const resolved = resolveTargetParams(tabId, target, anchor);
+  if (resolved === "STALE") {
+    return blocked("scroll_to", `Anchor ${anchor} is no longer valid`, {
+      errorCode: "ANCHOR_STALE",
+      recoverable: true,
+      suggestions: ["Run page.read with action=inspect again", "Use a semantic target instead"],
+    });
+  }
+  if (resolved === "NONE") {
+    return notPerformed("scroll_to", "No target or anchor provided (scroll_to is element-only; use scroll direction up/down for page scroll)");
+  }
+  const actParams = resolved as Record<string, unknown>;
+  actParams.direction = "to_element";
+  const res = await sendActMessage(tabId, "scroll", actParams);
+  if (!res.success) return { ...res, action: "scroll_to" };
+  // Attach visible bounds via resolve (center + elementInfo) for caller geometry.
+  try {
+    const geom = await sendResolve(tabId, "click", resolved as Record<string, unknown>);
+    if (geom.ok && geom.coords) {
+      return {
+        ...res,
+        action: "scroll_to",
+        evidence: { ...(res.evidence ?? {}), visible_bounds: { x: Math.round(geom.coords.x), y: Math.round(geom.coords.y) }, note: "ancestor-clipped center; partial visibility suffices; not occlusion-tested" },
+      };
+    }
+  } catch { /* bounds best-effort */ }
+  return { ...res, action: "scroll_to" };
+}
+
+/**
+ * wheel: native mouse-wheel input via CDP Input.dispatchMouseEvent.
+ * Requires at least one nonzero delta. Target scrolled into view first;
+ * without target, input lands at viewport centre (400,300 fallback documented).
+ * Returns echoed input (not guaranteed scroll distance — page may preventDefault).
+ */
+async function wheelAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  const deltaX = Number(params.delta_x ?? params.deltaX ?? 0) || 0;
+  const deltaY = Number(params.delta_y ?? params.deltaY ?? 0) || 0;
+  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY) || (deltaX === 0 && deltaY === 0)) {
+    return notPerformed("wheel", "wheel requires delta_x/delta_y with at least one nonzero (e.g. delta_y=600 down, -600 up)");
+  }
+  const target = params.target as Target | undefined;
+  const anchor = params.anchor as string | undefined;
+  let x = typeof params.x === "number" ? params.x as number : 400;
+  let y = typeof params.y === "number" ? params.y as number : 300;
+  if (target || anchor) {
+    const resolved = resolveTargetParams(tabId, target, anchor);
+    if (resolved === "STALE") {
+      return blocked("wheel", `Anchor ${anchor} is no longer valid`, { errorCode: "ANCHOR_STALE", recoverable: true });
+    }
+    if (resolved !== "NONE") {
+      const r = await sendResolve(tabId, "hover", resolved as Record<string, unknown>);
+      if (r.ok && r.coords) { x = r.coords.x; y = r.coords.y; }
+    }
+  }
+  const moved = await dispatchMouseEvent(tabId, "mouseWheel", x, y, { deltaX, deltaY });
+  if (!moved.ok) {
+    return blocked("wheel", `Wheel dispatch failed: ${moved.error}`, {
+      errorCode: "CDP_DISPATCH_FAILED", recoverable: true,
+      executionVerdict: { executed: false, world: "cdp", durationMs: 0, path: "cdp.input.dispatchMouseEvent" },
+    });
+  }
+  return performed("wheel", `Wheeled (${deltaX}, ${deltaY}) at (${Math.round(x)}, ${Math.round(y)})`, {
+    evidence: { x: Math.round(x), y: Math.round(y), deltaX, deltaY, note: "echoed input, not guaranteed distance; page may preventDefault" },
+    data: { x, y, deltaX, deltaY },
+    executionVerdict: { executed: true, world: "cdp", durationMs: moved.durationMs || 0, path: "cdp.input.dispatchMouseEvent" },
+  });
+}
+
+/**
+ * focus: DOM.focus via CDP, with microtask-separated verification.
+ * blur: remove focus via Runtime.evaluate (activeElement.blur).
+ */
+async function focusAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  const target = params.target as Target | undefined;
+  const anchor = params.anchor as string | undefined;
+  const resolved = resolveTargetParams(tabId, target, anchor);
+  if (resolved === "STALE") return blocked("focus", `Anchor ${anchor} is no longer valid`, { errorCode: "ANCHOR_STALE", recoverable: true });
+  if (resolved === "NONE") return notPerformed("focus", "No target or anchor provided");
+  const r = await sendResolve(tabId, "focus", resolved as Record<string, unknown>);
+  if (!r.ok) return r.result;
+  if (!r.jsExpression) return blocked("focus", "Resolve did not return jsExpression", { errorCode: "RESOLVE_NO_EXPRESSION", recoverable: true });
+  const f = await focusElement(tabId, r.jsExpression);
+  if (!f.ok || !f.focused) return blocked("focus", `Focus failed: ${f.error ?? "unknown"}`, { errorCode: "FOCUS_FAILED", recoverable: true });
+  return performed("focus", "Focused element", { evidence: { coords: r.coords }, executionVerdict: { executed: true, world: "cdp", durationMs: f.durationMs || 0, path: "cdp.dom.focus" } });
+}
+
+async function blurAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  // Blur whatever is focused; target optional (if given, focus-check after blur).
+  const target = params.target as Target | undefined;
+  const anchor = params.anchor as string | undefined;
+  const attach = await ensureAttached(tabId, "input.blur");
+  if (!attach.attached) return blocked("blur", `CDP attach failed: ${attach.error}`, { errorCode: "CDP_ATTACH_FAILED", recoverable: true });
+  const res = await runtimeEvaluate(tabId, `(() => { try { const ae = document.activeElement; if (ae && ae.blur) ae.blur(); if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); return { ok: true, tag: (ae && ae.tagName) || null }; } catch (e) { return { ok: false, error: String(e) }; } })()`);
+  if (!res.ok) return blocked("blur", `Blur failed: ${res.exceptionDetails?.text ?? "unknown"}`, { errorCode: "BLUR_FAILED", recoverable: true });
+  void target; void anchor;
+  return performed("blur", "Removed focus", { data: res.value as Record<string, unknown>, executionVerdict: { executed: true, world: "cdp", durationMs: res.durationMs || 0, path: "cdp.runtime.evaluate" } });
 }
 
 async function submit(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -649,11 +747,27 @@ async function uploadAction(params: Record<string, unknown>, tabId: number, fram
     return notPerformed("upload", "No target or anchor provided");
   }
 
+  // Safety lite: bound file_data (20MB base64 ≈ 15MB bytes). Larger → honest reject, no chunking in lite.
+  const fileData = params.file_data as string | undefined;
+  if (fileData && fileData.length > 20 * 1024 * 1024) {
+    return blocked("upload", `File too large (${Math.round(fileData.length / 1048576)}MB base64, max 20MB in lite) — split file or use smaller asset`, {
+      errorCode: "FILE_TOO_LARGE",
+      recoverable: true,
+    });
+  }
+
   const actParams = resolved as Record<string, unknown>;
   actParams.file_data = params.file_data;
   actParams.file_name = params.file_name;
   actParams.file_type = params.file_type;
-  return sendActMessage(tabId, "upload", actParams);
+  const res = await sendActMessage(tabId, "upload", actParams);
+  // effect_state: committed (success) | none (not performed) | unknown (blocked/ambiguous — may have happened, don't blind retry).
+  const effect = res.status === "performed" || res.status === "already_in_desired_state" ? "committed" : res.status === "not_performed" ? "none" : "unknown";
+  return {
+    ...res,
+    evidence: { ...(res.evidence ?? {}), effect_state: effect, phase: "browser-transaction", cleanup_state: "none" },
+    data: { ...((res.data as Record<string, unknown>) ?? {}), effect_state: effect },
+  };
 }
 
 // ── Drag action ──
@@ -925,7 +1039,7 @@ async function fillForm(params: Record<string, unknown>, tabId: number, frameId?
  */
 async function sendResolve(
   tabId: number,
-  action: "click" | "dblclick" | "hover" | "type" | "fill",
+  action: "click" | "dblclick" | "hover" | "type" | "fill" | "focus",
   params: Record<string, unknown>,
 ): Promise<{ ok: true; coords?: { x: number; y: number }; jsExpression?: string; text?: string; delay?: number; value?: string; elementInfo?: Record<string, unknown>; resolveVerdict?: ExecutionVerdict } | { ok: false; result: ActionResult }> {
   const response = await sendMessageRaw(tabId, "bp:resolve", { ...params, action });
@@ -1280,6 +1394,26 @@ async function dispatchFillViaCdp(
   const set = await setElementValue(tabId, jsExpression, value);
   if (!set.ok) {
     return await sendFallback(tabId, "fill", "bp:fallback-fill", { ...resolveParams, _cdpAttachError: set.error });
+  }
+
+  // Honest fill verification: formatting (masks, trimming, maxLength) may still
+  // satisfy the request even when raw value differs. Don't blind-refill.
+  if (set.value !== value) {
+    return notPerformed("fill", `Fill mismatch: expected ${JSON.stringify(value)} but field reads ${JSON.stringify(set.value)} — formatting may still satisfy; read field and correct only remaining difference`, {
+      errorCode: "FILL_VALUE_MISMATCH",
+      recoverable: true,
+      evidence: { expected: value, actual: set.value, tag: (resolve.elementInfo as { tag?: string } | undefined)?.tag },
+      suggestions: ["Read the field value", "Correct only remaining difference, no blind refill"],
+      data: { value, actual: set.value, elementInfo: resolve.elementInfo },
+      executionVerdict: {
+        executed: true,
+        world: "main",
+        value: set.value,
+        valueMatched: false,
+        durationMs: set.durationMs || 0,
+        path: "cdp.runtime.evaluate",
+      },
+    });
   }
 
   return performed("fill", `Filled via CDP`, {
