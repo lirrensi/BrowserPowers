@@ -76,7 +76,7 @@ step("4/4 eval smoke cases are non-destructive (static scan)");
     const s = readFileSync(c, "utf-8");
     for (const b of banned) if (s.includes(b)) hits.push(`${c.split("cases")[1]} contains ${b}`);
   }
-  if (hits.length === 0) ok(`${cases.length} cases scanned — read-only (navigate/inspect/fill data-URL/screenshot)`);
+  if (hits.length === 0) ok(`${cases.length} cases scanned — read-only (navigate/inspect/fill localhost fixture/screenshot)`);
   else fail(hits.join("\n"));
 }
 

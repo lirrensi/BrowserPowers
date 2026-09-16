@@ -56,6 +56,17 @@ if (cmd === "validate") {
   console.log("# Operation coverage (capability count, not case count)");
   for (const [op, n] of [...ops.entries()].sort()) console.log(`- ${op}: ${n} case(s)`);
 } else if (cmd === "smoke") {
+  const { createServer } = await import("node:http");
+  // Localhost fixture server: content scripts never inject into data: URLs,
+  // so {fixture} placeholders in case steps resolve to this http origin.
+  const FORM_HTML = `<!doctype html><html><head><title>Eval fixture</title></head><body><form><input id="t" placeholder="Name"><button>Save</button></form></body></html>`;
+  const fixtures = createServer((req, res) => {
+    if (req.url === "/form.html") { res.writeHead(200, { "Content-Type": "text/html" }); res.end(FORM_HTML); }
+    else { res.writeHead(404); res.end("nope"); }
+  });
+  await new Promise((resolve) => fixtures.listen(0, "127.0.0.1", resolve));
+  const fixtureBase = `http://127.0.0.1:${fixtures.address().port}`;
+  const sub = (v) => typeof v === "string" ? v.replaceAll("{fixture}", fixtureBase) : v;
   const base = process.env.BP_BASE || "http://127.0.0.1:4199/api";
   const browserName = process.env.BP_BROWSER || "";
   const cases = loadCases().filter(({ manifest: m }) => !filterCase || m.id === filterCase);
@@ -72,7 +83,7 @@ if (cmd === "validate") {
   for (const { manifest: m } of cases) {
     try {
       for (const step of m.smoke.steps) {
-        if (step.action === "navigate") await api(`/browsers/${browser.id}/execute`, { method: "POST", body: JSON.stringify({ tool: "tabs.navigate", params: { url: step.url } }) });
+        if (step.action === "navigate") await api(`/browsers/${browser.id}/execute`, { method: "POST", body: JSON.stringify({ tool: "tabs.navigate", params: { url: sub(step.url) } }) });
         else if (step.action === "inspect") await api(`/browsers/${browser.id}/execute`, { method: "POST", body: JSON.stringify({ tool: "page.read", params: { action: "inspect", limit: 10, compact: true } }) });
         else if (step.action === "fill") await api(`/browsers/${browser.id}/execute`, { method: "POST", body: JSON.stringify({ tool: "page.act", params: { action: "fill", target: step.target, value: step.value } }) });
         else if (step.action === "tabs_list") await api(`/browsers/${browser.id}/execute`, { method: "POST", body: JSON.stringify({ tool: "tabs.list", params: {} }) });
@@ -83,6 +94,7 @@ if (cmd === "validate") {
     } catch (err) { console.log(`❌ ${m.id}: ${err.message}`); fail++; }
   }
   console.log(`\n${pass} passed, ${fail} failed, 0 unverified (browser present)`);
+  fixtures.close();
   process.exitCode = fail === 0 ? 0 : 1;
 } else {
   console.error(`Unknown command ${cmd}. Use validate|list|coverage|smoke [--case=id]`);

@@ -2,17 +2,17 @@
   "$schema": "../../schemas/case.schema.json",
   "schemaVersion": 1,
   "id": "form-fill",
-  "title": "Fill inline data-URL form and verify mismatch honesty",
+  "title": "Fill localhost-fixture form and verify mismatch honesty",
   "suite": "core",
   "tags": ["form", "fill"],
   "seed": 2,
-  "fixture": { "startPath": "data:text/html,<form><input id=t placeholder=Name><button>Save</button></form>" },
+  "fixture": { "startPath": "{fixture}/form.html", "note": "Content scripts never inject into data: URLs (platform restriction), so the smoke runner serves this fixture over localhost http and substitutes {fixture}." },
   "prompts": { "en": "Open {url} and fill the Name field with Ada" },
   "coverage": ["page.read.inspect", "page.act.fill"],
   "assertions": { "site": [], "response": [], "adapter": ["fillOkOrMismatch"] },
   "smoke": {
     "steps": [
-      { "action": "navigate", "url": "data:text/html,<form><input id=t placeholder=Name><button>Save</button></form>" },
+      { "action": "navigate", "url": "{fixture}/form.html" },
       { "action": "inspect", "saveAs": "tree" },
       { "action": "fill", "target": { "css": "#t" }, "value": "Ada" }
     ]
