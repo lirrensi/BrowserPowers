@@ -368,13 +368,23 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 #   bare text   → text content match
 ```
 
+### Scripting — no project, no install, no file
+
+```bash
+bp run "return (await bp.listBrowsers()).length"
+bp run "await bp.navigate((await bp.waitForBrowser()).id, 'https://example.com')"
+bp run "return Object.keys(sdk)" # ["BrowserPowersClient", ...] — the module namespace
+```
+`bp` is a prebound client, `sdk` the module namespace, top-level await
+works, `return` prints (or `--json`). Any folder, no `package.json`, no
+`npm install`. This is the fastest path — reach for it first.
+
 ### Scripting from Node (one import, many calls)
 
-The CLI is one-shot per process — one spawn per call, no shared state.
-For sequences, filtering, and parallel fan-out, import the REST client
-instead (zero dependencies at runtime — only `node:fs`/`node:path`):
+Same client as a file, for longer scripts. Zero setup first:
+`bp run "..."` above. When it outgrows one line, graduate to a file:
 
-**From a different project** (recommended — survives deleting this repo):
+**From a different project** (survives deleting this repo):
 ```bash
 npm install "file:$(bp sdk path)"
 # then, in your script:

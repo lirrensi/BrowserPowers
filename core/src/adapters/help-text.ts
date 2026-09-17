@@ -426,6 +426,8 @@ function quickReference(): string {
     "### System",
     "- `exec <browserId> <tool> [params...]` — Run any tool with JSON params",
     "- `exec-all <tool> [params...]` — Run a tool across all browsers",
+    "- `run \"...\"` — Inline JS, no project/file (`bp` prebound, top-level await, `return` prints)",
+    "- `sdk path` — Print the vendored SDK dir (`npm install \"file:$(bp sdk path)\"`)",
     "- `init` — First-time setup wizard",
     "- `serve` — Start the core server",
     "- `mcp-config` — Print MCP client config snippet",

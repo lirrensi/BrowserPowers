@@ -49,16 +49,20 @@ the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpow
 | audit | `browserpowers audit list\|show <file>\|rm <file>` / `GET /api/audit` | n/a (use CLI/REST) |
 | daemon | `browserpowers serve` (foreground) / `browserpowers stop` / `browserpowers init` / `browserpowers mcp-config --client claude\|cursor` | n/a (process lifecycle, not script calls) |
 
+## Scripting — no project, no install, no file
+
+```bash
+bp run "return (await bp.listBrowsers()).length"
+bp run "await bp.navigate((await bp.waitForBrowser()).id, 'https://example.com')"
+bp run "return Object.keys(sdk)" # ["BrowserPowersClient", ...] — the module namespace
+```
+`bp` is a prebound client, `sdk` the module namespace, top-level await
+works, `return` prints (or `--json`). Any folder, no `package.json`, no
+`npm install`. Fastest path — reach for it first.
+
 ## Scripting from Node (one import, many calls)
 
-The CLI is one-shot per process — one spawn per call. For sequences,
-filtering, and parallel fan-out, import the REST client
-(`core/src/client.ts`, zero runtime deps). From another project:
-`npm install "file:$(bp sdk path)"`, then
-`import { BrowserPowersClient } from "browserpowers"`. (`bp sdk path`
-prints `~/.browserpowers/sdk` — vendored by the installer, survives
-deleting the repo.) From inside this repo (needs `npm run build` so
-`core/dist/client.js` exists):
+Same client as a file, for longer scripts:
 ```js
 import { BrowserPowersClient } from "./core/dist/client.js";
 const bp = new BrowserPowersClient(); // base + key from env

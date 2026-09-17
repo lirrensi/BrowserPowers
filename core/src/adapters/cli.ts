@@ -612,7 +612,15 @@ program
 // ── sdk ──
 // The installer vendors the zero-dep script client (client.js + .d.ts +
 // package.json) into the install dir so the repo is deletable afterwards.
-// `sdk path` prints that stable directory: `npm install "file:$(bp sdk path)"`.
+// `sdk path` prints that stable directory; `run` executes inline JS against it.
+async function resolveSdkDir(): Promise<string> {
+  const { homedir } = await import("node:os");
+  const { resolve } = await import("node:path");
+  const home = process.env.BROWSERPOWERS_HOME?.trim() || homedir();
+  return process.env.BROWSERPOWERS_HOME?.trim()
+    ? resolve(home, "sdk")
+    : resolve(home, ".browserpowers", "sdk");
+}
 program
   .command("sdk")
   .description("Script client (SDK) helpers — vendored by the installer, repo-independent")
@@ -620,13 +628,9 @@ program
     new Command("path")
       .description("Print the vendored SDK directory (stable import source for any project)")
       .action(async () => {
-        const { homedir } = await import("node:os");
         const { resolve } = await import("node:path");
         const { existsSync } = await import("node:fs");
-        const home = process.env.BROWSERPOWERS_HOME?.trim() || homedir();
-        const sdkDir = process.env.BROWSERPOWERS_HOME?.trim()
-          ? resolve(home, "sdk")
-          : resolve(home, ".browserpowers", "sdk");
+        const sdkDir = await resolveSdkDir();
         if (!existsSync(resolve(sdkDir, "package.json")) || !existsSync(resolve(sdkDir, "client.js"))) {
           console.error(`❌ SDK not found at ${sdkDir} — re-run: node scripts/install.mjs`);
           process.exit(1);
@@ -634,6 +638,69 @@ program
         console.log(sdkDir);
       })
   );
+
+// ── run ──
+// Inline scripting with zero setup: no project, no npm install, no file.
+// `bp` is a prebound BrowserPowersClient, `sdk` the vendored module namespace.
+// The inline code runs inside an async wrapper, so `await` works at the top
+// level and an explicit `return` surfaces its completion value. Verified live:
+// `Object.keys(sdk)` -> ["BrowserPowersClient", ...] (NOT `import 'sdk'` —
+// commander would swallow that; the namespace is prebound, not resolvable).
+// Examples (quote so the shell passes one arg):
+//   bp run "return (await bp.listBrowsers()).length"
+//   bp run "await bp.navigate((await bp.waitForBrowser()).id, 'https://example.com')"
+//   bp run "return Object.keys(sdk)"
+program
+  .command("run")
+  .description("Run inline JS against the vendored SDK — no project, no file. `bp` prebound.")
+  .option("-e, --eval <code>", "Inline script (alternatively pass code as bare args, joined with spaces)")
+  .option("--json", "Print the completion value as JSON instead of util.inspect")
+  .argument("[code...]", "Inline JS. `bp` and `sdk` are prebound; top-level await works; `return` prints.")
+  .action(async (code: string[], options: { eval?: string; json?: boolean }) => {
+    const { resolve } = await import("node:path");
+    const { existsSync } = await import("node:fs");
+    const { pathToFileURL } = await import("node:url");
+    const sdkDir = await resolveSdkDir();
+    const clientPath = resolve(sdkDir, "client.js");
+    if (!existsSync(clientPath)) {
+      cliError(`SDK not found at ${sdkDir} — re-run: node scripts/install.mjs`);
+    }
+    const inline = [options.eval, ...(code ?? [])].filter(Boolean).join(" ").trim();
+    if (!inline) {
+      cliError(`No script given. Example: bp run "return (await bp.listBrowsers()).length"`);
+    }
+    let sdk: unknown;
+    try {
+      sdk = await import(pathToFileURL(clientPath).href);
+    } catch (e) {
+      cliError(`Failed to load SDK at ${sdkDir}: ${(e as Error).message}`);
+    }
+    if (!sdk || typeof sdk !== "object" || !("BrowserPowersClient" in sdk)) {
+      cliError(`SDK at ${sdkDir} has no BrowserPowersClient export — re-run: node scripts/install.mjs`);
+    }
+    const ctorUnknown: unknown = sdk.BrowserPowersClient;
+    if (typeof ctorUnknown !== "function") {
+      cliError(`SDK at ${sdkDir} has no BrowserPowersClient export — re-run: node scripts/install.mjs`);
+    }
+    const bp: unknown = Reflect.construct(ctorUnknown, []);
+    const factory: unknown = new Function("bp", "sdk", `"use strict"; return (async () => { ${inline} })();`);
+    if (typeof factory !== "function") {
+      cliError(`Failed to compile inline script`);
+    }
+    try {
+      const value: unknown = await Reflect.apply(factory, undefined, [bp, sdk]);
+      if (value !== undefined) {
+        if (options.json) console.log(JSON.stringify(value, null, 2));
+        else {
+          const { inspect } = await import("node:util");
+          console.log(inspect(value, { depth: 10, colors: process.stdout.isTTY }));
+        }
+      }
+    } catch (e) {
+      console.error(`❌ ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+      process.exit(1);
+    }
+  });
 
 // ── mcp-config ──
 program
