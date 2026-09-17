@@ -7,7 +7,7 @@
 //          output and the install dir.
 //
 //          The previous test cycle hit the "silent fallback" bug
-//          because pnpm build only updates .output/chrome-mv3, but
+//          because `npm run build` only updates .output/chrome-mv3, but
 //          Chrome loads from ~/.browserpowers/extension. This script
 //          bridges the gap.
 
@@ -20,7 +20,6 @@ import { findBrowser, executeTool } from "./browser.mjs";
 const REPO_DIR = process.cwd();
 const BUILD_DIR = resolve(REPO_DIR, "extension", ".output", "chrome-mv3");
 const INSTALL_DIR = resolve(homedir(), ".browserpowers", "extension");
-
 const BOLD = "\x1b[1m", CYAN = "\x1b[36m", GREEN = "\x1b[32m", DIM = "\x1b[2m", RESET = "\x1b[0m";
 
 function step(msg) { console.log(`\n  ${BOLD}${msg}${RESET}`); console.log(`  ${"-".repeat(msg.length)}`); }
@@ -31,7 +30,7 @@ function run(cmd, cwd) {
 
 async function main() {
   step("1/4  Building extension");
-  run("pnpm run build:chrome", resolve(REPO_DIR, "extension"));
+  run("npm run build:chrome -w browserpowers-extension", REPO_DIR);
 
   if (!existsSync(BUILD_DIR)) {
     throw new Error(`Build did not produce ${BUILD_DIR}`);

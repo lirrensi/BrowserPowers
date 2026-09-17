@@ -67,7 +67,13 @@ function isPortBusy(port: number): Promise<boolean> {
 function resolvePaths() {
   const coreEntry = fileURLToPath(import.meta.url);
   const coreDir = resolve(dirname(coreEntry), "..");
-  const tsxCli = resolve(coreDir, "node_modules", "tsx", "dist", "cli.mjs");
+  // npm hoists workspace deps to the repo root — tsx lives at
+  // <root>/node_modules, not core/node_modules (pnpm kept it local).
+  const candidates = [
+    resolve(coreDir, "node_modules", "tsx", "dist", "cli.mjs"),
+    resolve(coreDir, "..", "node_modules", "tsx", "dist", "cli.mjs"),
+  ];
+  const tsxCli = candidates.find((p) => existsSync(p)) ?? candidates[0];
   // launcher.exe is compiled once, committed to repo
   const launcherExe = resolve(coreDir, "launcher", "launcher.exe");
   return { coreEntry, coreDir, tsxCli, launcherExe };

@@ -17,8 +17,8 @@ Closes #(issue)
 
 ## Testing
 
-- [ ] Core unit tests pass: `pnpm test:core`
-- [ ] Extension unit tests pass: `pnpm test:ext`
+- [ ] Core unit tests pass: `npm run test:core`
+- [ ] Extension unit tests pass: `npm run test:ext`
 - [ ] Manual testing done (describe)
 
 ## Checklist

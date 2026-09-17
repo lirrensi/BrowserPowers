@@ -353,14 +353,14 @@ Extension loads → init service worker → ws-client.connect()
 
 ```bash
 # Development (auto-restart on changes)
-pnpm dev:core            # tsx watch src/index.ts
+npm run dev:core            # tsx watch src/index.ts
 
 # Production
-pnpm build               # tsc
-pnpm start               # node dist/index.js
+npm run build -w browserpowers        # tsc
+npm run start -w browserpowers        # node dist/index.js
 
 # CLI mode
-pnpm run cli -- list
+npm run cli -w browserpowers -- list
 ```
 
 ### Shutdown

@@ -19,8 +19,8 @@
  *   - never deletes history/bookmarks/downloads; never calls stop on anyone's daemon
  *   - cleanup in `finally`: kill ONLY spawned PIDs, remove temp dirs
  *
- * Usage: pnpm test:live
- * Requires: Edge (msedge.exe), built extension (pnpm build), port 4199 free.
+ * Usage: npm run test:live
+ * Requires: Edge (msedge.exe), built extension (npm run build), port 4199 free.
  */
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, existsSync, rmSync } from "node:fs";
@@ -68,9 +68,9 @@ try {
   console.log("▶ preflight (no browser launched yet)");
   if (!existsSync(EDGE)) { console.error("  ❌ Edge not found — install Edge or set EDGE path; aborting (nothing started)"); process.exit(2); }
   console.log("  ✅ Edge present");
-  if (!existsSync(join(EXTDIR, "manifest.json"))) { console.error("  ❌ extension not built — run `pnpm build` first; aborting (nothing started)"); process.exit(2); }
+  if (!existsSync(join(EXTDIR, "manifest.json"))) { console.error("  ❌ extension not built — run `npm run build` first; aborting (nothing started)"); process.exit(2); }
   console.log("  ✅ built extension present");
-  if (!existsSync(CORE)) { console.error("  ❌ core not built — run `pnpm build` first; aborting (nothing started)"); process.exit(2); }
+  if (!existsSync(CORE)) { console.error("  ❌ core not built — run `npm run build` first; aborting (nothing started)"); process.exit(2); }
   console.log("  ✅ built core present");
   try {
     await fetch(`${API}/health`, { signal: AbortSignal.timeout(3000) });

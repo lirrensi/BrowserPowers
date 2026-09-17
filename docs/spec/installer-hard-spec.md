@@ -140,6 +140,7 @@ At minimum, the following must exist after install:
 
 - `~/.browserpowers/extension/manifest.json`
 - `~/.browserpowers/bin/browserpowers*` CLI entry points
+- `~/.browserpowers/bin/bp*` shorthand forwarders (same commands via `bp`)
 - Any platform-specific files needed for auto-start
 
 The Chrome extension is atomically swapped into place via a staging directory. The path `~/.browserpowers/extension/` is always valid: either the old version or the new version, never partial or missing.
@@ -157,6 +158,9 @@ browserpowers list
 browserpowers page read
 browserpowers page act
 ```
+
+`bp` is shorthand for `browserpowers` — `bp status` ≡ `browserpowers status`.
+The installer writes `bp*` forwarding wrappers alongside `browserpowers*`.
 
 ### 2.5 Register hidden auto-start
 
@@ -270,7 +274,7 @@ The following must be true within 60 seconds and without manual intervention:
 2. The script exits with code `0`.
 3. The shell prompt returns.
 4. `~/.browserpowers/extension/manifest.json` exists.
-5. `~/.browserpowers/bin/browserpowers*` exist.
+5. `~/.browserpowers/bin/browserpowers*` and `~/.browserpowers/bin/bp*` exist.
 6. Port `4199` is listening (daemon is running).
 7. No visible command-line window from the daemon or auto-start remains open.
 8. The daemon is registered to start automatically on user logon for the current platform.
@@ -321,7 +325,7 @@ That is the entire user interaction.
 
 ## 8. Implementation Notes
 
-- The core runs from the repository (`core/`). `pnpm` 11 in a workspace context fails when copied outside the workspace, so the core is not copied to `~/.browserpowers/core/`.
+- The core runs from the repository (`core/`, npm workspace) — never copied to `~/.browserpowers/core/`, so the daemon and CLI always resolve the same paths.
 - The extension is built in the repository and atomically swapped into `~/.browserpowers/extension/` via a staging directory.
 - On Windows, the current implementation uses a user-scoped Task Scheduler task with the **Hidden** flag to suppress the daemon window. This is an implementation detail; the spec only requires the result (no visible window, userland auto-start).
 - On macOS, the current implementation uses `~/Library/LaunchAgents/com.browserpowers.plist`.

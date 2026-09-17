@@ -15,7 +15,7 @@
  *          connected, the content script is alive in the active tab.
  *          Other tests cover page.js, page.act, and screenshots.
  *
- *          Used by `pnpm smoke` and as the first check before any
+ *          Used by `npm run smoke` and as the first check before any
  *          other manual test runs.
  */
 

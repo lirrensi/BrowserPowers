@@ -44,7 +44,7 @@ Instead of ephemeral, headless browser automation (Playwright, Puppeteer, Seleni
 
 ```bash
 # Install and start the core server
-pnpm dev:core
+npm run dev:core
 # Core listens on localhost:4199 — HTTP, WebSocket, and MCP
 
 > **Optional**: You can set an API key in `~/.config/browserpowers/config.yaml` under `auth.apiKey`. When set, all REST, MCP, and WebSocket connections will require this key. The browser extension will prompt you for the key in its settings UI.
@@ -78,7 +78,7 @@ browserpowers screenshot "Work Chrome" "./screenshot.png"
 browserpowers content "Research Firefox"
 ```
 
-> **Dev mode**: Use `pnpm run cli -- <command>` instead of `browserpowers <command>`.
+> **Dev mode**: Use `npm run cli -- <command>` instead of `browserpowers <command>`.
 > For full production installation, see the install script at `scripts/install.mjs`.
 
 **Via REST API:**

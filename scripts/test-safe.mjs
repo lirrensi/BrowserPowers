@@ -10,9 +10,7 @@
  *   4. static guards: skill documents the CLI; eval smoke cases contain no
  *      destructive actions (nothing that deletes history/bookmarks/downloads)
  *
- * Needs a browser: `pnpm eval:smoke`, `pnpm test:manual`, `pnpm smoke`.
- * Those only touch example.com + data: URLs and never delete anything —
- * see docs/testing.md.
+ * Needs a browser: `npm run eval:smoke`, `npm run test:manual`, `npm run smoke`.
  */
 import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -28,17 +26,15 @@ const run = (cmd, args) => spawnSync(cmd, args, { cwd: root, shell: true, stdio:
 
 step("1/4 unit + integration (mocked, no browser)");
 {
-  const r = run("pnpm", ["test:core"]);
+  const r = run("npm", ["run", "test:core"]);
   if (r.status === 0) ok("core: gates, audit redaction, MCP tools, registry");
   else { fail("core tests failed"); process.stdout.write((r.stdout || "").slice(-2000)); }
 }
 {
-  const r = run("pnpm", ["test:ext"]);
+  const r = run("npm", ["run", "test:ext"]);
   if (r.status === 0) ok("extension: routers, anchors, generations");
   else { fail("extension tests failed"); process.stdout.write((r.stdout || "").slice(-2000)); }
 }
-
-step("2/4 eval manifests valid (no browser)");
 {
   const r = run("node", ["evals/browser/cli.mjs", "validate"]);
   if (r.status === 0) ok((r.stdout || "").trim().split("\n").pop());

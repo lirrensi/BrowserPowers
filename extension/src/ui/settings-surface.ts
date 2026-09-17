@@ -1,12 +1,12 @@
 /**
  * FILE: extension/src/ui/settings-surface.ts
  * PURPOSE: Bootstrap the shared popup and options settings surface.
- * OWNS: Wiring the browser identity, core URL, capability permissions, reconnect/reset, and approvals UI.
+ * OWNS: Wiring the browser identity, core URL, capability permissions, reconnect/reset, approvals UI, and locale switching.
  * EXPORTS: bootstrapSettingsSurface() — initializes the shared settings/approvals experience in the current document.
  * DOCS: agent_chat/plan_ui_approval_flow_2026-05-10.md
  */
 
-import type { SitePermissionLists, PagePermissionGroup } from "../types";
+import type { PagePermissionGroup } from "../types";
 import {
   clearAllSessionPermissionOverrides,
   clearSessionPermissionOverride,
@@ -16,8 +16,16 @@ import {
   resetSettings,
   savePageSitePermissions,
   saveSettings,
-  removeSitePattern,
 } from "../storage";
+import {
+  t,
+  initI18n,
+  applyStaticI18n,
+  getLocale,
+  setLocale,
+  SUPPORTED_LOCALES,
+} from "./i18n";
+import type { Locale } from "./i18n";
 
 type SurfaceMode = "popup" | "options";
 type ConnectionState = "disconnected" | "connecting" | "connected" | "waiting";
@@ -40,27 +48,30 @@ interface ApprovalItem {
 }
 
 const CAP_GROUPS = [
-  { id: "tabs", label: "Tab Management", desc: "List, create, close tabs" },
-  { id: "screenshots", label: "Screenshots", desc: "Capture visible tab as image" },
-  { id: "history.read", label: "History — Read", desc: "Search browsing history" },
-  { id: "history.delete", label: "History — Delete", desc: "Wipe history entries" },
-  { id: "bookmarks.read", label: "Bookmarks — Read", desc: "List bookmarks" },
-  { id: "bookmarks.modify", label: "Bookmarks — Modify", desc: "Create bookmarks" },
-  { id: "bookmarks.delete", label: "Bookmarks — Delete", desc: "Remove bookmarks" },
-  { id: "downloads", label: "Downloads", desc: "List and open downloads" },
-  { id: "network", label: "Network Requests", desc: "Access network activity" },
-  { id: "storage", label: "Local Storage", desc: "Read/write localStorage" },
-  { id: "windows", label: "Windows", desc: "List, create, focus, close browser windows" },
-  { id: "cookies", label: "Cookies", desc: "Read, write, and delete HTTP cookies" },
+  { id: "tabs" },
+  { id: "screenshots" },
+  { id: "history.read" },
+  { id: "history.delete" },
+  { id: "bookmarks.read" },
+  { id: "bookmarks.modify" },
+  { id: "bookmarks.delete" },
+  { id: "downloads" },
+  { id: "network" },
+  { id: "storage" },
+  { id: "windows" },
+  { id: "cookies" },
 ] as const;
 
-const PAGE_CAP_GROUPS: Array<{ id: PagePermissionGroup; label: string; desc: string }> = [
-  { id: "page.read", label: "Page Read", desc: "Read content, metadata, find elements" },
-  { id: "page.act", label: "Page Actions", desc: "Click, type, scroll, fill forms" },
-  { id: "page.execute", label: "Execute JS", desc: "Run arbitrary JavaScript on page" },
+const PAGE_CAP_GROUPS: Array<{ id: PagePermissionGroup }> = [
+  { id: "page.read" },
+  { id: "page.act" },
+  { id: "page.execute" },
 ];
 
 const PERMISSION_OPTIONS = ["allow", "ask", "deny"] as const;
+
+// Autonyms for the locale picker; proper nouns, intentionally untranslated.
+const LOCALE_NAMES: Record<Locale, string> = { en: "English", de: "Deutsch", es: "Español", fr: "Français", ru: "Русский", zh: "中文", ar: "العربية" };
 
 export function bootstrapSettingsSurface(mode: SurfaceMode = "popup"): void {
   void init(mode).catch((error) => {
@@ -69,6 +80,8 @@ export function bootstrapSettingsSurface(mode: SurfaceMode = "popup"): void {
 }
 
 async function init(mode: SurfaceMode): Promise<void> {
+  initI18n();
+
   document.body.classList.toggle("options-page", mode === "options");
 
   const statusEl = byId("connection-status");
@@ -96,11 +109,14 @@ async function init(mode: SurfaceMode): Promise<void> {
   authKeyInput.addEventListener("change", () => { void saveAuthKey(authKeyInput); });
   approvalNotificationsInput.checked = settings.approvalNotificationsEnabled;
 
+  wireLocaleSelect({ statusEl, capsList, approvalsListEl, approvalBadge });
+
   renderCapabilities(capsList, effectivePermissions);
   const pageCapsContainer = byId("page-capabilities-list");
   renderPageCapabilities(pageCapsContainer);
   void loadPageCapabilities(pageCapsContainer);
   void updateStatus(statusEl);
+  applyStaticI18n(document);
 
   coreUrlInput.addEventListener("change", () => { void saveCoreUrl(coreUrlInput); });
   approvalNotificationsInput.addEventListener("change", () => { void saveApprovalNotifications(approvalNotificationsInput); });
@@ -139,6 +155,39 @@ function byId<T extends HTMLElement = HTMLElement>(id: string): T {
   return el as T;
 }
 
+function wireLocaleSelect(args: {
+  statusEl: HTMLElement;
+  capsList: HTMLElement;
+  approvalsListEl: HTMLElement;
+  approvalBadge: HTMLElement;
+}): void {
+  const select = document.getElementById("locale") as HTMLSelectElement | null;
+  if (!select) return;
+
+  select.innerHTML = "";
+  for (const locale of SUPPORTED_LOCALES) {
+    const option = document.createElement("option");
+    option.value = locale;
+    option.textContent = LOCALE_NAMES[locale] ?? locale;
+    select.appendChild(option);
+  }
+  select.value = getLocale();
+
+  select.addEventListener("change", () => {
+    setLocale(select.value as Locale);
+    select.value = getLocale();
+    void (async () => {
+      renderCapabilities(args.capsList, await getEffectivePermissions());
+      const pageCapsContainer = byId("page-capabilities-list");
+      renderPageCapabilities(pageCapsContainer);
+      await loadPageCapabilities(pageCapsContainer);
+      await updateStatus(args.statusEl);
+      await renderApprovals(args.approvalsListEl, args.approvalBadge, args.capsList);
+      applyStaticI18n(document);
+    })();
+  });
+}
+
 function renderCapabilities(container: HTMLElement, permissions: Record<string, string>): void {
   container.innerHTML = "";
 
@@ -150,14 +199,19 @@ function renderCapabilities(container: HTMLElement, permissions: Record<string, 
 
     const info = document.createElement("div");
     info.className = "cap-info";
-    info.innerHTML = `<strong>${group.label}</strong><small>${group.desc}</small>`;
+    const label = document.createElement("strong");
+    label.textContent = t(`caps.${group.id}.label`);
+    const desc = document.createElement("small");
+    desc.textContent = t(`caps.${group.id}.desc`);
+    info.appendChild(label);
+    info.appendChild(desc);
 
     const select = document.createElement("select");
     select.dataset.group = group.id;
     for (const opt of PERMISSION_OPTIONS) {
       const option = document.createElement("option");
       option.value = opt;
-      option.textContent = opt.toUpperCase();
+      option.textContent = t(`perms.${opt}`);
       if (opt === current) option.selected = true;
       select.appendChild(option);
     }
@@ -177,6 +231,8 @@ function renderCapabilities(container: HTMLElement, permissions: Record<string, 
     row.appendChild(select);
     container.appendChild(row);
   }
+
+  applyStaticI18n(document);
 }
 
 function renderPageCapabilities(container: HTMLElement): void {
@@ -188,17 +244,17 @@ function renderPageCapabilities(container: HTMLElement): void {
     section.dataset.group = group.id;
 
     const heading = document.createElement("h3");
-    heading.textContent = group.label;
+    heading.textContent = t(`pagecaps.${group.id}.label`);
     section.appendChild(heading);
 
     const desc = document.createElement("p");
     desc.className = "hint";
-    desc.textContent = group.desc;
+    desc.textContent = t(`pagecaps.${group.id}.desc`);
     section.appendChild(desc);
 
     for (const listName of ["allow", "ask", "deny"] as const) {
       const label = document.createElement("label");
-      label.textContent = listName.charAt(0).toUpperCase() + listName.slice(1);
+      label.textContent = t(`sites.list.${listName}`);
       label.className = `site-list-label site-list-${listName}`;
 
       const textarea = document.createElement("textarea");
@@ -206,12 +262,12 @@ function renderPageCapabilities(container: HTMLElement): void {
       textarea.dataset.group = group.id;
       textarea.dataset.list = listName;
       textarea.rows = 2;
-      textarea.placeholder = listName === "allow" ? "*" : "";
+      textarea.placeholder = listName === "allow" ? t("sites.allowPh") : "";
 
       // Debounced save
-      let saveTimer: ReturnType<typeof setTimeout> | null = null;
+      let saveTimer: ReturnType<typeof setTimeout> | undefined;
       textarea.addEventListener("input", () => {
-        if (saveTimer) clearTimeout(saveTimer);
+        clearTimeout(saveTimer);
         saveTimer = setTimeout(() => {
           void savePagePatternsFromTextarea(textarea);
         }, 600);
@@ -223,6 +279,8 @@ function renderPageCapabilities(container: HTMLElement): void {
 
     container.appendChild(section);
   }
+
+  applyStaticI18n(document);
 }
 
 async function savePagePatternsFromTextarea(textarea: HTMLTextAreaElement): Promise<void> {
@@ -272,32 +330,37 @@ async function updateStatus(statusEl: HTMLElement): Promise<void> {
     const status = await chrome.runtime.sendMessage({ type: "getConnectionStatus" }) as ConnectionStatus | undefined;
 
     if (status?.authRequired) {
-      statusEl.textContent = "API key required";
+      statusEl.textContent = t("status.authRequired");
       statusEl.className = "status disconnected";
+      applyStaticI18n(document);
       return;
     }
 
     switch (status?.state) {
       case "connected":
-        statusEl.textContent = "Connected";
+        statusEl.textContent = t("status.connected");
         statusEl.className = "status connected";
+        applyStaticI18n(document);
         return;
       case "connecting":
-        statusEl.textContent = "Connecting...";
+        statusEl.textContent = t("status.connecting");
         statusEl.className = "status connecting";
+        applyStaticI18n(document);
         return;
       case "waiting":
-        statusEl.textContent = "Waiting to reconnect...";
+        statusEl.textContent = t("status.waiting");
         statusEl.className = "status connecting";
+        applyStaticI18n(document);
         return;
       default:
-        statusEl.textContent = "Disconnected";
+        statusEl.textContent = t("status.disconnected");
         statusEl.className = "status disconnected";
     }
   } catch {
-    statusEl.textContent = "Disconnected";
+    statusEl.textContent = t("status.disconnected");
     statusEl.className = "status disconnected";
   }
+  applyStaticI18n(document);
 }
 
 async function saveName(nameInput: HTMLInputElement): Promise<void> {
@@ -319,7 +382,7 @@ async function saveApprovalNotifications(approvalNotificationsInput: HTMLInputEl
 }
 
 async function reconnect(statusEl: HTMLElement): Promise<void> {
-  statusEl.textContent = "Connecting...";
+  statusEl.textContent = t("status.connecting");
   statusEl.className = "status connecting";
   await chrome.runtime.sendMessage({ type: "reconnectToCore" });
   void updateStatus(statusEl);
@@ -334,7 +397,7 @@ async function reset(args: {
   approvalBadge: HTMLElement;
   approvalsListEl: HTMLElement;
 }): Promise<void> {
-  if (!confirm("Reset all settings to defaults?")) return;
+  if (!confirm(t("dialogs.resetConfirm"))) return;
 
   await clearAllSessionPermissionOverrides();
   await resetSettings();
@@ -381,9 +444,15 @@ async function renderApprovals(
   const pending = await chrome.runtime.sendMessage({ type: "getPendingApprovals" }) as ApprovalItem[] | undefined;
 
   if (!pending || pending.length === 0) {
-    approvalsListEl.innerHTML = '<p class="empty-state">No pending approvals.</p>';
+    approvalsListEl.innerHTML = "";
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.dataset.i18n = "approvals.empty";
+    empty.textContent = t("approvals.empty");
+    approvalsListEl.appendChild(empty);
     approvalBadge.classList.add("hidden");
     approvalBadge.textContent = "0";
+    applyStaticI18n(document);
     return [];
   }
 
@@ -397,10 +466,10 @@ async function renderApprovals(
       <div class="tool-desc">${escapeHtml(item.description)}</div>
       <div class="tool-params">${escapeHtml(JSON.stringify(item.params, null, 2))}</div>
       <div class="approval-actions">
-        <button class="btn-approve-once" data-action="approve-once" data-request-id="${item.requestId}">Approve Once</button>
-        <button class="btn-approve-session" data-action="approve-session" data-request-id="${item.requestId}">Approve Session</button>
-        <button class="btn-approve-forever" data-action="approve-forever" data-request-id="${item.requestId}">Approve Forever</button>
-        <button class="btn-deny" data-action="deny" data-request-id="${item.requestId}">Reject</button>
+        <button class="btn-approve-once" data-action="approve-once" data-request-id="${item.requestId}">${escapeHtml(t("approvals.approveOnce"))}</button>
+        <button class="btn-approve-session" data-action="approve-session" data-request-id="${item.requestId}">${escapeHtml(t("approvals.approveSession"))}</button>
+        <button class="btn-approve-forever" data-action="approve-forever" data-request-id="${item.requestId}">${escapeHtml(t("approvals.approveForever"))}</button>
+        <button class="btn-deny" data-action="deny" data-request-id="${item.requestId}">${escapeHtml(t("approvals.reject"))}</button>
       </div>
     </div>
   `).join("");
@@ -438,6 +507,7 @@ async function renderApprovals(
     });
   });
 
+  applyStaticI18n(document);
   return pending;
 }
 

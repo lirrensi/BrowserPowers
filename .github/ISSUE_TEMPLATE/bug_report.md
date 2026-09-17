@@ -12,7 +12,7 @@ A clear and concise description of the bug.
 
 ## Steps to Reproduce
 
-1. Start the core: `browserpowers serve` (or `pnpm dev:core`)
+1. Start the core: `browserpowers serve` (or `npm run dev:core`)
 2. Load the extension in ...
 3. Run command: `...`
 4. See error
@@ -28,8 +28,8 @@ What actually happened. Include error messages, screenshots, or logs.
 ## Environment
 
 - **OS:** [e.g. Windows 11, macOS 14, Ubuntu 24.04]
-- **Node.js version:** [e.g. 18, 20, 22]
-- **pnpm version:** [e.g. 9]
+- **Node.js version:** [e.g. 20, 22, 24]
+- **npm version:** [e.g. 10, 11]
 - **Browser(s):** [e.g. Chrome 130, Firefox 132]
 - **BrowserPowers version:** [e.g. 1.0.0]
 

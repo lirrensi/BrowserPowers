@@ -1,7 +1,7 @@
 # BrowserPowers
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blueviolet?style=flat-square" alt="Version 1.5.0" />
+  <img src="https://img.shields.io/badge/version-1.6.0-blueviolet?style=flat-square" alt="Version 1.6.0" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
   <img src="https://img.shields.io/badge/chrome-supported-success?style=flat-square" alt="Chrome Supported" />
   <img src="https://img.shields.io/badge/firefox-experimental-orange?style=flat-square" alt="Firefox Experimental" />
@@ -94,10 +94,10 @@ Instead of ephemeral headless browser automation (Playwright, Puppeteer, Seleniu
 Get the core server and extension running in development mode:
 
 ```bash
-# Prerequisites: Node.js >= 18, pnpm >= 9
-pnpm install
-pnpm build     # builds both core and extension
-pnpm dev       # runs core server + extension dev server in parallel
+# Prerequisites: Node.js >= 20 (npm ships with it, >= 10)
+npm install
+npm run build     # builds both core and extension
+npm run dev       # runs core server + extension dev server in parallel
 ```
 
 The core server starts on `http://127.0.0.1:4199` with:
@@ -105,7 +105,7 @@ The core server starts on `http://127.0.0.1:4199` with:
 - **MCP endpoint** at `/mcp`
 - **WebSocket** at `/ws`
 
-Use `pnpm run cli -- <command>` instead of `browserpowers <command>` during development.
+Use `npm run cli -- <command>` instead of `browserpowers <command>` during development.
 
 > For **production installation** (daemon mode, auto-start, PATH setup), see the [Production Installation](#production-installation) section below.
 
@@ -126,9 +126,8 @@ cd BrowserPowers
 
 The install script checks these for you. If anything is missing, it tells you exactly what to install.
 
-- **Node.js** >= 18
-- **pnpm** >= 9 (globally: `npm install -g pnpm`)
-- **tsx** (globally: `pnpm add -g tsx`)
+- **Node.js** >= 20 (npm >= 10 ships with it — no separate install)
+- **tsx** (local to the repo — `npm install` provides it, no global install)
 
 ### 2. Install
 
@@ -293,6 +292,8 @@ Once loaded, click the extension icon to open the popup. You can:
 
 ## CLI Reference
 
+`bp` is shorthand for `browserpowers` — every command below works with either.
+
 ```bash
 browserpowers serve                        # Start the core server (foreground, default)
 browserpowers start                        # Start the daemon detached, then exit
@@ -327,8 +328,23 @@ browserpowers config show                                # Print current configu
 browserpowers config path                                # Show config file location
 ```
 
-> **Dev mode**: Use `pnpm run cli -- <command>` instead of `browserpowers <command>`.
+Same surface as a script — one import, many calls, parallel fan-out:
 
+| CLI | Script (`BrowserPowersClient`) |
+| --- | --- |
+| `browserpowers list` | `bp.listBrowsers()` |
+| `browserpowers tabs <browser>` | `bp.tabsList(browser)` |
+| `browserpowers navigate <browser> <url>` | `bp.navigate(browser, url)` |
+| `browserpowers screenshot <browser> [file]` | `bp.screenshot(browser)` / `bp.saveScreenshot(browser, path)` |
+| `browserpowers page read <browser> <action>` | `bp.pageRead(browser, action, params)` |
+| `browserpowers page act <browser> <action>` | `bp.pageAct(browser, action, params)` |
+| `browserpowers exec <browser> <tool>` | `bp.execute(browser, tool, params)` (any tool) |
+| `browserpowers exec-all <tool>` | `bp.executeAll(tool, params)` |
+| `POST /api/execute-batch` | `bp.executeBatch([{ browser, tool, params }])` |
+| `browserpowers request-help <browser>` | `bp.execute(browser, "human.requestHelp", { prompt })` |
+| `browserpowers status` | `bp.health()` / `bp.waitForBrowser(name)` |
+
+> **Dev mode**: Use `npm run cli -- <command>` instead of `browserpowers <command>`.
 ### Page Interaction Syntax
 
 The CLI supports smart target detection for page operations:
@@ -352,15 +368,68 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 #   bare text   → text content match
 ```
 
+### Scripting from Node (one import, many calls)
+
+The CLI is one-shot per process — one spawn per call, no shared state.
+For sequences, filtering, and parallel fan-out, import the REST client
+instead (ships in `core/`, zero dependencies, needs `npm run build` first
+so `core/dist/client.js` exists):
+
+```js
+import { BrowserPowersClient } from "./core/dist/client.js";
+
+const bp = new BrowserPowersClient(); // base + key from env, see below
+const browser = await bp.waitForBrowser("my-browser"); // ID or name
+await bp.navigate(browser.id, "https://example.com");
+
+// Read, then filter in-process — one round trip, not one per element.
+// data is the ActionResult: anchors at result.data.data.anchors, check both success flags.
+const tree = await bp.pageRead(browser.id, "inspect", { limit: 30 });
+if (!tree.success) throw new Error(`inspect failed: ${tree.error}`);
+if (!tree.data?.success) throw new Error(`inspect not performed: ${tree.data?.message}`);
+const anchors = tree.data?.data?.anchors ?? [];
+const buttons = anchors.filter((a) => a.tag === "button");
+console.log(`inspect: ${anchors.length} anchors (${buttons.length} buttons)`);
+
+// Parallel fan-out: both reads in flight under one await.
+const [content, meta] = await Promise.all([
+  bp.pageRead(browser.id, "content"),
+  bp.pageRead(browser.id, "meta"),
+]);
+
+// Batch across browsers, order preserved. Screenshot straight to disk.
+const results = await bp.executeBatch([
+  { browser: "alpha", tool: "page.read", params: { action: "content" } },
+  { browser: "beta", tool: "page.read", params: { action: "content" } },
+]);
+await bp.saveScreenshot(browser.id, "./shot.png", { overlay: "none" });
+```
+
+<!-- What it prints (real run shape):
+core: http://127.0.0.1:4199/api
+browser: quick-fox-a3b2 (b-1)
+inspect: 14 anchors (3 buttons)
+  a1 <button> Save
+content: 1823 chars of JSON
+meta: {"title":"Example Domain",...}
+screenshot: ./shot.png
+-->
+
+Starter script: `node core/examples/quickstart.mjs [browser] [url]`.
+
+Env (same names the harnesses already use): `BROWSERPOWERS_BASE` (or
+`BP_BASE`, or core-origin `BP_CORE`), `BROWSERPOWERS_API_KEY` (or `BP_API_KEY`).
+`execute()` returns the `{ success, data, error }` envelope — check
+`.success`, don't catch. `executeBatch()` takes ID-or-name browsers and
+preserves order. Full API: `core/src/client.ts`.
+
 ---
 
 ## MCP Integration
 
 > **Important:** The core server must be **running** before your MCP client can connect.
 > If you ran the install script, the native service is already running it.
-> If you're in development mode, start it with `pnpm dev` (or `pnpm dev:core`).
-
-BrowserPowers exposes a full Model Context Protocol server. Connect your MCP client to:
+> If you're in development mode, start it with `npm run dev` (or `npm run dev:core`).
 
 ```
 http://127.0.0.1:4199/mcp
@@ -492,11 +561,14 @@ BrowserPowers/
 │   │   ├── adapters/      # MCP, REST, CLI adapters
 │   │   ├── command-service/ # Command execution pipeline
 │   │   ├── gates/         # Permission gate middleware
+│   │   ├── client.ts      # Zero-dep Node REST client (scripts: import + sequence)
 │   │   ├── config.ts      # YAML config loader
 │   │   ├── registry.ts    # Connected browser registry
 │   │   ├── server.ts      # Hono HTTP server
 │   │   ├── ws-server.ts   # WebSocket server
 │   │   └── index.ts       # Entry point
+│   ├── examples/
+│   │   └── quickstart.mjs # Starter script (node core/examples/quickstart.mjs [browser] [url])
 │   └── tests/             # Unit tests
 ├── extension/             # WXT browser extension
 │   ├── entrypoints/       # Background, popup, options, content
@@ -520,17 +592,17 @@ BrowserPowers/
 
 | Command | Description |
 |---------|-------------|
-| `pnpm dev` | Run core + extension in parallel |
-| `pnpm dev:core` | Run core server only |
-| `pnpm dev:ext` | Run extension dev server |
-| `pnpm dev:ext:chrome` | Run extension dev server (Chrome) |
-| `pnpm dev:ext:firefox` | Run extension dev server (Firefox) |
-| `pnpm build` | Build both packages |
-| `pnpm test` | Run all tests |
-| `pnpm test:core` | Run core unit tests |
-| `pnpm test:ext` | Run extension unit tests |
-| `pnpm test:e2e` | Run Playwright E2E tests |
-| `pnpm clean` | Clean build output |
+| `npm run dev` | Run core + extension in parallel |
+| `npm run dev:core` | Run core server only |
+| `npm run dev:ext` | Run extension dev server |
+| `npm run dev:ext:chrome` | Run extension dev server (Chrome) |
+| `npm run dev:ext:firefox` | Run extension dev server (Firefox) |
+| `npm run build` | Build both packages |
+| `npm test` | Run all tests |
+| `npm run test:core` | Run core unit tests |
+| `npm run test:ext` | Run extension unit tests |
+| `npm run test:e2e` | Run Playwright E2E tests |
+| `npm run clean` | Clean build output |
 
 ---
 

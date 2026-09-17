@@ -392,6 +392,7 @@ function header(): string {
     "variable access), plus a content-script fallback for the rare CDP-denied case.",
     "",
     "Run `help <topic>` for a section deep-dive, or `help <command>` for a single command.",
+    "Installed CLI ships a `bp` shorthand — `bp status` === `browserpowers status`.",
   ].join("\n");
 }
 

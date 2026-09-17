@@ -71,7 +71,7 @@ import { resolve, relative } from "node:path";
 const REPO_DIR = process.cwd();
 const BP_DIR = resolve(homedir(), ".browserpowers");
 const BP_CORE = resolve(BP_DIR, "core");
-const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core lives in the repo (pnpm workspace) and runs from there
+const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core lives in the repo (npm workspace) and runs from there
 const BP_DAEMON_LAUNCHER = resolve(BP_DIR, ".daemon-launcher.ps1");
 const BP_EXT = resolve(BP_DIR, "extension");
 const BP_BIN = resolve(BP_DIR, "bin");
@@ -540,34 +540,32 @@ function checkPrerequisites() {
         });
     }
 
-    // ── 2. pnpm >= 9 ──
-    const pnpmResult = tryRun("pnpm --version", { cwd: REPO_DIR });
-    if (pnpmResult && pnpmResult.error) {
+    // ── 2. npm >= 10 (ships with Node 20+ — no separate install) ──
+    const npmResult = tryRun("npm --version", { cwd: REPO_DIR });
+    if (npmResult && npmResult.error) {
         failures.push({
-            name: "pnpm >= 9",
+            name: "npm >= 10",
             detail: "Not found",
-            install: IS_WIN
-                ? "    npm install -g pnpm"
-                : "    npm install -g pnpm\n" + "    or: curl -fsSL https://get.pnpm.io/install.sh | sh -",
+            install: "  npm ships with Node.js — reinstall Node from https://nodejs.org/ (LTS recommended)",
         });
     } else {
-        const pnpmVer = (pnpmResult || "").toString().trim();
-        if (!satisfiesVersion(pnpmVer, "9")) {
+        const npmVer = (npmResult || "").toString().trim();
+        if (!satisfiesVersion(npmVer, "10")) {
             failures.push({
-                name: "pnpm >= 9",
-                detail: `Found: ${pnpmVer}`,
-                install: "    pnpm add -g pnpm@latest",
+                name: "npm >= 10",
+                detail: `Found: ${npmVer}`,
+                install: "    npm install -g npm@latest",
             });
         }
     }
 
-    // ── 3. tsx ──
-    const tsxResult = tryRun("tsx --version", { cwd: REPO_DIR });
+    // ── 3. tsx (local to the repo — no global install needed) ──
+    const tsxResult = tryRun("npm ls tsx", { cwd: REPO_DIR });
     if (tsxResult && tsxResult.error) {
         failures.push({
-            name: "tsx",
-            detail: "Not found — needed to run the CLI wrapper",
-            install: "    pnpm add -g tsx",
+            name: "tsx (local)",
+            detail: "Not installed — needed to run the CLI wrapper",
+            install: "    npm install",
         });
     }
 
@@ -597,7 +595,7 @@ function copyFilter(src) {
     if (rel.includes("node_modules")) return false;
     if (rel.includes(".output")) return false;
     if (rel.includes("dist")) return false;
-    if (rel.endsWith("pnpm-lock.yaml")) return false;
+    if (rel.endsWith("package-lock.json")) return false;
     return true;
 }
 
@@ -611,6 +609,11 @@ function writeCliWrappers(tsxCli, coreEntry) {
         const cmdContent = [`@echo off`, `node "${tsxCli}" "${coreEntry}" %*`].join("\r\n");
         writeFileSync(cmdPath, cmdContent, "utf-8");
         log(`  ${cmdPath}`);
+        // `bp` shorthand — forwards so there is only one real wrapper to maintain.
+        const bpCmdPath = resolve(BP_BIN, "bp.cmd");
+        const bpCmdContent = [`@echo off`, `call "%~dp0browserpowers.cmd" %*`].join("\r\n");
+        writeFileSync(bpCmdPath, bpCmdContent, "utf-8");
+        log(`  ${bpCmdPath}`);
     }
 
     // ── Windows: PowerShell wrapper (better for PS users) ──
@@ -624,6 +627,13 @@ function writeCliWrappers(tsxCli, coreEntry) {
         ].join("\n");
         writeFileSync(psPath, psContent, "utf-8");
         log(`  ${psPath}`);
+        const bpPsPath = resolve(BP_BIN, "bp.ps1");
+        const bpPsContent = [
+            `#!/usr/bin/env pwsh`,
+            `& "$PSScriptRoot\\browserpowers.ps1" @args`,
+        ].join("\n");
+        writeFileSync(bpPsPath, bpPsContent, "utf-8");
+        log(`  ${bpPsPath}`);
     }
 
     // ── Unix: shell script ──
@@ -633,19 +643,29 @@ function writeCliWrappers(tsxCli, coreEntry) {
         writeFileSync(shPath, shContent, "utf-8");
         chmodSync(shPath, 0o755);
         log(`  ${shPath}`);
+        const bpShPath = resolve(BP_BIN, "bp");
+        const bpShContent = [`#!/bin/sh`, `exec "$(dirname "$0")/browserpowers" "$@"`].join("\n");
+        writeFileSync(bpShPath, bpShContent, "utf-8");
+        chmodSync(bpShPath, 0o755);
+        log(`  ${bpShPath}`);
     }
-
     // ── All platforms: Node.js .mjs wrapper ──
     // (used by the .cmd / .sh wrappers above, also runnable directly)
+    // npm hoists tsx to the repo root — probe core/node_modules first
+    // (pnpm layout), fall back to the root (npm layout).
     const mjsPath = resolve(BP_BIN, "browserpowers.mjs");
     const mjsContent = [
         `#!/usr/bin/env node`,
         `import { spawn } from "node:child_process";`,
+        `import { existsSync } from "node:fs";`,
         `import { resolve, dirname } from "node:path";`,
         `import { fileURLToPath } from "node:url";`,
         `const __dirname = dirname(fileURLToPath(import.meta.url));`,
         `const coreDir = resolve(__dirname, "../core");`,
-        `const tsxPath = resolve(coreDir, "node_modules/tsx/dist/cli.mjs");`,
+        `const repoDir = resolve(__dirname, "../..");`,
+        `const localTsx = resolve(coreDir, "node_modules/tsx/dist/cli.mjs");`,
+        `const hoistedTsx = resolve(repoDir, "node_modules/tsx/dist/cli.mjs");`,
+        `const tsxPath = existsSync(localTsx) ? localTsx : hoistedTsx;`,
         `const entryPath = resolve(coreDir, "src/index.ts");`,
         `const child = spawn(process.execPath, [tsxPath, entryPath, ...process.argv.slice(2)], { stdio: "inherit", cwd: coreDir });`,
         `child.on("exit", (code) => process.exit(code ?? 0));`,
@@ -657,6 +677,21 @@ function writeCliWrappers(tsxCli, coreEntry) {
     // Make executable on Unix
     if (!IS_WIN) chmodSync(mjsPath, 0o755);
     log(`  ${mjsPath}`);
+    // `bp` for the .mjs entry too (direct node invocation, scripts).
+    const bpMjsPath = resolve(BP_BIN, "bp.mjs");
+    const bpMjsContent = [
+        `#!/usr/bin/env node`,
+        `// Shorthand — forwards to browserpowers.mjs so PATH only needs one dir.`,
+        `import { spawn } from "node:child_process";`,
+        `import { resolve, dirname } from "node:path";`,
+        `import { fileURLToPath } from "node:url";`,
+        `const target = resolve(dirname(fileURLToPath(import.meta.url)), "browserpowers.mjs");`,
+        `const child = spawn(process.execPath, [target, ...process.argv.slice(2)], { stdio: "inherit" });`,
+        `child.on("exit", (code) => process.exit(code ?? 0));`,
+    ].join("\n");
+    writeFileSync(bpMjsPath, bpMjsContent, "utf-8");
+    if (!IS_WIN) chmodSync(bpMjsPath, 0o755);
+    log(`  ${bpMjsPath}`);
 }
 
 // ── Print done banner ───────────────────────────────────
@@ -669,7 +704,7 @@ function printDone(version, extChrome, extFirefox) {
 
      ${BP_DIR}
 
-  ${bold("📋 CLI:")}
+  ${bold("📋 CLI:")}  (bp = shorthand — bp status works everywhere browserpowers status does)
 
      ${binName("browserpowers")} start          Start daemon in background (no visible window)
      ${binName("browserpowers")} restart        Stop & restart the daemon
@@ -789,19 +824,15 @@ async function main() {
         process.exit(124);
     }, 60_000).unref();
 
-    // ── Step 2: Install core deps in the repo (where the pnpm workspace works) ──
-    // The repo is a pnpm workspace (`pnpm-workspace.yaml` with `core` + `extension`).
-    // Copying `core/` to `~/.browserpowers/core/` and running pnpm install there is
-    // a no-op on pnpm 11 (it reports "Already up to date" without installing). So
-    // the core stays in the repo and runs from there. The CLI wrapper and the
+    // ── Step 2: Install deps in the repo (npm workspaces: root package.json) ──
+    // The core stays in the repo and runs from there. The CLI wrapper and the
     // daemon spawn both point at the repo's core paths.
-    step(2, "Installing core dependencies (in workspace)");
-    mustRun("pnpm install --no-frozen-lockfile", { cwd: BP_CORE_REPO, inheritStdio: true });
+    step(2, "Installing dependencies (npm workspaces)");
+    mustRun("npm install --no-audit --no-fund", { cwd: REPO_DIR, inheritStdio: true });
     log("  Done.");
 
     // ── Step 3: Build extension in-place, then atomically swap into place ──
-    // The repo is a pnpm workspace (`pnpm-workspace.yaml` with `core` + `extension`).
-    // Building inside the repo keeps pnpm in its native workspace context. The
+    // Building inside the repo keeps npm in its native workspace context. The
     // built `.output/chrome-mv3` and `.output/firefox-mv2` are staged under
     // `~/.browserpowers/`, then atomically swapped onto the canonical extension
     // paths. The browser's reference to those paths stays valid throughout —
@@ -814,12 +845,8 @@ async function main() {
     const EXT_CHROME = BP_EXT;
     const EXT_FIREFOX = resolve(BP_DIR, "extension-firefox");
 
-    log("  Installing extension dependencies (in workspace)...");
-    mustRun("pnpm install --no-frozen-lockfile", { cwd: EXT_REPO, inheritStdio: true });
-
-    // ── Chrome MV3 ──
     log("  Building Chrome MV3...");
-    mustRun("pnpm run build:chrome", { cwd: EXT_REPO, inheritStdio: true });
+    mustRun("npm run build:chrome -w browserpowers-extension", { cwd: REPO_DIR, inheritStdio: true });
     const chromeBuilt = resolve(EXT_REPO, ".output", "chrome-mv3");
     if (!existsSync(chromeBuilt)) {
         fatal(`Chrome build did not produce expected output at ${chromeBuilt}`);
@@ -838,7 +865,7 @@ async function main() {
 
     // ── Firefox MV2 ──
     log("  Building Firefox MV2...");
-    mustRun("pnpm run build:firefox", { cwd: EXT_REPO, inheritStdio: true });
+    mustRun("npm run build:firefox -w browserpowers-extension", { cwd: REPO_DIR, inheritStdio: true });
     const ffBuilt = resolve(EXT_REPO, ".output", "firefox-mv2");
     if (!existsSync(ffBuilt)) {
         fatal(`Firefox build did not produce expected output at ${ffBuilt}`);
@@ -860,8 +887,8 @@ async function main() {
     // ── Step 4: Create CLI wrappers ──
     step(4, "Creating CLI wrapper");
 
-    // Core runs from the repo (where pnpm's workspace context works).
-    const tsxCli = resolve(BP_CORE_REPO, "node_modules", "tsx", "dist", "cli.mjs");
+    // Core runs from the repo (where npm's workspace context works).
+    const tsxCli = resolve(REPO_DIR, "node_modules", "tsx", "dist", "cli.mjs");
     const coreEntry = resolve(BP_CORE_REPO, "src", "index.ts");
     writeCliWrappers(tsxCli, coreEntry);
 

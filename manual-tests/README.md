@@ -4,7 +4,7 @@ Every test in this directory drives **the user's real browser** through the core
 
 ## Setup (one time)
 
-1. Install + start the core: `node scripts/install.mjs` (or `pnpm dev` for development).
+1. Install + start the core: `node scripts/install.mjs` (or `npm run dev` for development).
 2. Open Chrome, load the BrowserPowers extension from the built output, click the icon to confirm the popup shows "Connected".
 3. Run `node manual-tests/test-smoke.mjs`. It should print PASS. If it errors with "No browser connected", your extension isn't talking to the core.
 
@@ -26,10 +26,10 @@ node manual-tests/test-click-at.mjs
 # Run every test, get a summary:
 node manual-tests/run-all.mjs
 # or
-pnpm test:manual
+npm run test:manual
 
 # Run the headline smoke (this is what the install README should say):
-pnpm smoke
+npm run smoke
 ```
 
 ## When the browser is wrong
@@ -41,12 +41,10 @@ node scripts/install.mjs
 # then in Chrome: chrome://extensions → toggle the BrowserPowers extension off and on
 ```
 
-## When you change a feature
-
-1. `pnpm build` (rebuilds the extension).
+1. `npm run build` (rebuilds the extension).
 2. Reload the extension in Chrome (or run `node scripts/install.mjs` again to copy the new build into `~/.browserpowers/extension`).
 3. Run the matching test: `node manual-tests/test-X.mjs`.
-4. If green, run the full suite: `pnpm test:manual`.
+4. If green, run the full suite: `npm run test:manual`.
 
 ## Why this exists
 

@@ -1,6 +1,5 @@
 # ── Dependencies ──────────────────────────────────────
 node_modules/
-.pnpm-store/
 
 # ── Build output ──────────────────────────────────────
 dist/
@@ -22,7 +21,6 @@ Thumbs.db
 # ── Logs ──────────────────────────────────────────────
 *.log
 npm-debug.log*
-pnpm-debug.log*
 
 # ── Test artifacts ────────────────────────────────────
 test-results/
@@ -35,12 +33,6 @@ manual-tests/results/
 *.ntvs*
 *.njsproj
 *.sln
-
-
-# ── Nested workspace lockfiles ────────────────────────
-# Root pnpm-lock.yaml is the single source of truth
-core/pnpm-lock.yaml
-extension/pnpm-lock.yaml
 
 private/
 memory/

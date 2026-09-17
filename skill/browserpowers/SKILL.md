@@ -20,39 +20,63 @@ Treat it as viewpoint-and-walk-away — no borrowing user tabs, no stealing focu
 ## Before starting
 
 1. `browsers` — find a connected browser. Prefer NAME, fall back to ID. Empty = extension not connected.
-2. If daemon down (`status` fails, `/health` unreachable), tell user to run `browserpowers serve` / `pnpm dev:core`, then load extension.
+2. If daemon down (`status` fails, `/health` unreachable), tell user to run `browserpowers serve` / `npm run dev:core`, then load extension.
 3. Check `help` once per session if unsure; every tool accepts `{ help: true }` for full params.
 
 ## CLI equivalents (humans, scripts, WSL)
 
 Agents should prefer MCP tools (structured results, image blocks). Humans and
 shell scripts should use the CLI — same core, same gates. Every row below does
-the same thing:
+the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpowers status`):
 
-| MCP tool | CLI |
-| --- | --- |
-| `browsers` | `browserpowers list` |
-| `tabs({ action: "list" })` | `browserpowers tabs <browser>` |
-| `tabs({ action: "navigate", url })` | `browserpowers navigate <browser> <url>` |
-| `screenshot` | `browserpowers screenshot <browser> [filepath] [--overlay both] [--full-page] [--json]` |
-| `page_read({ action })` | `browserpowers page read <browser> <action> [key=value ...] [--json]` |
-| `page_act({ action })` | `browserpowers page act <browser> <action> [key=value ...] [--json]` |
-| `page_js({ code })` | `browserpowers exec <browser> page.js '{"code":"..."}'` |
-| `cookies` / `windows` | `browserpowers exec <browser> cookies.list '{"url":"https://example.com"}'` (any tool works via `exec`) |
-| `execute_all` | `browserpowers exec-all <tool> [json-params]` |
-| `execute_batch` | REST `POST /api/execute-batch` (no CLI shorthand — use `exec` in a loop) |
-| `request_help` | `browserpowers request-help <browser> --prompt "..." [--url-contains ...]` |
-| `record` | `browserpowers record <browser> start\|stop\|status [--purpose ...] [--out trace.json]` |
-| `help` | `browserpowers help [topic]` / `browserpowers help page.act click` |
-| approvals | `browserpowers approvals list` (approve/deny in extension popup) |
-| health | `browserpowers status [--json]` / `browserpowers doctor [--json]` / `GET /api/health` |
-| audit | `browserpowers audit list\|show <file>\|rm <file>` / `GET /api/audit` |
-| daemon | `browserpowers serve` (foreground) / `browserpowers stop` / `browserpowers init` / `browserpowers mcp-config --client claude\|cursor` |
+| MCP tool | CLI | Script (`BrowserPowersClient`) |
+| --- | --- | --- |
+| `browsers` | `browserpowers list` | `bp.listBrowsers()` |
+| `tabs({ action: "list" })` | `browserpowers tabs <browser>` | `bp.tabsList(browser)` |
+| `tabs({ action: "navigate", url })` | `browserpowers navigate <browser> <url>` | `bp.navigate(browser, url)` |
+| `screenshot` | `browserpowers screenshot <browser> [filepath] [--overlay both] [--full-page] [--json]` | `bp.screenshot(browser)` / `bp.saveScreenshot(browser, path)` |
+| `page_read({ action })` | `browserpowers page read <browser> <action> [key=value ...] [--json]` | `bp.pageRead(browser, action, params)` |
+| `page_act({ action })` | `browserpowers page act <browser> <action> [key=value ...] [--json]` | `bp.pageAct(browser, action, params)` |
+| `page_js({ code })` | `browserpowers exec <browser> page.js '{"code":"..."}'` | `bp.pageJs(browser, code)` |
+| `cookies` / `windows` | `browserpowers exec <browser> cookies.list '{"url":"https://example.com"}'` (any tool works via `exec`) | `bp.execute(browser, tool, params)` (any tool) |
+| `execute_all` | `browserpowers exec-all <tool> [json-params]` | `bp.executeAll(tool, params)` |
+| `execute_batch` | REST `POST /api/execute-batch` (no CLI shorthand — use `exec` in a loop) | `bp.executeBatch([{ browser, tool, params }])` |
+| `request_help` | `browserpowers request-help <browser> --prompt "..." [--url-contains ...]` | `bp.execute(browser, "human.requestHelp", { prompt, ... })` |
+| `record` | `browserpowers record <browser> start\|stop\|status [--purpose ...] [--out trace.json]` | `bp.execute(browser, "record.start" \| "record.stop" \| "record.status", { ... })` |
+| `help` | `browserpowers help [topic]` / `browserpowers help page.act click` | n/a (docs only) |
+| approvals | `browserpowers approvals list` (approve/deny in extension popup) | n/a (human in popup) |
+| health | `browserpowers status [--json]` / `browserpowers doctor [--json]` / `GET /api/health` | `bp.health()` / `bp.waitForBrowser(name)` |
+| audit | `browserpowers audit list\|show <file>\|rm <file>` / `GET /api/audit` | n/a (use CLI/REST) |
+| daemon | `browserpowers serve` (foreground) / `browserpowers stop` / `browserpowers init` / `browserpowers mcp-config --client claude\|cursor` | n/a (process lifecycle, not script calls) |
 
-CLI target shorthand mirrors MCP text-first targeting:
-`target=#submit-btn`, `target=.btn`, `target="text:Save"`, or bare `target=Save`.
-Without `[filepath]`, `screenshot` prints base64 JSON — the WSL/host-safe path
-(same bytes as the MCP image block).
+## Scripting from Node (one import, many calls)
+
+The CLI is one-shot per process — one spawn per call. For sequences,
+filtering, and parallel fan-out, import the REST client (`core/src/client.ts`,
+zero deps, needs `npm run build` so `core/dist/client.js` exists):
+
+```js
+import { BrowserPowersClient } from "./core/dist/client.js";
+const bp = new BrowserPowersClient(); // base + key from env
+const browser = await bp.waitForBrowser("my-browser"); // ID or name
+await bp.navigate(browser.id, "https://example.com");
+const tree = await bp.pageRead(browser.id, "inspect", { limit: 30 });
+if (!tree.success) throw new Error(`inspect failed: ${tree.error}`);
+if (!tree.data?.success) throw new Error(`inspect not performed: ${tree.data?.message}`);
+const anchors = tree.data?.data?.anchors ?? []; // ActionResult: check tree.success AND tree.data.success
+const buttons = anchors.filter((a) => a.tag === "button");
+const [content, meta] = await Promise.all([
+  bp.pageRead(browser.id, "content"),
+  bp.pageRead(browser.id, "meta"),
+]);
+await bp.saveScreenshot(browser.id, "./shot.png");
+```
+
+Starter: `node core/examples/quickstart.mjs [browser] [url]`. Env:
+`BROWSERPOWERS_BASE` (or `BP_BASE`, or core-origin `BP_CORE`),
+`BROWSERPOWERS_API_KEY` (or `BP_API_KEY`). `execute()` returns the
+`{ success, data, error }` envelope — check `.success`, don't catch.
+`executeBatch()` takes ID-or-name browsers, preserves order.
 
 ## Task workflow
 
@@ -162,7 +186,7 @@ page_act({ action: "dialog_respond", response: { confirm: true } })
 - Record lite: `record({ action: "start", purpose: "checkout flow" })` → act → `record({ action: "stop" })` → trace.json (ops + last 10 states). Never banking/SSO/password-manager.
 - Audit (redacted): `browserpowers audit list|show|rm` or `GET /api/audit`. Origin-only URLs, values redacted, 30d retention.
 - Health: `browserpowers status --json`, `browserpowers doctor`, `GET /api/health`. See `docs/sandboxed-agents.md` for `BROWSERPOWERS_HOME` + WSL split.
-- Evals: `pnpm eval` (validate), `pnpm eval:smoke` (needs browser). 5 core cases in `evals/browser/cases/core/`.
+- Evals: `npm run eval` (validate), `npm run eval:smoke` (needs browser). 5 core cases in `evals/browser/cases/core/`.
 
 ## Approvals and human steps
 

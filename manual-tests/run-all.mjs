@@ -7,7 +7,7 @@
  *
  *          Usage:
  *            node manual-tests/run-all.mjs
- *            pnpm test:manual
+ *            npm run test:manual
  */
 
 import { spawn } from "node:child_process";

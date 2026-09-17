@@ -1344,9 +1344,9 @@ The REST API MUST allow all origins via CORS (`Access-Control-Allow-Origin: *`) 
 
 ### 4. CLI
 
-The CLI is available via `browserpowers <command>` (or `pnpm run cli -- <command>` during development).
+The CLI is available via `browserpowers <command>` (or `npm run cli -- <command>` during development).
 
-> **Dev mode**: Use `pnpm run cli -- <command>` instead of `browserpowers <command>`.
+> **Dev mode**: Use `npm run cli -- <command>` instead of `browserpowers <command>`.
 > For full production installation, see the install script at `scripts/install.mjs`.
 
 #### 4.1 Commands

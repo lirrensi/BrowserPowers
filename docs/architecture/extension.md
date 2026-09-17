@@ -682,13 +682,13 @@ src/site-permissions.ts
 
 ```bash
 # Development
-pnpm dev:ext                    # WXT dev server (HMR)
-pnpm dev:ext:chrome             # Chrome-specific
-pnpm dev:ext:firefox            # Firefox-specific
+npm run dev:ext                    # WXT dev server (HMR)
+npm run dev:ext:chrome             # Chrome-specific
+npm run dev:ext:firefox            # Firefox-specific
 
 # Production
-pnpm build:ext:chrome           # Build Chrome extension
-pnpm build:ext:firefox          # Build Firefox extension
+npm run build:chrome -w browserpowers-extension           # Build Chrome extension
+npm run build:firefox -w browserpowers-extension          # Build Firefox extension
 ```
 
 ### Load in Browser

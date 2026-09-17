@@ -4,6 +4,44 @@ All notable changes to BrowserPowers are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-09-18
+
+Scripting, shorthand, locales, and npm — plus a small batch fix.
+
+### Added
+- **Node scripting client** (`core/src/client.ts`, zero deps): `import {
+  BrowserPowersClient } from "./core/dist/client.js"` then sequence, filter
+  in-process, and fan out with `Promise.all` — one import, many calls, no
+  per-call subprocess churn. Starter: `node core/examples/quickstart.mjs
+  [browser] [url]`. Anchors live at `result.data.data.anchors` (ActionResult
+  inside the transport envelope — check both success flags). CLI/Script
+  mapping tables in skill + README.
+- **CLI shorthand `bp`** (`bp.cmd` / `bp.ps1` / `bp` / `bp.mjs` forward to the
+  `browserpowers` wrappers — same commands, less typing). Installer writes
+  them; banner, skill, README, `--help`, and spec mention it.
+- **Extension UI i18n (en/de/es/fr/ru/zh/ar)**: popup + options render from
+  `src/ui/i18n.ts` + `src/ui/locales.ts` (76 keys × 7 locales, full parity)
+  with a Language picker (first settings card, persists to `bp:locale`,
+  navigator fallback to `en`). Arabic flips `<html dir=rtl>`.
+  Zero deps, no storage-schema or manifest changes.
+
+### Fixed
+- **REST `POST /api/execute-batch` now resolves browser names** like every
+  other endpoint (previously only UUIDs worked — names silently became
+  "Browser not found"). Accepts ID or name in `browserId | browser_id |
+  browser | browser_name | browserName`.
+
+### Changed
+- **Package manager: pnpm → npm.** Plain `npm install` / `npm run build` /
+  `npm test` from the repo root — no global pnpm, no global tsx (both were
+  hard prerequisites that bit on fresh machines). npm workspaces
+  (`core` + `extension`) replace `pnpm-workspace.yaml`; `install.mjs` checks
+  `npm >= 10` and resolves local tsx from `node_modules`. All scripts, docs,
+  skill, and templates updated. Installer + daemon probe `core/node_modules`
+  first, fall back to hoisted root `node_modules` (npm layout). Verified:
+  `npm run build` (tsc + WXT), `npm run test:safe` green (74 core + 32 ext +
+  5 eval cases).
+
 ## [1.5.0] — 2026-09-17
 
 Agent skill, human-loop, observation/interaction depth, and a two-layer test

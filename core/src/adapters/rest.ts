@@ -110,14 +110,18 @@ restApp.post("/execute-all", async (c) => {
 });
 
 // POST /api/execute-batch — execute multiple tools across browsers in parallel
+// Each command accepts an ID or NAME in any of: browserId | browser_id | browser | browser_name | browserName
 restApp.post("/execute-batch", async (c) => {
   const { commands } = await c.req.json();
   const batch: Array<{ browserId: string; tool: string; params: Record<string, unknown> }> =
-    (commands as Array<{ browser_id?: string; browserId?: string; tool: string; params?: Record<string, unknown> }>).map((cmd) => ({
-      browserId: cmd.browserId ?? cmd.browser_id ?? "",
-      tool: cmd.tool,
-      params: cmd.params ?? {},
-    }));
+    (commands as Array<{ browser_id?: string; browserId?: string; browser?: string; browser_name?: string; browserName?: string; tool: string; params?: Record<string, unknown> }>).map((cmd) => {
+      const idOrName = cmd.browserId ?? cmd.browser_id ?? cmd.browser ?? cmd.browser_name ?? cmd.browserName ?? "";
+      return {
+        browserId: resolveBrowserId(idOrName) ?? idOrName,
+        tool: cmd.tool,
+        params: cmd.params ?? {},
+      };
+    });
   const results = await commandService.executeBatch(batch);
   return c.json({ results });
 });

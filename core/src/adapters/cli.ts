@@ -67,7 +67,7 @@ const program = new Command();
 
 program
   .name("browserpowers")
-  .description("CLI for multi-browser agent control")
+  .description("CLI for multi-browser agent control (`bp` is shorthand — same commands)")
   .version(VERSION)
   .option("--async", "Execute asynchronously — print requestId and exit immediately");
 
@@ -828,7 +828,7 @@ program
       browsers = ((await res.json()) as { browsers: any[] }).browsers ?? [];
       rows.push({ check: "daemon running", status: "ok", detail: BASE });
     } catch (e) {
-      rows.push({ check: "daemon running", status: "FAIL", detail: (e as Error).message, hint: "Run: browserpowers serve (or pnpm dev:core)" });
+      rows.push({ check: "daemon running", status: "FAIL", detail: (e as Error).message, hint: "Run: browserpowers serve (or npm run dev:core)" });
     }
     // 4. extension
     if (browsers.length > 0) {
