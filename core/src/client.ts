@@ -11,7 +11,9 @@
 //   const b = await bp.waitForBrowser("my-browser");       // ID or name
 //   await bp.navigate(b.id, "https://example.com");
 //   const tree = await bp.pageRead(b.id, "inspect", { limit: 20 });
-//   const anchors = (tree.data as { anchors?: Array<{ tag?: string }> })?.anchors ?? [];
+//   if (!tree.success) throw new Error(tree.error);        // transport verdict
+//   if (!tree.data?.success) throw new Error(tree.data?.message); // page-action verdict
+//   const anchors = tree.data?.data?.anchors ?? [];        // ActionResult nests inside
 //   const buttons = anchors.filter((a) => a.tag === "button"); // filter in-process
 //   const [content, meta] = await Promise.all([            // parallel fan-out
 //     bp.pageRead(b.id, "content"),

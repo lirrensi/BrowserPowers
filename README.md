@@ -372,8 +372,17 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 
 The CLI is one-shot per process — one spawn per call, no shared state.
 For sequences, filtering, and parallel fan-out, import the REST client
-instead (ships in `core/`, zero dependencies, needs `npm run build` first
-so `core/dist/client.js` exists):
+instead (zero dependencies at runtime — only `node:fs`/`node:path`):
+
+**From a different project** (recommended — clean import, no paths):
+```bash
+npm install "file:/absolute/path/to/BrowserExtC/core"
+# then, in your script:
+# import { BrowserPowersClient } from "browserpowers";
+```
+
+**From inside this repo** (needs `npm run build` first so
+`core/dist/client.js` exists):
 
 ```js
 import { BrowserPowersClient } from "./core/dist/client.js";
