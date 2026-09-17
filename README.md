@@ -368,37 +368,37 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 #   bare text   → text content match
 ```
 
-### Scripting — no project, no install, no file
+### Scripting — one import string, copy it every time
 
+Step 1 — resolve the string once (stash it in your notes):
 ```bash
-bp run "return (await bp.listBrowsers()).length"
-bp run "await bp.navigate((await bp.waitForBrowser()).id, 'https://example.com')"
-bp run "return Object.keys(sdk)" # ["BrowserPowersClient", ...] — the module namespace
+bp sdk path
+# C:\Users\rx\.browserpowers\sdk  →  your import string is:
+# file:///C:/Users/rx/.browserpowers/sdk/client.js
 ```
-`bp` is a prebound client, `sdk` the module namespace, top-level await
-works, `return` prints (or `--json`). Any folder, no `package.json`, no
-`npm install`. This is the fastest path — reach for it first.
+Same path on every script, every folder, every drive session — the installer
+owns it, the repo is deletable, nothing to `npm install`.
 
-### Scripting from Node (one import, many calls)
-
-Same client as a file, for longer scripts. Zero setup first:
-`bp run "..."` above. When it outgrows one line, graduate to a file:
-
-**From a different project** (survives deleting this repo):
+Step 2 — paste it into any script, inline or file:
 ```bash
-npm install "file:$(bp sdk path)"
-# then, in your script:
-# import { BrowserPowersClient } from "browserpowers";
+node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/rx/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
 ```
-`bp sdk path` prints `~/.browserpowers/sdk` — the installer vendors the
-zero-dep client there (`client.js` + `client.d.ts` + `package.json`), so the
-import source is the install card, not a repo checkout.
+```js
+// any .mjs file, any folder — same string
+import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
+const bp = new BrowserPowersClient();
+const browser = await bp.waitForBrowser("my-browser"); // ID or name
+await bp.navigate(browser.id, "https://example.com");
+```
+Windows tax: triple slash (`file:///C:/...`), and `-e` needs
+`--input-type=module` for `import` to parse.
 
-**From inside this repo** (needs `npm run build` first so
-`core/dist/client.js` exists):
+### Scripting from Node (longer scripts)
+
+Same import string, grown up:
 
 ```js
-import { BrowserPowersClient } from "./core/dist/client.js";
+import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
 
 const bp = new BrowserPowersClient(); // base + key from env, see below
 const browser = await bp.waitForBrowser("my-browser"); // ID or name

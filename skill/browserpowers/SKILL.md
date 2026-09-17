@@ -49,22 +49,17 @@ the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpow
 | audit | `browserpowers audit list\|show <file>\|rm <file>` / `GET /api/audit` | n/a (use CLI/REST) |
 | daemon | `browserpowers serve` (foreground) / `browserpowers stop` / `browserpowers init` / `browserpowers mcp-config --client claude\|cursor` | n/a (process lifecycle, not script calls) |
 
-## Scripting — no project, no install, no file
+## Scripting — one import string, copy it every time
 
+Resolve once (`bp sdk path` → `file:///.../sdk/client.js`), paste everywhere —
+inline `-e` or any `.mjs` file, any folder. Triple slash on Windows,
+`--input-type=module` for `-e`:
 ```bash
-bp run "return (await bp.listBrowsers()).length"
-bp run "await bp.navigate((await bp.waitForBrowser()).id, 'https://example.com')"
-bp run "return Object.keys(sdk)" # ["BrowserPowersClient", ...] — the module namespace
+node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/rx/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
 ```
-`bp` is a prebound client, `sdk` the module namespace, top-level await
-works, `return` prints (or `--json`). Any folder, no `package.json`, no
-`npm install`. Fastest path — reach for it first.
-
-## Scripting from Node (one import, many calls)
-
-Same client as a file, for longer scripts:
 ```js
-import { BrowserPowersClient } from "./core/dist/client.js";
+import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
+
 const bp = new BrowserPowersClient(); // base + key from env
 const browser = await bp.waitForBrowser("my-browser"); // ID or name
 await bp.navigate(browser.id, "https://example.com");
