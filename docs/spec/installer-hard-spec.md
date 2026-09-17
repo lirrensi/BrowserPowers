@@ -141,7 +141,7 @@ At minimum, the following must exist after install:
 - `~/.browserpowers/extension/manifest.json`
 - `~/.browserpowers/bin/browserpowers*` CLI entry points
 - `~/.browserpowers/bin/bp*` shorthand forwarders (same commands via `bp`)
-- Any platform-specific files needed for auto-start
+- `~/.browserpowers/sdk/` vendored script client (`package.json` + `client.js` + `client.d.ts` + `LICENSE`) — `bp sdk path` prints it; `npm install "file:$(bp sdk path)"` works with the repo deleted
 
 The Chrome extension is atomically swapped into place via a staging directory. The path `~/.browserpowers/extension/` is always valid: either the old version or the new version, never partial or missing.
 
@@ -275,12 +275,13 @@ The following must be true within 60 seconds and without manual intervention:
 3. The shell prompt returns.
 4. `~/.browserpowers/extension/manifest.json` exists.
 5. `~/.browserpowers/bin/browserpowers*` and `~/.browserpowers/bin/bp*` exist.
-6. Port `4199` is listening (daemon is running).
-7. No visible command-line window from the daemon or auto-start remains open.
-8. The daemon is registered to start automatically on user logon for the current platform.
-9. On macOS, `~/Library/LaunchAgents/com.browserpowers.plist` exists.
-10. On Linux, `~/.config/autostart/browserpowers.desktop` exists.
-11. On Windows, the daemon is registered in the current-user auto-start mechanism.
+6. `~/.browserpowers/sdk/package.json` + `client.js` + `client.d.ts` exist (`bp sdk path`).
+7. Port `4199` is listening (daemon is running).
+8. No visible command-line window from the daemon or auto-start remains open.
+9. The daemon is registered to start automatically on user logon for the current platform.
+10. On macOS, `~/Library/LaunchAgents/com.browserpowers.plist` exists.
+11. On Linux, `~/.config/autostart/browserpowers.desktop` exists.
+12. On Windows, the daemon is registered in the current-user auto-start mechanism.
 
 ### 5.1 Stress criterion
 

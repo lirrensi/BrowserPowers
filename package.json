@@ -2,7 +2,10 @@
   "name": "browserpowers",
   "version": "1.6.0",
   "private": false,
-  "description": "Multi-browser LLM agent control — core server + browser extension",
+  "workspaces": [
+    "core",
+    "extension"
+  ],
   "author": "lirrensi",
   "license": "MIT",
   "repository": {
@@ -21,16 +24,16 @@
     "mcp"
   ],
   "scripts": {
-    "dev": "pnpm --parallel -r dev",
-    "dev:core": "pnpm --filter browserpowers dev",
-    "dev:ext": "pnpm --filter browserpowers-extension dev",
-    "dev:ext:chrome": "pnpm --filter browserpowers-extension dev:chrome",
-    "dev:ext:firefox": "pnpm --filter browserpowers-extension dev:firefox",
-    "build": "pnpm --parallel -r build",
+    "dev": "npm run dev --workspaces --if-present --parallel",
+    "dev:core": "npm run dev -w browserpowers",
+    "dev:ext": "npm run dev -w browserpowers-extension",
+    "dev:ext:chrome": "npm run dev:chrome -w browserpowers-extension",
+    "dev:ext:firefox": "npm run dev:firefox -w browserpowers-extension",
+    "build": "npm run build --workspaces --if-present",
     "test": "vitest run",
-    "predev": "pnpm build",
-    "prepare": "pnpm --filter browserpowers-extension prepare",
-    "clean": "pnpm --parallel -r clean",
+    "predev": "npm run build",
+    "prepare": "npm run prepare -w browserpowers-extension",
+    "clean": "npm run clean --workspaces --if-present",
     "test:core": "vitest run --project core",
     "test:ext": "vitest run --project extension",
     "test:manual": "node manual-tests/run-all.mjs",
@@ -49,6 +52,6 @@
   },
   "engines": {
     "node": ">=20",
-    "pnpm": ">=9"
+    "npm": ">=10"
   }
 }

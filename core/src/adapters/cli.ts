@@ -609,6 +609,32 @@ program
       })
   );
 
+// ── sdk ──
+// The installer vendors the zero-dep script client (client.js + .d.ts +
+// package.json) into the install dir so the repo is deletable afterwards.
+// `sdk path` prints that stable directory: `npm install "file:$(bp sdk path)"`.
+program
+  .command("sdk")
+  .description("Script client (SDK) helpers — vendored by the installer, repo-independent")
+  .addCommand(
+    new Command("path")
+      .description("Print the vendored SDK directory (stable import source for any project)")
+      .action(async () => {
+        const { homedir } = await import("node:os");
+        const { resolve } = await import("node:path");
+        const { existsSync } = await import("node:fs");
+        const home = process.env.BROWSERPOWERS_HOME?.trim() || homedir();
+        const sdkDir = process.env.BROWSERPOWERS_HOME?.trim()
+          ? resolve(home, "sdk")
+          : resolve(home, ".browserpowers", "sdk");
+        if (!existsSync(resolve(sdkDir, "package.json")) || !existsSync(resolve(sdkDir, "client.js"))) {
+          console.error(`❌ SDK not found at ${sdkDir} — re-run: node scripts/install.mjs`);
+          process.exit(1);
+        }
+        console.log(sdkDir);
+      })
+  );
+
 // ── mcp-config ──
 program
   .command("mcp-config")

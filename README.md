@@ -374,12 +374,15 @@ The CLI is one-shot per process — one spawn per call, no shared state.
 For sequences, filtering, and parallel fan-out, import the REST client
 instead (zero dependencies at runtime — only `node:fs`/`node:path`):
 
-**From a different project** (recommended — clean import, no paths):
+**From a different project** (recommended — survives deleting this repo):
 ```bash
-npm install "file:/absolute/path/to/BrowserExtC/core"
+npm install "file:$(bp sdk path)"
 # then, in your script:
 # import { BrowserPowersClient } from "browserpowers";
 ```
+`bp sdk path` prints `~/.browserpowers/sdk` — the installer vendors the
+zero-dep client there (`client.js` + `client.d.ts` + `package.json`), so the
+import source is the install card, not a repo checkout.
 
 **From inside this repo** (needs `npm run build` first so
 `core/dist/client.js` exists):

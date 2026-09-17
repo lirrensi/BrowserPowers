@@ -54,9 +54,11 @@ the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpow
 The CLI is one-shot per process — one spawn per call. For sequences,
 filtering, and parallel fan-out, import the REST client
 (`core/src/client.ts`, zero runtime deps). From another project:
-`npm install "file:/path/to/BrowserExtC/core"`, then
-`import { BrowserPowersClient } from "browserpowers"`. From inside this
-repo (needs `npm run build` so `core/dist/client.js` exists):
+`npm install "file:$(bp sdk path)"`, then
+`import { BrowserPowersClient } from "browserpowers"`. (`bp sdk path`
+prints `~/.browserpowers/sdk` — vendored by the installer, survives
+deleting the repo.) From inside this repo (needs `npm run build` so
+`core/dist/client.js` exists):
 ```js
 import { BrowserPowersClient } from "./core/dist/client.js";
 const bp = new BrowserPowersClient(); // base + key from env

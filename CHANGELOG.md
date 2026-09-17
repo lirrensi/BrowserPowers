@@ -10,12 +10,14 @@ Scripting, shorthand, locales, and npm — plus a small batch fix.
 
 ### Added
 - **Node scripting client** (`core/src/client.ts`, zero deps): `import {
-  BrowserPowersClient } from "./core/dist/client.js"` then sequence, filter
-  in-process, and fan out with `Promise.all` — one import, many calls, no
-  per-call subprocess churn. Starter: `node core/examples/quickstart.mjs
-  [browser] [url]`. Anchors live at `result.data.data.anchors` (ActionResult
-  inside the transport envelope — check both success flags). CLI/Script
-  mapping tables in skill + README.
+  BrowserPowersClient } from "browserpowers"` after `npm install
+  "file:$(bp sdk path)"` — then sequence, filter in-process, and fan out
+  with `Promise.all`. The installer vendors the client into
+  `~/.browserpowers/sdk/` (`bp sdk path` prints it), so the repo is deletable
+  afterwards. Starter: `node core/examples/quickstart.mjs [browser] [url]`.
+  Anchors live at `result.data.data.anchors` (ActionResult inside the
+  transport envelope — check both success flags). CLI/Script mapping tables
+  in skill + README.
 - **CLI shorthand `bp`** (`bp.cmd` / `bp.ps1` / `bp` / `bp.mjs` forward to the
   `browserpowers` wrappers — same commands, less typing). Installer writes
   them; banner, skill, README, `--help`, and spec mention it.

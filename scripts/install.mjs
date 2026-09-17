@@ -71,7 +71,8 @@ import { resolve, relative } from "node:path";
 const REPO_DIR = process.cwd();
 const BP_DIR = resolve(homedir(), ".browserpowers");
 const BP_CORE = resolve(BP_DIR, "core");
-const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core lives in the repo (npm workspace) and runs from there
+const BP_CORE_REPO = resolve(REPO_DIR, "core"); // core runs from the repo (npm workspaces)
+const BP_SDK = resolve(BP_DIR, "sdk");
 const BP_DAEMON_LAUNCHER = resolve(BP_DIR, ".daemon-launcher.ps1");
 const BP_EXT = resolve(BP_DIR, "extension");
 const BP_BIN = resolve(BP_DIR, "bin");
@@ -113,9 +114,10 @@ function cyan(s) {
 const BP_EXT_TMP = resolve(BP_DIR, ".ext-tmp");
 const BP_STAGING_CHROME = resolve(BP_DIR, ".extension-staging-chrome");
 const BP_STAGING_FIREFOX = resolve(BP_DIR, ".extension-staging-firefox");
+const BP_STAGING_SDK = resolve(BP_DIR, ".sdk-staging");
 
 function cleanupPartial() {
-    for (const p of [BP_EXT_TMP, BP_STAGING_CHROME, BP_STAGING_FIREFOX]) {
+    for (const p of [BP_EXT_TMP, BP_STAGING_CHROME, BP_STAGING_FIREFOX, BP_STAGING_SDK]) {
         if (existsSync(p)) {
             try {
                 rmSync(p, { recursive: true, maxRetries: 5, retryDelay: 300, force: true });
@@ -599,6 +601,13 @@ function copyFilter(src) {
     return true;
 }
 
+// ── SDK file filter ─────────────────────────────────────
+// Only the files a foreign project needs to `npm install file:<sdk>`:
+// the zero-dep client bundle (.js + .d.ts) plus the identity files npm
+// requires (package.json + LICENSE). Everything else (src, tests,
+// tsconfig, launcher, server code) stays in the repo.
+const SDK_FILES = ["package.json", "LICENSE", "client.js", "client.d.ts"];
+
 // ── Create CLI wrappers ─────────────────────────────────
 // Platform-appropriate wrappers so `browserpowers` works from any terminal.
 
@@ -710,9 +719,9 @@ function printDone(version, extChrome, extFirefox) {
      ${binName("browserpowers")} restart        Stop & restart the daemon
      ${binName("browserpowers")} stop           Stop the daemon
      ${binName("browserpowers")} serve          Run server in foreground (for debugging)
-     ${binName("browserpowers")} list           List connected browsers
      ${binName("browserpowers")} page read      Read page content
      ${binName("browserpowers")} page act       Interact with pages
+     ${binName("browserpowers")} sdk path       Print the vendored SDK dir (npm install "file:$(bp sdk path)")
 
   ${bold("🌐 Chrome Extension:")}
 
@@ -831,6 +840,18 @@ async function main() {
     mustRun("npm install --no-audit --no-fund", { cwd: REPO_DIR, inheritStdio: true });
     log("  Done.");
 
+    // ── Step 2b: Build the core (tsc → dist/) so the SDK has a bundle to vendor.
+    // The daemon CLI wrappers need dist/index.js too — today it only exists
+    // if the developer happened to run `npm run build` beforehand. Building
+    // here makes install self-contained: repo deletable right after.
+    log("  Building core...");
+    mustRun("npm run build -w browserpowers", { cwd: REPO_DIR, inheritStdio: true });
+    const coreDist = resolve(BP_CORE_REPO, "dist");
+    if (!existsSync(resolve(coreDist, "client.js")) || !existsSync(resolve(coreDist, "index.js"))) {
+        fatal(`Core build did not produce expected output at ${coreDist} (client.js + index.js)`);
+    }
+    log("  Done.");
+
     // ── Step 3: Build extension in-place, then atomically swap into place ──
     // Building inside the repo keeps npm in its native workspace context. The
     // built `.output/chrome-mv3` and `.output/firefox-mv2` are staged under
@@ -881,6 +902,49 @@ async function main() {
     }
     atomicSwapDir(BP_STAGING_FIREFOX, EXT_FIREFOX);
     log(`  → ${EXT_FIREFOX} (manifest.json at root)`);
+
+    // ── Step 3b: Vendor the zero-dep SDK (client.js + .d.ts) into ~/.browserpowers/sdk.
+    // This is the whole point of the exercise: after install, the repo is
+    // deletable and `bp sdk path` still prints a stable directory any project
+    // can `npm install file:<sdk>` from. Staged + atomically swapped like the
+    // extensions, so concurrent `bp`/daemon readers never see a half-written SDK.
+    log("  Vendoring SDK...");
+    const sdkPkg = readJson(resolve(BP_CORE_REPO, "package.json"));
+    if (existsSync(BP_STAGING_SDK)) {
+        rmSync(BP_STAGING_SDK, { recursive: true, force: true, maxRetries: 3, retryDelay: 300 });
+    }
+    mkdirSync(BP_STAGING_SDK, { recursive: true });
+    try {
+        for (const f of ["client.js", "client.d.ts"]) {
+            const src = resolve(coreDist, f);
+            if (!existsSync(src)) {
+                cleanupPartial();
+                fatal(`Core build missing SDK file: ${src}`);
+            }
+            cpSync(src, resolve(BP_STAGING_SDK, f));
+        }
+        cpSync(resolve(REPO_DIR, "LICENSE"), resolve(BP_STAGING_SDK, "LICENSE"));
+        const sdkManifest = {
+            name: "browserpowers",
+            version: sdkPkg.version,
+            description: "BrowserPowers script client — zero-dep Node SDK (vendored by install.mjs)",
+            type: "module",
+            main: "./client.js",
+            types: "./client.d.ts",
+            exports: {
+                ".": { types: "./client.d.ts", import: "./client.js" },
+                "./client": { types: "./client.d.ts", import: "./client.js" },
+                "./package.json": "./package.json",
+            },
+            license: "MIT",
+        };
+        writeFileSync(resolve(BP_STAGING_SDK, "package.json"), JSON.stringify(sdkManifest, null, 2) + "\n", "utf-8");
+    } catch (err) {
+        cleanupPartial();
+        fatal(`Failed to stage SDK: ${err && err.message ? err.message : String(err)}`);
+    }
+    atomicSwapDir(BP_STAGING_SDK, BP_SDK);
+    log(`  → ${BP_SDK} (client.js + package.json)`);
 
     log("  Done.");
 
