@@ -6,6 +6,13 @@ dist/
 .output/
 .wxt/
 
+# ── Compiled binaries (never commit — built locally, see core/launcher/) ──
+*.exe
+*.dll
+*.node
+*.so
+*.dylib
+
 # ── Environment ───────────────────────────────────────
 .env
 .env.local

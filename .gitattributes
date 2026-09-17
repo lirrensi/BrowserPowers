@@ -8,5 +8,8 @@
 *.jpg binary
 *.ico binary
 *.zip binary
+*.exe binary
+*.dll binary
+*.node binary
 
 

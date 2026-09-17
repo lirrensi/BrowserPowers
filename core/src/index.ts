@@ -74,7 +74,9 @@ function resolvePaths() {
     resolve(coreDir, "..", "node_modules", "tsx", "dist", "cli.mjs"),
   ];
   const tsxCli = candidates.find((p) => existsSync(p)) ?? candidates[0];
-  // launcher.exe is compiled once, committed to repo
+  // launcher.exe is built locally from ./launcher (go build -trimpath);
+  // never committed — see core/launcher/README. Falls back to direct
+  // spawn when absent.
   const launcherExe = resolve(coreDir, "launcher", "launcher.exe");
   return { coreEntry, coreDir, tsxCli, launcherExe };
 }
