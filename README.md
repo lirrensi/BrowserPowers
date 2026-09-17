@@ -373,19 +373,20 @@ browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fi
 Step 1 — resolve the string once (stash it in your notes):
 ```bash
 bp sdk path
-# C:\Users\rx\.browserpowers\sdk  →  your import string is:
-# file:///C:/Users/rx/.browserpowers/sdk/client.js
+# C:\Users\<you>\.browserpowers\sdk  →  your import string is:
+# file:///C:/Users/<you>/.browserpowers/sdk/client.js
 ```
 Same path on every script, every folder, every drive session — the installer
-owns it, the repo is deletable, nothing to `npm install`.
+owns it, the repo is deletable, nothing to `npm install`. (`bp sdk path`
+prints your real path — paste what it prints, not what's above.)
 
 Step 2 — paste it into any script, inline or file:
 ```bash
-node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/rx/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
+node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/<you>/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
 ```
 ```js
-// any .mjs file, any folder — same string
-import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
+// any .mjs file, any folder — same string (use YOUR path from `bp sdk path`)
+import { BrowserPowersClient } from "file:///C:/Users/<you>/.browserpowers/sdk/client.js";
 const bp = new BrowserPowersClient();
 const browser = await bp.waitForBrowser("my-browser"); // ID or name
 await bp.navigate(browser.id, "https://example.com");
@@ -398,7 +399,7 @@ Windows tax: triple slash (`file:///C:/...`), and `-e` needs
 Same import string, grown up:
 
 ```js
-import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
+import { BrowserPowersClient } from "file:///C:/Users/<you>/.browserpowers/sdk/client.js";
 
 const bp = new BrowserPowersClient(); // base + key from env, see below
 const browser = await bp.waitForBrowser("my-browser"); // ID or name

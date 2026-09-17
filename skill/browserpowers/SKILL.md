@@ -55,10 +55,10 @@ Resolve once (`bp sdk path` â†’ `file:///.../sdk/client.js`), paste everywhere â
 inline `-e` or any `.mjs` file, any folder. Triple slash on Windows,
 `--input-type=module` for `-e`:
 ```bash
-node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/rx/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
+node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/<you>/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
 ```
 ```js
-import { BrowserPowersClient } from "file:///C:/Users/rx/.browserpowers/sdk/client.js";
+import { BrowserPowersClient } from "file:///C:/Users/<you>/.browserpowers/sdk/client.js";
 
 const bp = new BrowserPowersClient(); // base + key from env
 const browser = await bp.waitForBrowser("my-browser"); // ID or name
