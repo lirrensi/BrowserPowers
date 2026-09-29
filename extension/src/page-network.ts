@@ -21,6 +21,7 @@
  * EXPORTS: wsList, wsSend, wsTail, httpObserve, httpBlock, httpRules,
  *          httpUnblock, ingestNetFrame, ingestHttpFrame, ensureHookInstalled
  */
+import { runNetHookInstall } from "./net-install.js";
 
 export interface NetFrame {
   dir: "in" | "out";
@@ -72,6 +73,9 @@ let ruleSeq = 0;
 const httpLogs: HttpLogEntry[] = [];
 let includeBodies = false;
 
+/** CDP socket tap: requestId → hookId for Network.webSocket* correlation. */
+const cdpRequestToHook = new Map<string, string>();
+
 /** Tabs with a confirmed MAIN-world hook (else executeScript re-injects). */
 const hookedTabs = new Set<number>();
 
@@ -83,16 +87,27 @@ const hookedTabs = new Set<number>();
  * proceeds anyway so observation degrades to empty instead of erroring.
  */
 export async function ensureHookInstalled(tabId: number): Promise<boolean> {
-  if (hookedTabs.has(tabId)) return true;
+  if (hookedTabs.has(tabId)) {
+    // Trust-but-verify: the SW restarts lose nothing (module state persists
+    // per worker lifetime), but navigations kill the page hook while our bit
+    // stays set if webNavigation missed it. A cheap MAIN-world probe decides.
+    try {
+      const { runtimeEvaluate } = await import("./cdp.js");
+      const probe = await runtimeEvaluate(tabId, "!!window.WebSocket.__bpHooked");
+      if (probe.ok && probe.value === true) return true;
+    } catch { /* fall through to re-install */ }
+    hookedTabs.delete(tabId);
+  }
   try {
     const { netHookMain } = await import("./net-hook-main.js");
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: netHookMain as () => void,
-    });
-    hookedTabs.add(tabId);
-    return true;
+    const ok = await runNetHookInstall(tabId, netHookMain as () => void);
+    if (ok) {
+      hookedTabs.add(tabId);
+      // scripting.executeScript applies to the CURRENT document — no reload,
+      // no wait. Push rules so observe/block apply to the live page.
+      await pushRulesToTab(tabId);
+    }
+    return ok;
   } catch {
     return false;
   }
@@ -169,6 +184,42 @@ export function ingestNetFrame(tabId: number, payload: Record<string, unknown>):
   }
 }
 
+
+// ── CDP socket tap (Network.webSocket* events, no page hook needed) ──
+//
+// The debugger sees sockets the page opened BEFORE any hook existed —
+// exactly the xterm case. requestId is the correlation key; payloads are
+// base64 (binary) or plain text. Frames here are network-truth (what hit
+// the wire), complementing the MAIN hook's JS-truth (what the page sent).
+
+/** Network.webSocketCreated → register (or refresh URL of) the hook. */
+export function ingestCdpSocketCreated(tabId: number, url: string, requestId: string): void {
+  try {
+    if (!requestId) return;
+    const hook = ensureHook(tabId, `cdp:${requestId}`, url ?? "");
+    if (url && !hook.url) hook.url = url;
+    cdpRequestToHook.set(requestId, hook.hookId);
+  } catch { /* bookkeeping only */ }
+}
+
+/** Network.webSocketFrameReceived/Sent → append the payload frame. */
+export function ingestCdpSocketFrame(tabId: number, requestId: string, dir: "in" | "out", data: string): void {
+  try {
+    void tabId;
+    const hookId = cdpRequestToHook.get(requestId);
+    const hook = hookId ? resolveHook(hookId) : undefined;
+    if (!hook) return;
+    pushFrame(hook, dir, data ?? "");
+  } catch { /* bookkeeping only */ }
+}
+
+/** Network.webSocketClosed → keep buffered frames for ws_tail. */
+export function ingestCdpSocketClosed(requestId: string): void {
+  try {
+    cdpRequestToHook.delete(requestId);
+  } catch { /* bookkeeping only */ }
+}
+
 /** Ingest a relayed HTTP observation from the page hook. */
 export function ingestHttpFrame(tabId: number, payload: Record<string, unknown>): void {
   try {
@@ -194,8 +245,8 @@ export function ingestHttpFrame(tabId: number, payload: Record<string, unknown>)
 
 // ── WS ops ──
 
-export function wsList(tabId?: number): { hooks: WsHookInfo[] } {
-  const out: WsHookInfo[] = [];
+export function wsList(tabId?: number): { hooks: Array<WsHookInfo & { via: "page-hook" | "cdp" }> } {
+  const out: Array<WsHookInfo & { via: "page-hook" | "cdp" }> = [];
   for (const h of hooks.values()) {
     if (tabId !== undefined && h.tabId !== tabId) continue;
     out.push({
@@ -205,6 +256,7 @@ export function wsList(tabId?: number): { hooks: WsHookInfo[] } {
       tabId: h.tabId,
       createdAt: h.createdAt,
       frameCount: h.frames.length,
+      via: h.socketId.startsWith("cdp:") ? "cdp" : "page-hook",
     });
   }
   out.sort((a, b) => b.createdAt - a.createdAt);
@@ -225,24 +277,46 @@ export function wsTail(
   };
 }
 
-/** Ask the page hook to send a frame on a live socket (delivery is best-effort in-page). */
+/**
+ * Send a frame on a hooked socket through the page's own socket object.
+ *
+ * NOTE: there is no CDP `Network.sendData` (verified live: -32601 method not
+ * found). The debugger is observe-only for sockets. Injection therefore
+ * evaluates `socket.send(data)` in the page MAIN world via
+ * `Runtime.evaluate` — the socket object lives in page JS, so this reaches
+ * the real connection with the page's framing/subprotocol intact. Works for
+ * tap sockets AND page-hook sockets (same path); the `via` field reports
+ * which observation path found the socket.
+ */
 export async function wsSend(
   tabId: number,
   hookOrSocketId: string,
   data: string,
-): Promise<{ sent: boolean; hookId: string; socketId: string }> {
+): Promise<{ sent: boolean; hookId: string; socketId: string; via: "page-hook" | "cdp" }> {
   const hook = resolveHook(hookOrSocketId);
   if (!hook) throw new Error(`unknown websocket hook/socket: ${hookOrSocketId} — run page.net ws_list first`);
-  try {
-    await chrome.tabs.sendMessage(tabId, {
-      source: "browserpowers",
-      type: "bp:net-send",
-      params: { socketId: hook.socketId, data },
-    });
-  } catch (e) {
-    throw new Error(`ws_send delivery failed (no hooked page in tab ${tabId}): ${(e as Error).message}`);
+  const via = hook.socketId.startsWith("cdp:") ? "cdp" as const : "page-hook" as const;
+  // Tap sockets: no page-side id to address. Evaluate the send on the live
+  // socket registry instead — the MAIN hook (if present) keeps socket objects;
+  // otherwise fall back to dispatching on every OPEN WebSocket we can reach
+  // via the hook's registry endpoint. Best-effort by design.
+  const { runtimeEvaluate } = await import("./cdp.js");
+  const expr = `(() => { try {
+    const w = window.__bpNetSockets || {};
+    const s = w[${JSON.stringify(hook.socketId)}];
+    if (s && s.readyState === 1) { s.send(${JSON.stringify(data)}); return "sent:socket"; }
+    return "no-socket:" + Object.keys(w).length;
+  } catch (e) { return "error:" + (e && e.message || String(e)); } })()`;
+  const res = await runtimeEvaluate(tabId, expr);
+  if (!res.ok) {
+    throw new Error(`ws_send evaluate failed: ${res.exceptionDetails?.text ?? "unknown"} — socket may be closed`);
   }
-  return { sent: true, hookId: hook.hookId, socketId: hook.socketId };
+  const outcome = String(res.value ?? "");
+  if (outcome.startsWith("sent:")) {
+    pushFrame(hook, "out", data);
+    return { sent: true, hookId: hook.hookId, socketId: hook.socketId, via };
+  }
+  throw new Error(`ws_send: page has no live socket for ${hook.socketId} (${outcome}) — open the terminal first, or the socket closed`);
 }
 
 // ── HTTP ops ──
@@ -256,8 +330,8 @@ async function pushRulesToTab(tabId: number): Promise<void> {
     });
   } catch {
     // Tab may have no content script yet (navigating, chrome://) — SW keeps
-    // the rules; the page hook pulls them on next navigation via bp:net-rules
-    // re-push from httpRules() callers. Best-effort only.
+    // the rules; ensureHookInstalled's postMessage re-push (below) delivers
+    // them once the hook lands. Best-effort only.
   }
 }
 

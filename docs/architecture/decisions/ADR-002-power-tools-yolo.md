@@ -56,3 +56,15 @@ needed a single "allow everything" switch that persists nothing.
 - `press` fallback now warns loudly (`isolated/fallbackKeyEvent` verdict +
   `isTrusted=false` message) instead of silent success.
 - Spec tool count 11 → 15; page families three → five.
+
+## Addendum 2026-09-30 — socket tap limits (verified live)
+
+- The debugger is **observe-only** for sockets: no `Network.sendData`
+  (`-32601`). Injection goes through the page's own `socket.send()` via
+  `Runtime.evaluate`, never the wire.
+- Observation starts at debugger attach; pre-attach sockets/frames are
+  invisible. The CDP tap (`Network.webSocket*` → `page-network.ts`) covers
+  any socket from attach onward with zero page cooperation.
+- `Page.addScriptToEvaluateOnNewDocument` registrations returned identifiers
+  but never fired in this setup (markers absent after manual + CDP reloads)
+  — dropped in favor of `chrome.scripting.executeScript WORLD_MAIN`.

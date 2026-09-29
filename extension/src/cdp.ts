@@ -38,9 +38,9 @@
  */
 
 import { isExtensionContext } from "./safety.js";
-import { forgetHook } from "./page-network.js";
-
-// ── Public types ─────────────────────────────────────────────────────────
+// NOTE: page-network.js imports cdp.js (runtimeEvaluate for the trust-but-
+// verify probe), so a static import here would circularize. The tap calls
+// below use dynamic import — module-cached after first load, no perf hit.
 
 export interface AttachResult {
   attached: boolean;
@@ -129,9 +129,44 @@ export function init(): void {
   if (!isExtensionContext()) return;
 
   // CDP events — buffered for page.read action=console.
+  // Network.webSocket* feeds the page.net CDP socket tap (no page hook needed).
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source.tabId;
     if (typeof tabId !== "number") return;
+
+    if (method === "Network.webSocketCreated") {
+      const p = params as { url?: string; requestId?: string } | undefined;
+      if (p?.requestId) {
+        void import("./page-network.js").then((m) => {
+          try { m.ingestCdpSocketCreated(tabId, p.url ?? "", p.requestId as string); } catch { /* bookkeeping only */ }
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (method === "Network.webSocketFrameReceived" || method === "Network.webSocketFrameSent") {
+      const p = params as { requestId?: string; response?: { payloadData?: string } } | undefined;
+      if (p?.requestId) {
+        const dir = method === "Network.webSocketFrameReceived" ? "in" : "out";
+        const data = p.response?.payloadData ?? "";
+        const rid = p.requestId;
+        void import("./page-network.js").then((m) => {
+          try { m.ingestCdpSocketFrame(tabId, rid, dir, data); } catch { /* bookkeeping only */ }
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (method === "Network.webSocketClosed") {
+      const p = params as { requestId?: string } | undefined;
+      if (p?.requestId) {
+        const rid = p.requestId;
+        void import("./page-network.js").then((m) => {
+          try { m.ingestCdpSocketClosed(rid); } catch { /* bookkeeping only */ }
+        }).catch(() => {});
+      }
+      return;
+    }
 
     if (method === "Runtime.consoleAPICalled") {
       const p = params as RuntimeConsoleAPICalledParams | undefined;
@@ -186,20 +221,23 @@ export function init(): void {
     console.warn(`[bp-cdp] Detached from tab ${tabId}: ${reason}`);
   });
 
-  // Auto-detach on top-frame navigation (SPA in-tab navigation is fine — only
-  // frameId === 0 is treated as a real navigation).
+  // Navigation: keep the debugger attached. Detaching on navigation kills
+  // Page.addScriptToEvaluateOnNewDocument registrations (they live on the
+  // debugger session) — which is how the page.net MAIN hook persists.
   if (chrome.webNavigation?.onCommitted) {
     chrome.webNavigation.onCommitted.addListener((details) => {
       if (details.frameId !== 0) return;
       const tabId = details.tabId;
-      if (attached.has(tabId)) {
-        void detach(tabId).catch((err) => {
-          console.warn(`[bp-cdp] Auto-detach on navigation failed: ${(err as Error).message}`);
-        });
-      }
+      // NOTE: no auto-detach here. Detaching on navigation kills
+      // Page.addScriptToEvaluateOnNewDocument registrations (they live on
+      // the debugger session), which is exactly how the page.net MAIN hook
+      // persists. The banner is cosmetic; the session survives navigations
+      // until the tab closes or DevTools grabs it.
       // page.net MAIN-world hook dies with the document — forget so the next
-      // page.net call re-injects via scripting.executeScript.
-      try { forgetHook(tabId); } catch { /* bookkeeping only */ }
+      // page.net call re-installs. Dynamic import: page-network imports cdp.
+      void import("./page-network.js").then((m) => {
+        try { m.forgetHook(tabId); } catch { /* bookkeeping only */ }
+      }).catch(() => {});
     });
   }
 
@@ -288,11 +326,16 @@ export async function ensureAttached(tabId: number, reason: string): Promise<Att
   try {
     await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
     await chrome.debugger.sendCommand({ tabId }, "Log.enable");
-    // Input.enable is a no-op for our use case but is conventional — keep
-    // it so any future Input.* event listeners (touch, key) work.
-    await chrome.debugger.sendCommand({ tabId }, "Input.enable");
+    // NOTE: no Input.enable exists in CDP — Input.* works without it.
+    // Network.enable feeds the page.net socket tap (Network.webSocket* events).
+    // Non-fatal if it fails — the MAIN-world hook remains the frame path.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Network.enable", {});
+    } catch (e) {
+      console.warn(`[bp-cdp] Network.enable failed on tab ${tabId}: ${(e as Error).message}`);
+    }
   } catch (err) {
-    console.warn(`[bp-cdp] Failed to enable Runtime/Log/Input domains on tab ${tabId}: ${(err as Error).message}`);
+    console.warn(`[bp-cdp] Failed to enable Runtime/Log domains on tab ${tabId}: ${(err as Error).message}`);
   }
 
   return { attached: true, version: CDP_PROTOCOL_VERSION };

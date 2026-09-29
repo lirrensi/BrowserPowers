@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WS Echo — page.net test</title>
+  <!--
+    Local page.net proving ground. Opens a WebSocket to the companion
+    echo server (same origin, so no CSP/CORS games), sends text frames,
+    and renders inbound frames into #log. Drive it via:
+      page.net ws_list → ws_tail → ws_send, http_observe/block on /api/echo.
+    Served from manual-tests/test-pages/ over plain http (no page CSP).
+  -->
+</head>
+<body>
+  <h1>WS Echo</h1>
+  <p>Status: <code id="status">starting…</code></p>
+  <button id="open">Open socket</button>
+  <button id="ping">Send ping</button>
+  <button id="fetch">Fetch /api/echo</button>
+  <pre id="log"></pre>
+  <script>
+    (function () {
+      var status = document.getElementById("status");
+      var log = document.getElementById("log");
+      var ws = null;
+      function line(s) { log.textContent += s + "\n"; }
+      function setStatus(s) { status.textContent = s; }
+      document.getElementById("open").addEventListener("click", function () {
+        if (ws && ws.readyState === 1) { setStatus("already open"); return; }
+        ws = new WebSocket("ws://" + location.host + "/ws-echo");
+        window.__bpTestWs = ws;
+        ws.addEventListener("open", function () { setStatus("open"); line("[open]"); });
+        ws.addEventListener("message", function (e) { line("[in] " + String(e.data).slice(0, 200)); });
+        ws.addEventListener("close", function () { setStatus("closed"); line("[close]"); });
+        ws.addEventListener("error", function () { line("[error]"); });
+        setStatus("connecting…");
+      });
+      document.getElementById("ping").addEventListener("click", function () {
+        if (!ws || ws.readyState !== 1) { setStatus("no socket — open first"); return; }
+        ws.send("ping-from-page");
+        line("[out] ping-from-page");
+      });
+      document.getElementById("fetch").addEventListener("click", function () {
+        fetch("/api/echo?probe=1").then(function (r) { return r.text(); }).then(function (t) {
+          line("[fetch] " + t.slice(0, 200));
+        }).catch(function (e) { line("[fetch-err] " + e.message); });
+      });
+      // Auto-open on load so ws_list has something without clicking.
+      window.addEventListener("load", function () {
+        document.getElementById("open").click();
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -33,10 +33,11 @@ export function netHookMain() {
     w.__bpNetHookInstalled = true;
 
     let socketSeq = 0;
-    const sockets = /** @type {Object<string, any>} */ ({});
+    // Exposed as window.__bpNetSockets so ws_send can address live sockets
+    // via Runtime.evaluate (there is no CDP Network.sendData — verified live).
+    const sockets = /** @type {Object<string, any>} */ (w.__bpNetSockets || (w.__bpNetSockets = {}));
     let rules = /** @type {Array<any>} */ ([]);
     let includeBodies = false;
-
     /** @param {any} msg */
     function relay(msg) {
       try {
@@ -108,13 +109,23 @@ export function netHookMain() {
           } catch (e) { /* ignore */ }
           return origSend.call(this, data);
         };
-        /** @this {any} @param {string} url @param {any} protocols */
+        /** @this {any} @param {any} url @param {any} protocols */
         function HookedWS(url, protocols) {
-          const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+          // Plain function (NOT class): `new HookedWS()` returns the real
+          // socket explicitly. The earlier no-return version handed back an
+          // empty `this` with the right prototype but no connection — every
+          // socket died instantly (readyState 3). Returning the genuine
+          // WebSocket keeps the native brand check happy; prototype patching
+          // (same approach as the working WebSocket.prototype.send wrapper)
+          // handles the rest.
+          let ws = null;
           try {
             socketSeq += 1;
             const socketId = "sock_" + socketSeq;
             const urlStr = String(url);
+            ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+            // Re-target at the hooked prototype so later calls hit wrapped send.
+            try { Object.setPrototypeOf(ws, HookedWS.prototype); } catch (e) { /* ignore */ }
             meta.set(ws, { socketId: socketId, url: urlStr });
             sockets[socketId] = ws;
             ws.addEventListener("message", function (e) {
@@ -136,8 +147,14 @@ export function netHookMain() {
               } catch (err) { /* ignore */ }
             });
             relay({ domain: "ws", kind: "open", socketId: socketId, url: urlStr });
-          } catch (e) { /* ignore */ }
-          return ws;
+          } catch (e) { /* fall through to fallback below */ }
+          if (ws) return ws;
+          // Last resort: unhooked but live socket beats a dead hooked one.
+          try {
+            return protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+          } catch (e) {
+            throw e;
+          }
         }
         HookedWS.prototype = OrigWS.prototype;
         for (const k of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
@@ -145,7 +162,6 @@ export function netHookMain() {
             HookedWS[k] = OrigWS[k];
           } catch (e) { /* ignore */ }
         }
-        HookedWS.__bpHooked = true;
         w.WebSocket = HookedWS;
       }
     } catch (e) { /* never break page */ }

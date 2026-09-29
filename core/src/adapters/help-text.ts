@@ -141,8 +141,14 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
   {
     name: "page_net",
     group: "page-interaction",
-    description: "Observe and drive page network via in-page WS/HTTP wrapper hook — power tool, gated like page_js via page.execute.",
+    description: "Observe and drive page network: CDP socket tap (observe any socket from attach onward) + MAIN-world wrapper hook (page-hook sockets, HTTP observe/block) — power tool, gated like page_js via page.execute.",
     actions: ["ws_list", "ws_send", "ws_tail", "http_observe", "http_block", "http_rules", "http_unblock"],
+    params: `- browser_id or browser_name (one required)
+- action (string, required): ws_list | ws_send | ws_tail | http_observe | http_block | http_rules | http_unblock
+- hook_id|socket_id (ws_send, ws_tail): hook from ws_list
+- data (ws_send, string): frame bytes to inject via the page's own socket.send()
+- pattern (http_observe, http_block): substring or *-wildcard URL match
+- LIMITS: observe sees sockets created after debugger attach (past traffic is gone); ws_send needs the MAIN hook installed (chrome.scripting, CSP-exempt) — tap-only sockets (via:"cdp", no hook) cannot receive; there is no CDP Network.sendData (observe-only debugger); http_block is wrapper-level fetch short-circuit (403), not network-stack`,
   },
   {
     name: "request_help",

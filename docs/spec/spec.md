@@ -894,22 +894,27 @@ Respond to a pending dialog.
 
 | Property | Value |
 |---|---|
-| Description | Observe and drive page network via an in-page WS/HTTP wrapper hook (TSK-0015) — WS hooks (`ws_list`, `ws_send`, `ws_tail`) + HTTP observe/block rules (`http_observe`, `http_block`, `http_rules`, `http_unblock`). Power tool, gated like `page_js`. |
+| Description | Observe and drive page network: CDP socket tap (observe any socket from attach onward, no page code) + MAIN-world wrapper hook (page-hook sockets, HTTP observe/block). Power tool, gated like `page_js`. |
 | Input | `{ browser_id: string, action: "ws_list" \| "ws_send" \| "ws_tail" \| "http_observe" \| "http_block" \| "http_rules" \| "http_unblock", tabId?: number, hook_id \| socket_id?: string, data?: string, limit?: number, pattern?: string, id?: string, include_bodies?: boolean, mode?: "sync" \| "async" }` |
-| Output | Per-action payload plus verdict `{ executed: true, world: "isolated", durationMs: 0, path: "isolated.pageNetwork" }`. The unused `network.requests` webRequest case is untouched. |
+| Output | Per-action payload plus verdict `{ executed: true, world: "isolated", durationMs: 0, path: "isolated.pageNetwork" }` (`ws_list` also reports `installed` + per-hook `via`). The unused `network.requests` webRequest case is untouched. |
 
 **Actions:**
-- `ws_list` — List WS sockets hooked by the page hook (hookId, socketId, url, tabId, frame counts)
-- `ws_send` — Inject a frame into a live page socket (`{ hook_id\|socket_id, data }`) — best-effort in-page delivery
-- `ws_tail` — Ring-buffered frames for a hook (`{ hook_id\|socket_id, limit? }`, cap 200/hook)
+- `ws_list` — List WS sockets: CDP-tapped (`via: "cdp"`, any socket created after debugger attach) + page-hook (`via: "page-hook"`, sockets opened under the MAIN hook). Fields: hookId, socketId, url, tabId, frame counts, via.
+- `ws_send` — Inject bytes via the page's own `socket.send()` through `Runtime.evaluate` (`{ hook_id\|socket_id, data }`). Requires the MAIN hook installed (socket registry); tap-only sockets without a hook fail loudly.
+- `ws_tail` — Ring-buffered frames for a hook (`{ hook_id\|socket_id, limit? }`, cap 200/hook). Tap frames are network-truth (wire bytes); hook frames are JS-truth (what the page sent).
 - `http_observe` — Register an observe pattern and return matching requests (`{ pattern, include_bodies?, limit? }`; method/url/status only, bodies only with `include_bodies: true` then truncated to 4KB)
 - `http_block` — Register a block pattern (`{ pattern }`); matched `fetch` short-circuits with a synthetic 403 `Response`
 - `http_rules` — List current observe/block rules
 - `http_unblock` — Remove a rule (`{ id }`)
 
-**xterm serial-console case:** `ws_tail` shows terminal bytes flowing over the socket; `ws_send` injects keystrokes into it.
+**xterm serial-console case:** `ws_tail` shows terminal bytes flowing over the socket; `ws_send` injects keystrokes through the page's own socket. Proven: CDP tap observes live sockets with no page cooperation.
 
-> **Blocked-action honesty:** blocking is wrapper-level only — the page hook's `fetch` wrapper returns a synthetic 403 `Response` (XHR is observe-only and cannot be cleanly short-circuited). This is NOT network-stack blocking; true MV3 stack blocking would need `declarativeNetRequest` rules (explicit non-goal). The page hook runs at `document_start` so it installs before page scripts open sockets; CSP-locked pages may refuse the inline hook script, in which case no hooks are reported.
+> **Edge cases / limits (verified live 2026-09-30):**
+> - Observe starts at debugger attach. Sockets created before attach, and frames sent before attach, are invisible — past traffic is gone. Keep the tab attached (any `page.cdp`/`page.js` call attaches) before opening the terminal.
+> - There is **no CDP `Network.sendData`** (verified `-32601 method not found`) — the debugger is observe-only for sockets. Injection always goes through page JS (`socket.send()`), never the wire.
+> - `ws_send` without an installed MAIN hook fails with `no-socket:0`. The hook installs via `chrome.scripting.executeScript ({ world: "MAIN" })` (CSP-exempt); strict-CSP `<script>`-tag injection does not work and is kept as best-effort fast path only.
+> - `chrome://`, `edge://`, `about:`, `devtools://` pages: no content script, no hook — `page.net` fails loudly instead of returning empty.
+> - Blocking is wrapper-level only — the page hook's `fetch` wrapper returns a synthetic 403 `Response` (XHR is observe-only and cannot be cleanly short-circuited). This is NOT network-stack blocking; true MV3 stack blocking would need `declarativeNetRequest` rules (explicit non-goal).
 
 > **Security**: Gated behind the `page.execute` permission group exactly like `page_js` (NO new tool group). MCP tool name is `page_net`; internally it dispatches as tool `page.net`.
 

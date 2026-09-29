@@ -775,14 +775,17 @@ async function execute(
       if (!action || typeof action !== "string") {
         throw new Error("page.net requires an 'action' parameter (ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock)");
       }
-      // Authoritative hook install: CSP-exempt MAIN-world injection. Best-effort —
-      // proceeds anyway so observation degrades to empty instead of erroring.
-      const hooked = await ensureHookInstalled(tabId);
-      const verdict = { executed: true, world: "isolated" as const, durationMs: 0, path: "isolated.pageNetwork" };
-      const hookNote = hooked ? undefined : "MAIN-world hook not installed on this tab (CSP/chrome://?) — results may be empty";
+      // chrome://, edge://, about:, and friends: no content script, no MAIN
+      // world, no hook — fail loud instead of an empty hooks[] that looks
+      // like "no sockets" (that exact confusion cost a day of debugging).
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      const tabUrl = tab?.url ?? tab?.pendingUrl ?? "";
+      if (/^(chrome|chrome-error|edge|about|devtools|view-source|chrome-extension):/i.test(tabUrl)) {
+        throw new Error(`page.net cannot run on ${tabUrl.split(":")[0]}:// pages (no content script there) — focus a real http(s) tab or pass its tabId`);
+      }
       switch (action) {
         case "ws_list":
-          return { data: { ...wsList(tabId), ...(hookNote ? { hookNote } : {}) }, executionVerdict: verdict };
+          return { data: { ...wsList(tabId), installed: hooked, ...(hookNote ? { hookNote } : {}) }, executionVerdict: verdict };
         case "ws_send": {
           const hookId = (params.hook_id ?? params.socket_id) as string | undefined;
           const data = params.data as string | undefined;
