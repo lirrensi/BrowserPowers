@@ -74,7 +74,6 @@ import {
 } from "../src/v2/content-actions";
 import type { Target, ActResult } from "../src/v2/content-actions";
 import type { ExecutionVerdict } from "../src/types.js";
-
 // ── Runtime Self-Test ──
 // Synchronous, document_start — proves the content script's isolated world can
 // actually evaluate JS. The verdict rides on every response so callers can
@@ -110,6 +109,9 @@ export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
   main() {
+    // page.net (TSK-0015): MAIN-world WS/HTTP wrapper hook + isolated relay.
+    // Runs at document_start so the hook installs before page scripts open sockets.
+    installNetBridge();
     chrome.runtime.onMessage.addListener(
       (
         message: { source: string; type: string; action?: string; params?: Record<string, unknown> },
@@ -169,6 +171,10 @@ async function handleMessage(
         return withRuntimeStatus(await handleFallback(message.type, message.params || {}));
       case "bp:runtime_status":
         return withRuntimeStatus(buildRuntimeStatus());
+      case "bp:net-send":
+        return withRuntimeStatus(await handleNetSend(message.params || {}));
+      case "bp:net-rules":
+        return withRuntimeStatus(await handleNetRules(message.params || {}));
       default:
         return withRuntimeStatus({ success: false, message: `Unknown message type: ${message.type}`, errorCode: "UNKNOWN_TYPE" });
     }
@@ -435,7 +441,7 @@ async function handleAct(
     }
 
     default:
-      return { success: false, message: `Unknown act action: ${action}`, errorCode: "UNKNOWN_ACTION" };
+      return { success: false, message: `Unknown act action: ${action}. If help lists it, this extension build is stale — reload the extension.`, errorCode: "UNKNOWN_ACTION" };
   }
 }
 
@@ -651,4 +657,113 @@ function buildRuntimeStatus(): Record<string, unknown> {
       'isolated:content-script',
     ],
   };
+}
+
+// ── page.net bridge (TSK-0015) ──
+//
+// Architecture: the observation hook must run in the page MAIN world
+// (isolated-world wrappers would only see the content script's own heap,
+// not page sockets). `netHookMain` (extension/src/net-hook-main.ts) is
+// injected via `chrome.scripting.executeScript ({ world: "MAIN" })` from the
+// service worker (page-network.ts `ensureHookInstalled`) — NOT via a
+// `<script>` tag from here, because strict page CSPs (`script-src 'self'`
+// without `unsafe-inline`, e.g. cloud.ru) refuse inline scripts while the
+// extension-API MAIN-world injection path is CSP-exempt.
+//
+// This isolated listener forwards page relays to the SW (`bp:net-frame` →
+// page-network.ts ingest) and forwards SW control messages (`bp:net-send`,
+// `bp:net-rules`) back into the page. Everything is guarded so pages never
+// break. The content script's own inject attempt (installNetBridge, below)
+// is a best-effort fast path for pages whose CSP allows it; the SW-side
+// ensureHookInstalled is the authoritative path.
+
+import { netHookMain } from "../src/net-hook-main.js";
+
+/**
+ * Page MAIN-world hook — imported from ../src/net-hook-main.js.
+ * Referenced by installNetBridge below so the bundler retains it.
+ */
+void netHookMain;
+
+/**
+ * Isolated-world side: injects `netHookMain` into the page MAIN world at
+ * document_start, then relays page→SW (window.postMessage → runtime).
+ * Installs once per document; every step guarded.
+ */
+function installNetBridge(): void {
+  try {
+    const w = window as unknown as Record<string, unknown>;
+    if (w.__bpNetBridgeInstalled) return;
+    w.__bpNetBridgeInstalled = true;
+
+    window.addEventListener("message", (e) => {
+      try {
+        const d = e.data as Record<string, unknown>;
+        if (!d || d.source !== "browserpowers-net") return;
+        const { source: _src, ...frame } = d;
+        try {
+          const p = chrome.runtime.sendMessage({ type: "bp:net-frame", frame }) as unknown;
+          if (p && typeof (p as Promise<unknown>).catch === "function") {
+            (p as Promise<unknown>).catch(() => {});
+          }
+        } catch { /* SW may be asleep; hook buffers nothing, drops frame */ }
+      } catch {
+        // Never break the page over telemetry.
+      }
+    });
+
+    const injectHook = () => {
+      try {
+        const src = `(${netHookMain.toString()})();`;
+        const el = document.createElement("script");
+        el.textContent = src;
+        (document.documentElement ?? document.head ?? document.body).appendChild(el);
+        el.remove();
+      } catch {
+        // CSP or missing documentElement — page simply has no net hook.
+      }
+    };
+    if (document.documentElement) {
+      injectHook();
+    } else {
+      // document_start with no root yet (SPA shell, about:blank handoff) — retry on DOM build.
+      document.addEventListener("DOMContentLoaded", injectHook, { once: true });
+      window.addEventListener("load", injectHook, { once: true });
+    }
+  } catch {
+    // Never break content-script startup.
+  }
+}
+
+/** SW → page: deliver an outbound WS frame on a hooked socket (best-effort). */
+async function handleNetSend(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const socketId = params.socketId as string;
+  const data = params.data as string;
+  if (!socketId || typeof data !== "string") {
+    return { success: false, message: "bp:net-send requires socketId and data:string", errorCode: "MISSING_PARAM" };
+  }
+  try {
+    window.postMessage({ source: "browserpowers-net-ctl", cmd: "send", socketId, data }, "*");
+    return { success: true, data: { sent: true, socketId } };
+  } catch (err) {
+    return { success: false, message: `bp:net-send failed: ${(err as Error).message}`, errorCode: "NET_SEND_FAILED" };
+  }
+}
+
+/** SW → page: push the current HTTP observe/block rules into the page hook. */
+async function handleNetRules(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  try {
+    window.postMessage(
+      {
+        source: "browserpowers-net-ctl",
+        cmd: "rules",
+        rules: params.rules ?? [],
+        includeBodies: params.includeBodies === true,
+      },
+      "*",
+    );
+    return { success: true, data: { pushed: true } };
+  } catch (err) {
+    return { success: false, message: `bp:net-rules failed: ${(err as Error).message}`, errorCode: "NET_RULES_FAILED" };
+  }
 }

@@ -1067,7 +1067,7 @@ export function pressKeys(el: Element, key?: string, keys?: string[]): ActResult
     return {
       success: false,
       message: "No element",
-      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackKeyEvent" },
     };
   }
   (el as HTMLElement).focus();
@@ -1077,7 +1077,7 @@ export function pressKeys(el: Element, key?: string, keys?: string[]): ActResult
     return {
       success: false,
       message: "No key specified",
-      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.dispatchEvent" },
+      executionVerdict: { executed: false, world: "isolated", durationMs: performance.now() - start, path: "isolated.fallbackKeyEvent" },
     };
   }
 
@@ -1113,7 +1113,7 @@ export function pressKeys(el: Element, key?: string, keys?: string[]): ActResult
       world: "isolated",
       domMutated: true,
       durationMs: performance.now() - start,
-      path: "isolated.dispatchEvent",
+      path: "isolated.fallbackKeyEvent",
     },
   };
 }

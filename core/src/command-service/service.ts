@@ -4,6 +4,19 @@ import type { ToolResult } from "../types.js";
 import { ApprovalTimeoutError, registry } from "../registry.js";
 import { checkGate } from "../gates/middleware.js";
 import { logAudit } from "../audit.js";
+import { VERSION } from "../version.js";
+
+/**
+ * Soft version-skew hint. The core NEVER refuses old extension builds —
+ * it just appends an upgrade hint so agents see "reload the extension"
+ * instead of a bare "Unknown tool".
+ */
+function skewHint(browser: { name: string; extVersion?: string }): string {
+  if (browser.extVersion && browser.extVersion !== VERSION) {
+    return ` (browser "${browser.name}" ext v${browser.extVersion} vs core v${VERSION} — stale build; reload the extension)`;
+  }
+  return ` (if help lists it, the connected extension build is stale — reload it)`;
+}
 
 /**
  * The SINGLE implementation of CommandService.
@@ -116,7 +129,7 @@ class CommandServiceImpl implements CommandService {
         browserId,
         tool,
         success: false,
-        error: `Tool "${tool}" not in browser's capabilities`,
+        error: `Tool "${tool}" not in browser's capabilities${skewHint(browser)}`,
       };
     }
 
@@ -155,15 +168,20 @@ class CommandServiceImpl implements CommandService {
           return await this.pollHumanHelp(browserId, data.notif_id, helpDeadlineMs);
         }
       }
-      await logAudit({ browserId, tool, params: cleanParams, result: { success: true } });
+      if (!result.success && result.error && (/Unknown (tool|act action)/i.test(result.error) || result.error.includes("UNKNOWN_ACTION"))) {
+        result.error += skewHint(browser);
+      }
+      await logAudit({ browserId, tool, params: cleanParams, result: result.success ? { success: true } : { success: false, error: result.error } });
       return result;
     } catch (err) {
-      await logAudit({ browserId, tool, params: cleanParams, result: { success: false, error: (err as Error).message } });
+      const message = (err as Error).message;
+      const hinted = /Unknown (tool|act action)/i.test(message) || message.includes("UNKNOWN_ACTION") ? message + skewHint(browser) : message;
+      await logAudit({ browserId, tool, params: cleanParams, result: { success: false, error: hinted } });
       return {
         browserId,
         tool,
         success: false,
-        error: (err as Error).message,
+        error: hinted,
       };
     }
   }
@@ -227,7 +245,7 @@ class CommandServiceImpl implements CommandService {
     // Capability check
     const cap = browser.capabilities.find((c: { tool: string }) => c.tool === tool);
     if (!cap) {
-      throw new Error(`Tool "${tool}" not in browser's capabilities`);
+      throw new Error(`Tool "${tool}" not in browser's capabilities${skewHint(browser)}`);
     }
 
     // Enqueue request — fire-and-forget

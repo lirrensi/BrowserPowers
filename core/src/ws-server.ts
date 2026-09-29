@@ -6,6 +6,7 @@ import type { CoreToExt, ExtToCore } from "./types.js";
 import { registry } from "./registry.js";
 import { loadConfig } from "./config.js";
 import { isAuthRequired, validateApiKey } from "./auth.js";
+import { VERSION } from "./version.js";
 
 /** Active WebSocket connections: browserId → WebSocket */
 const connections = new Map<string, WebSocket>();
@@ -99,7 +100,7 @@ export function createWsServer(httpServer: Server): WebSocketServer {
 
       switch (msg.type) {
         case "register": {
-          const { name, capabilities, permissions, browserId: savedId, commandMode } = msg.payload;
+          const { name, capabilities, permissions, browserId: savedId, commandMode, extVersion } = msg.payload;
 
           // Validate browser name
           if (typeof name !== "string" || !name.trim()) {
@@ -143,7 +144,7 @@ export function createWsServer(httpServer: Server): WebSocketServer {
             // update the WebSocket reference via register() below.
           }
 
-          registry.register(browserId, name, capabilities, permissions, commandMode);
+          registry.register(browserId, name, capabilities, permissions, commandMode, extVersion);
           connections.set(browserId, ws);
 
           // Start draining any queued items for this browser
@@ -151,7 +152,7 @@ export function createWsServer(httpServer: Server): WebSocketServer {
 
           const reply: CoreToExt = {
             type: "registered",
-            payload: { browserId },
+            payload: { browserId, coreVersion: VERSION },
           };
           ws.send(JSON.stringify(reply));
           console.log(`[ws] Browser "${name}" registered as ${browserId}${savedId ? " (reused)" : " (new)"}, caps: ${capabilities.map(c => c.tool).join(", ")}`);

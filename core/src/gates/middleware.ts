@@ -34,6 +34,7 @@ const TOOL_TO_GROUP: Record<string, ToolGroup> = {
   "downloads.list": "downloads",
   "downloads.open": "downloads",
   "network.requests": "network",
+  "page.net": "page.execute",
   "storage.get": "storage",
   "storage.set": "storage",
 
@@ -53,6 +54,7 @@ const TOOL_TO_GROUP: Record<string, ToolGroup> = {
   "page.read": "page.read",
   "page.act": "page.act",
   "page.js": "page.execute",
+  "page.cdp": "page.execute",
 
   // ── Human-loop (no borrow, dedicated automation browser) ──
   "human.requestHelp": "human",

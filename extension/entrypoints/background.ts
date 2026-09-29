@@ -3,7 +3,7 @@
  * This is the bridge between the BrowserPowers core and this browser's chrome.* APIs.
  */
 
-import { connect, reconnect, onMessage, isConnected, send, getConnectionStatus, disconnect } from "../src/ws-client";
+import { connect, reconnect, onMessage, isConnected, send, getConnectionStatus, getCoreVersion, disconnect } from "../src/ws-client";
 import { routeExecute, rehydrateHelpRequests, type ExecuteRequest } from "../src/capability-router";
 import { isExtensionContext } from "../src/safety";
 import { getSettings, saveSettings, saveSessionPermissionOverride, clearSessionPermissionOverride, getPageSitePermissions, addSitePattern } from "../src/storage";
@@ -11,7 +11,7 @@ import { normalizeHostname, resolvePagePermission } from "../src/site-permission
 // Side-effect import — registers chrome.debugger.onEvent / onDetach listeners
 // and webNavigation / tabs.onRemoved auto-detach hooks. Attach itself is lazy;
 // nothing happens until the first page.js or console read on a tab.
-import "../src/cdp";
+import { ingestNetFrame, ingestHttpFrame } from "../src/page-network";
 
 interface PendingApproval {
   requestId: string;
@@ -102,6 +102,20 @@ async function handleCoreMessage(msg: any): Promise<void> {
       case "request_approval": {
         const { requestId, tool, params, description } = msg.payload;
         console.log(`[bp-ext] Approval requested: ${tool} (${requestId})`);
+
+        // YOLO mode: dedicated automation browser, no human in the loop.
+        // Auto-approve everything WITHOUT persisting anything — turning YOLO
+        // off must restore the exact prior posture, so no site patterns,
+        // no session overrides, no permission writes happen here.
+        try {
+          const settings = await getSettings();
+          if (settings.yoloMode === true) {
+            console.log(`[bp-ext] YOLO mode: auto-approving ${tool}`);
+            send({ type: "approval_response", payload: { requestId, approved: true } });
+            updateBadge();
+            return;
+          }
+        } catch { /* fall through to normal approval flow */ }
 
         // ── Site-pattern check ──
         // Only relevant for page tools. Check if site rules already cover this.
@@ -235,6 +249,15 @@ function init(): void {
         break;
       }
 
+      case "getVersions": {
+        let extVersion = "unknown";
+        try {
+          extVersion = chrome.runtime.getManifest().version;
+        } catch { /* keep fallback */ }
+        sendResponse({ extVersion, coreVersion: getCoreVersion() });
+        break;
+      }
+
       case "reconnectToCore": {
         void reconnect();
         sendResponse({ success: true });
@@ -297,6 +320,23 @@ function init(): void {
         break;
       }
 
+      case "bp:net-frame": {
+        // page.net relay (TSK-0015): content script forwards MAIN-hook frames.
+        // Ingest is best-effort bookkeeping — never fails the message channel.
+        try {
+          const tabId = _sender?.tab?.id as number | undefined;
+          const frame = (message.frame ?? {}) as Record<string, unknown>;
+          if (tabId !== undefined && tabId >= 0) {
+            if (frame.domain === "http" || frame.kind === "http") {
+              ingestHttpFrame(tabId, frame);
+            } else {
+              ingestNetFrame(tabId, frame);
+            }
+          }
+        } catch { /* bookkeeping must not break messaging */ }
+        sendResponse({ received: true });
+        break;
+      }
       default:
         return false; // not handled
     }

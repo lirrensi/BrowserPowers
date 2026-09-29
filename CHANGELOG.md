@@ -4,6 +4,26 @@ All notable changes to BrowserPowers are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-09-29
+
+Field-feedback release: serial-console session drove five gaps shut, plus two new power tools.
+
+### Added
+- **Raw CDP passthrough** (`page.cdp` / MCP `page_cdp` / `browserpowers page cdp <browser> <method> [paramsJSON]`): any CDP method, no allowlist, gated via `page.execute` like `page_js`. Trusted `Input.dispatchKeyEvent` for xterm-style widgets that ignore synthetic events.
+- **Page-context network** (`page.net` / MCP `page_net` / `browserpowers page net <browser> <action>`): `ws_list` / `ws_send` / `ws_tail` + `http_observe` / `http_block` / `http_rules` / `http_unblock` via a MAIN-world hook. Blocking is wrapper-level (fetch 403), not network-stack.
+- **YOLO mode** (extension popup/options, bottom card): one switch that auto-approves every `request_approval` without persisting anything — off restores the exact prior posture. For dedicated automation browsers.
+- **Incognito windows** (`windows create` takes `incognito: true`, plumbed to `chrome.windows.create`).
+- **Popup version line**: `ext vX · core vY` under the title, amber skew warning when they differ; `Connected — registering...` state between socket-open and `registered` reply.
+- **MCP `help` per-action deep-dives**: `help({ topic: "page-act", action: "click_at" })` matches CLI `help page.act click_at`.
+
+### Fixed
+- **`press` synthetic fallback now warns**: message appends "untrusted synthetic KeyboardEvent … isTrusted=false", verdict forced to `isolated/fallbackKeyEvent` (was silent `success: true`).
+- **Version-skew cry**: `extVersion` in register/registry, `coreVersion` in `registered` reply; unknown tool/action errors carry a "stale build — reload the extension" hint.
+- **Spec drift**: 15 MCP tools documented (was 11); LLM-routing / headless-agent scope demoted to future/non-goal.
+
+### Changed
+- Page tool families: five (`page.read`, `page.act`, `page.js`, `page.cdp`, `page.net`); `page.cdp` / `page.net` share the `page.execute` gate (no new groups).
+
 ## [1.6.0] — 2026-09-18
 
 Scripting, shorthand, locales, and npm — plus a small batch fix.

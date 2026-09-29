@@ -58,6 +58,7 @@ class BrowserRegistry {
     capabilities: Capability[],
     permissions: Browser["permissions"],
     commandMode?: CommandMode,
+    extVersion?: string,
   ): Browser {
     const config = loadConfig();
     const browser: Browser = {
@@ -69,6 +70,7 @@ class BrowserRegistry {
       connectedAt: Date.now(),
       lastHeartbeat: Date.now(),
     };
+    if (extVersion !== undefined) browser.extVersion = extVersion;
     this.browsers.set(browserId, browser);
     return browser;
   }

@@ -96,8 +96,7 @@ connect() → ws.onopen → send register
 
 **Heartbeat**: Sends `{ type: "heartbeat" }` every 25 seconds.
 
-**Registration on connect**: On successful WebSocket open, reads persistent settings plus session permission overrides, builds capability list (filtered by effective permissions), and sends `register` message.
-
+**Registration on connect**: On successful WebSocket open, reads persistent settings plus session permission overrides, builds capability list (filtered by effective permissions), and sends `register` message (includes `extVersion` from the manifest; core answers with `coreVersion` — skew surfaces as a "stale build" hint on unknown-tool errors and an amber header line).
 ### 3. Capability Router (`src/capability-router.ts`)
 
 The **only module** in the codebase that calls `chrome.*` APIs. Maps tool names to concrete browser API calls. v2 page tools (`page.read`, `page.act`, `page.js`) are dispatched to dedicated v2 modules under `src/v2/`.
@@ -112,9 +111,10 @@ The **only module** in the codebase that calls `chrome.*` APIs. Maps tool names 
 | `tabs.update` | `chrome.tabs.update()` | Navigate, focus, etc. |
 | `tabs.navigate` | `chrome.tabs.update()` / `chrome.tabs.create()` | In sync mode, auto-runs compact inspect and includes snapshot in result |
 | `page.read` | `src/v2/page-read.ts` → dispatchReadAction | Unified read tool with action dispatch |
-| `page.act` | `src/v2/page-act.ts` → dispatchActAction | In sync mode, captures before/after inspect snapshots and computes semantic diff |
+| `page.act` | `src/v2/page-act.ts` → dispatchActAction | In sync mode, captures before/after inspect snapshots and computes semantic diff; `press` fallback warns untrusted in the message |
 | `page.js` | `src/v2/page-js.ts` → dispatchJsAction | JavaScript execution wrapper — gated escape hatch |
-| `screenshots.capture` | `chrome.tabs.captureVisibleTab()` | Returns base64 PNG |
+| `page.cdp` | `src/cdp.ts` → sendCommand | Raw CDP passthrough (any method); verdict `cdp.<method>` |
+| `page.net` | `src/page-network.ts` + `src/net-hook-main.ts` (MAIN-world, CSP-exempt install) | WS hooks + HTTP observe/block; wrapper-level blocking only |
 | `history.search` | `chrome.history.search()` | |
 | `history.delete` | `chrome.history.deleteUrl()` / `deleteAll()` | |
 | `bookmarks.list` | `chrome.bookmarks.search()` | |
@@ -260,8 +260,11 @@ they share the same backing logic and storage, with only layout differences.
 | **Core Server** | WebSocket URL text input |
 | **Approvals** | Native approval notification toggle |
 | **Capabilities** | Dropdown per tool group (ALLOW / ASK / DENY) |
+| **Automation Mode** | YOLO toggle — while on, every `request_approval` auto-approves instantly and nothing is persisted (off restores the exact prior posture); capability controls render disabled |
 | **Actions** | Reconnect button, Reset to Defaults button |
 
+Header shows `ext vX · core vY` (amber on skew) and a `Connected — registering...`
+intermediate state between socket-open and the `registered` handshake reply.
 **Approvals tab** (shown when approvals are pending):
 
 | Section | Controls |
@@ -533,6 +536,7 @@ interface ExtensionSettings {
   coreUrl: string;
   authKey: string;
   approvalNotificationsEnabled: boolean;
+  yoloMode: boolean; // single switch: auto-approve everything, persist nothing
   permissions: {
     tabs: "allow" | "ask" | "deny";
     "page.read": "allow" | "ask" | "deny";

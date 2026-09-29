@@ -35,8 +35,8 @@ BrowserPowers solves this by making each real browser a first-class participant.
 - Permission gate system per tool group per browser (allow, deny, ask)
 - Browser registry — tracking connected browsers, their capabilities, and health
 - Configuration via local YAML file (~/.config/browserpowers/config.yaml)
-- LLM call routing through core (proxy pattern, not local LLM)
-- Headless core agent mode (shared agent logic, no browser UI required)
+
+LLM call routing through core and headless core agent mode are future work / non-goals — no implementation exists.
 
 ### Out of Scope
 
@@ -182,8 +182,11 @@ Sent by the extension immediately after WebSocket connection is established.
 | `permissions` | PermissionProfile | Per-group permission levels |
 | `authKey` | string (optional) | API key for servers with authentication enabled |
 | `browserId` | string (optional) | Previously assigned browser ID for reconnection |
+| `extVersion` | string (optional) | Extension build version (manifest version); absent from old builds |
 
-The core MUST respond with a `registered` message containing the assigned `browserId`.
+The core MUST respond with a `registered` message containing the assigned `browserId` and the core's own `coreVersion`.
+
+Soft-skew contract: the core NEVER refuses old extension builds; unknown-tool errors carry an upgrade hint ("stale build — reload the extension") instead.
 
 ##### result
 
@@ -252,7 +255,8 @@ Sent in response to `register`.
 {
   "type": "registered",
   "payload": {
-    "browserId": "<uuid>"
+    "browserId": "<uuid>",
+    "coreVersion": "<semver>"
   }
 }
 ```
@@ -409,7 +413,7 @@ On reconnect, the extension MUST send a fresh `register` message.
 
 ### 2. MCP Tools
 
-The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport, served statelessly: every HTTP request is handled by a freshly constructed server instance, and no session state persists between requests. The server registers 11 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `cookies`, `windows`, and `help`.
+The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport, served statelessly: every HTTP request is handled by a freshly constructed server instance, and no session state persists between requests. The server registers 15 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `page_cdp`, `page_net`, `cookies`, `windows`, `request_help`, `record`, and `help`.
 
 #### 2.1 Tool: `browsers`
 
@@ -876,6 +880,39 @@ Respond to a pending dialog.
 
 > **Security**: This tool is gated behind the `page.execute` permission group (the old group name is preserved for backward compatibility). It MUST NOT be accessible if `page.execute` is set to `deny` or `ask` (without approval). It is intentionally the highest-risk tool in the system. The MCP tool name is `page_js`; internally it dispatches as tool `page.js` which maps to permission group `page.execute`.
 
+#### 2.8b Tool: `page_cdp`
+
+| Property | Value |
+|---|---|
+| Description | Raw CDP passthrough — send any CDP method with arbitrary params on the active tab (e.g. `Input.dispatchKeyEvent` for trusted key input into xterm/canvas). Power tool, gated like `page_js`. No allowlist — any method is forwarded; the caller owns the consequences. |
+| Input | `{ browser_id: string, method: string, params?: Record<string, unknown>, timeout_ms?: number, mode?: "sync" \| "async" }` |
+| Output | `{ method, result }` plus verdict `{ executed: true, world: "cdp", durationMs, path: "cdp.<method>" }` |
+
+> **Security**: Gated behind the `page.execute` permission group exactly like `page_js` (default `deny` → ask-gated in practice). `frameId` is NOT supported — non-zero `frameId` is rejected (top frame / CDP Page-target scope only). Unknown methods surface the CDP protocol error text (`CDP <method> failed: <err>`).
+
+#### 2.8c Tool: `page_net`
+
+| Property | Value |
+|---|---|
+| Description | Observe and drive page network via an in-page WS/HTTP wrapper hook (TSK-0015) — WS hooks (`ws_list`, `ws_send`, `ws_tail`) + HTTP observe/block rules (`http_observe`, `http_block`, `http_rules`, `http_unblock`). Power tool, gated like `page_js`. |
+| Input | `{ browser_id: string, action: "ws_list" \| "ws_send" \| "ws_tail" \| "http_observe" \| "http_block" \| "http_rules" \| "http_unblock", tabId?: number, hook_id \| socket_id?: string, data?: string, limit?: number, pattern?: string, id?: string, include_bodies?: boolean, mode?: "sync" \| "async" }` |
+| Output | Per-action payload plus verdict `{ executed: true, world: "isolated", durationMs: 0, path: "isolated.pageNetwork" }`. The unused `network.requests` webRequest case is untouched. |
+
+**Actions:**
+- `ws_list` — List WS sockets hooked by the page hook (hookId, socketId, url, tabId, frame counts)
+- `ws_send` — Inject a frame into a live page socket (`{ hook_id\|socket_id, data }`) — best-effort in-page delivery
+- `ws_tail` — Ring-buffered frames for a hook (`{ hook_id\|socket_id, limit? }`, cap 200/hook)
+- `http_observe` — Register an observe pattern and return matching requests (`{ pattern, include_bodies?, limit? }`; method/url/status only, bodies only with `include_bodies: true` then truncated to 4KB)
+- `http_block` — Register a block pattern (`{ pattern }`); matched `fetch` short-circuits with a synthetic 403 `Response`
+- `http_rules` — List current observe/block rules
+- `http_unblock` — Remove a rule (`{ id }`)
+
+**xterm serial-console case:** `ws_tail` shows terminal bytes flowing over the socket; `ws_send` injects keystrokes into it.
+
+> **Blocked-action honesty:** blocking is wrapper-level only — the page hook's `fetch` wrapper returns a synthetic 403 `Response` (XHR is observe-only and cannot be cleanly short-circuited). This is NOT network-stack blocking; true MV3 stack blocking would need `declarativeNetRequest` rules (explicit non-goal). The page hook runs at `document_start` so it installs before page scripts open sockets; CSP-locked pages may refuse the inline hook script, in which case no hooks are reported.
+
+> **Security**: Gated behind the `page.execute` permission group exactly like `page_js` (NO new tool group). MCP tool name is `page_net`; internally it dispatches as tool `page.net`.
+
 #### 2.9 Tool: `cookies`
 
 | Property | Value |
@@ -1002,7 +1039,7 @@ Internally dispatches as `screenshot`.
 
 #### 2.13 ActionResult Envelope
 
-Every v2 page interaction tool (`page_read`, `page_act`, `page_js`) returns results in a standard ActionResult envelope. This gives agents clear, structured feedback for every operation.
+Every v2 page interaction tool (`page_read`, `page_act`, `page_js`, `page_cdp`) returns results in a standard ActionResult envelope. This gives agents clear, structured feedback for every operation.
 
 #### Envelope Shape
 
@@ -1424,15 +1461,17 @@ These groups control access to browser-level data and operations. They are each 
 
 ##### 5.1.2 Page API Tool Groups
 
-Page tools are organized into three tool families (v2 API), each gated behind its own permission group. All page tools are implemented under the hood via `chrome.scripting.executeScript`, but the permission gate is on the **declared intent** (what the agent asked for), not the implementation mechanism.
+Page tools are organized into five tool families (v2 API). All page tools are implemented under the hood via `chrome.scripting.executeScript` (except `page.cdp`, which goes through `chrome.debugger`), but the permission gate is on the **declared intent** (what the agent asked for), not the implementation mechanism.
 
 | Tool (internal) | MCP Tool | Group | Risk | Description |
 |---|---|---|---|---|
 | `page.read` | `page_read` | `page.read` | Low | Unified read tool — action dispatch for inspect, content, text, html, attr, meta, forms, count, select |
 | `page.act` | `page_act` | `page.act` | Medium | Unified act tool — action dispatch for click, fill, check, select_option, press, scroll, submit, wait_for |
 | `page.js` | `page_js` | `page.execute` | High | Execute arbitrary JavaScript — gated escape hatch (permission group name preserved as `page.execute` for backward compatibility) |
+| `page.cdp` | `page_cdp` | `page.execute` | High | Raw CDP passthrough (any method, e.g. `Input.dispatchKeyEvent`) — power tool, gated like `page_js`, no allowlist |
+| `page.net` | `page_net` | `page.execute` | High | WS hooks (ws_list/ws_send/ws_tail) + HTTP observe/block (http_observe/http_block/http_rules/http_unblock) — wrapper-level blocking only, gated like `page_js`, no new group |
 
-> **Design rationale**: Instead of ~30 individual page tools, v2 collapses them into three tool families (`page.read`, `page.act`, `page.js`) with action dispatch. This reduces MCP surface area while preserving granular behavior. The permission model remains on the tool family level — `page.read` for read-only operations, `page.act` for mutations, `page.execute` for arbitrary code. This allows the user to allow safe reads (`page.read: allow`), permit controlled interaction (`page.act: ask`), while denying arbitrary code execution (`page.execute: deny`). Actions inside each family are not individually gated — the permission is on the tool family, not the action.
+> **Design rationale**: Instead of ~30 individual page tools, v2 collapses them into page tool families (`page.read`, `page.act`, `page.js`, plus raw `page.cdp`) with action dispatch. This reduces MCP surface area while preserving granular behavior. The permission model remains on the tool family level — `page.read` for read-only operations, `page.act` for mutations, `page.execute` for arbitrary code / raw CDP. This allows the user to allow safe reads (`page.read: allow`), permit controlled interaction (`page.act: ask`), while denying arbitrary code execution (`page.execute: deny`). Actions inside each family are not individually gated — the permission is on the tool family, not the action.
 
 > **Backward compatibility**: The legacy MCP aliases `browser_get_content`, `browser_select`, and `browser_screenshot` remain available. `browser_get_content` and `browser_select` now internally dispatch via `page.read({ action: "content" })` and `page.read({ action: "select" })` respectively. `browser_screenshot` maps to `screenshots.capture` (unchanged).
 

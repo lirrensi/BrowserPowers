@@ -16,8 +16,18 @@ import { dispatchActAction } from "./v2/page-act.js";
 import { dispatchJsAction } from "./v2/page-js.js";
 import { diffSnapshots } from "./v2/snapshot-diff.js";
 import { captureWithOverlay } from "./screenshot.js";
-import { captureFullPageScreenshot, captureViewportScreenshot } from "./cdp.js";
+import { captureFullPageScreenshot, captureViewportScreenshot, sendCommand } from "./cdp.js";
 import type { ExecutionVerdict } from "./types.js";
+import {
+  wsList,
+  wsSend,
+  wsTail,
+  httpObserve,
+  httpBlock,
+  httpRules,
+  httpUnblock,
+  ensureHookInstalled,
+} from "./page-network.js";
 
 // ═══════════════════════════════════════════
 // Network request ring buffer (#002)
@@ -413,6 +423,28 @@ async function execute(
       return { data: actResult, executionVerdict: actResult.executionVerdict };
     }
 
+    case "page.cdp": {
+      const tabId = (params.tabId as number) ?? (await getActiveTabId());
+      const method = params.method as string;
+      if (!method || typeof method !== "string") {
+        throw new Error("page.cdp requires a non-empty string 'method' parameter");
+      }
+      const frameId = params.frameId as number | undefined;
+      if (frameId !== undefined && frameId !== 0) {
+        throw new Error("page.cdp does not support frameId — only the top frame (CDP Page target scope)");
+      }
+      const cdpParams = (params.params as Record<string, unknown>) ?? {};
+      const result = await sendCommand(tabId, method, cdpParams);
+      if (!result.ok) {
+        throw new Error(`CDP ${method} failed: ${result.error}`);
+      }
+      try { appendRecordOp("page.cdp", params); } catch { /* record best-effort */ }
+      return {
+        data: { method, result: result.value },
+        executionVerdict: { executed: true, world: "cdp", durationMs: result.durationMs, path: `cdp.${method}` },
+      };
+    }
+
     case "page.js": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
       const frameId = await resolveFrameId(tabId, params);
@@ -737,6 +769,61 @@ async function execute(
       return { data: { requests: sliced } };
     }
 
+    case "page.net": {
+      const tabId = (params.tabId as number) ?? (await getActiveTabId());
+      const action = params.action as string;
+      if (!action || typeof action !== "string") {
+        throw new Error("page.net requires an 'action' parameter (ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock)");
+      }
+      // Authoritative hook install: CSP-exempt MAIN-world injection. Best-effort —
+      // proceeds anyway so observation degrades to empty instead of erroring.
+      const hooked = await ensureHookInstalled(tabId);
+      const verdict = { executed: true, world: "isolated" as const, durationMs: 0, path: "isolated.pageNetwork" };
+      const hookNote = hooked ? undefined : "MAIN-world hook not installed on this tab (CSP/chrome://?) — results may be empty";
+      switch (action) {
+        case "ws_list":
+          return { data: { ...wsList(tabId), ...(hookNote ? { hookNote } : {}) }, executionVerdict: verdict };
+        case "ws_send": {
+          const hookId = (params.hook_id ?? params.socket_id) as string | undefined;
+          const data = params.data as string | undefined;
+          if (!hookId || typeof data !== "string") {
+            throw new Error("page.net ws_send requires { hook_id|socket_id, data: string }");
+          }
+          return { data: await wsSend(tabId, hookId, data), executionVerdict: verdict };
+        }
+        case "ws_tail": {
+          const hookId = (params.hook_id ?? params.socket_id) as string | undefined;
+          const limit = (params.limit as number) ?? 50;
+          if (!hookId) throw new Error("page.net ws_tail requires { hook_id|socket_id, limit? }");
+          return { data: wsTail(hookId, limit), executionVerdict: verdict };
+        }
+        case "http_observe": {
+          const pattern = params.pattern as string | undefined;
+          if (!pattern) throw new Error("page.net http_observe requires { pattern: string }");
+          const limit = (params.limit as number) ?? 100;
+          const includeBodies = params.include_bodies === true;
+          return {
+            data: await httpObserve(pattern, includeBodies, tabId, limit),
+            executionVerdict: verdict,
+          };
+        }
+        case "http_block": {
+          const pattern = params.pattern as string | undefined;
+          if (!pattern) throw new Error("page.net http_block requires { pattern: string }");
+          return { data: await httpBlock(pattern), executionVerdict: verdict };
+        }
+        case "http_rules":
+          return { data: httpRules(), executionVerdict: verdict };
+        case "http_unblock": {
+          const id = params.id as string | undefined;
+          if (!id) throw new Error("page.net http_unblock requires { id: string }");
+          return { data: await httpUnblock(id), executionVerdict: verdict };
+        }
+        default:
+          throw new Error(`unknown page.net action: ${action} (ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock)`);
+      }
+    }
+
     // ══════════════════════════════════════════
     // Storage
     // ══════════════════════════════════════════
@@ -791,6 +878,7 @@ async function execute(
     case "windows.create": {
       const createParams: chrome.windows.CreateData = {};
       if (params.url) createParams.url = params.url as string;
+      if (params.incognito === true) createParams.incognito = true;
       return { data: await chrome.windows.create(createParams) };
     }
 
@@ -918,7 +1006,7 @@ async function execute(
     }
 
     default:
-      throw new Error(`Unknown tool: ${tool}`);
+      throw new Error(`Unknown tool: ${tool}. If help lists it, this extension build is stale — reload the extension.`);
   }
 }
 
@@ -944,7 +1032,7 @@ let recordSeq = 0;
 function redactRecordParams(tool: string, params: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
-    if (["value", "text", "code", "file_data", "password", "token"].includes(k)) out[k] = "[redacted]";
+    if (["value", "text", "code", "file_data", "password", "token", "params"].includes(k)) out[k] = "[redacted]";
     else if (k === "target" && typeof v === "object" && v !== null) {
       const t = v as Record<string, unknown>;
       out[k] = { ...(t.css ? { css: t.css } : {}), ...(t.text ? { text: String(t.text).slice(0, 80) } : {}), ...(t.role ? { role: t.role } : {}) };

@@ -89,7 +89,7 @@ export async function dispatchActAction(
     case "dblclick_at": return dblclickAt(params, tabId, frameId);
     case "hover_at": return hoverAt(params, tabId, frameId);
     default:
-      return notPerformed("act", `Unknown act action: ${action}`);
+      return notPerformed("act", `Unknown act action: ${action}. If help lists it, this extension build is stale — reload the extension.`);
   }
 }
 
@@ -398,7 +398,7 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
     // CDP attach failed — fall through to the CS synthetic event path.
     actParams.key = key;
     actParams.keys = keys;
-    return sendActMessage(tabId, "press", actParams);
+    return markPressFallback(await sendActMessage(tabId, "press", actParams), activeKey, attach.error);
   }
 
   // No target — global press (e.g. page-level Escape). Try CDP first.
@@ -419,7 +419,39 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
     }
   }
   // CDP attach failed (or no target) — fall back to CS synthetic event.
-  return sendActMessage(tabId, "press", { key, keys });
+  return markPressFallback(await sendActMessage(tabId, "press", { key, keys }), activeKey, attach.error);
+}
+
+/**
+ * Tag a content-script press result as the untrusted synthetic-KeyEvent
+ * fallback (CDP Input.dispatchKeyEvent unavailable). On success the message
+ * gains the isTrusted=false caveat, data records the fallback, and the
+ * verdict is forced to isolated/fallbackKeyEvent (preserving durationMs).
+ * Non-success results ride through unchanged so error codes survive.
+ * (activeKey is accepted for call-site symmetry; the key already rides in
+ * the content-script message.)
+ */
+function markPressFallback(
+  result: ActionResult,
+  activeKey: string | undefined,
+  cdpError?: string,
+): ActionResult {
+  void activeKey;
+  const suffix = cdpError
+    ? ` — untrusted synthetic KeyboardEvent fallback (CDP unavailable: ${cdpError}); isTrusted=false, trusted-only widgets (xterm-like) will ignore it.`
+    : ` — untrusted synthetic KeyboardEvent fallback (CDP unavailable); isTrusted=false, trusted-only widgets (xterm-like) will ignore it.`;
+  const verdict = result.executionVerdict;
+  return {
+    ...result,
+    message: `${result.message}${suffix}`,
+    data: { ...(result.data || {}), _fallback: "isolated", _cdpAttachError: cdpError },
+    executionVerdict: {
+      executed: verdict?.executed ?? true,
+      world: "isolated",
+      durationMs: verdict?.durationMs ?? 0,
+      path: "isolated.fallbackKeyEvent",
+    },
+  };
 }
 
 async function sendActFallbackPress(
@@ -430,13 +462,8 @@ async function sendActFallbackPress(
   cdpError: string | undefined,
 ): Promise<ActionResult> {
   const csResult = await sendActMessage(tabId, "press", { ...actParams, key, keys });
-  if (csResult.success) {
-    return {
-      ...csResult,
-      data: { ...(csResult.data || {}), _fallback: "isolated", _cdpAttachError: cdpError },
-    };
-  }
-  return csResult;
+  const fallbackKey = keys && keys.length > 0 ? keys[keys.length - 1] : key;
+  return markPressFallback(csResult, fallbackKey, cdpError);
 }
 
 async function scrollAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {

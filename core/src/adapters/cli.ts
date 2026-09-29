@@ -286,7 +286,7 @@ program
 // ── page read ──
 program
   .command("page")
-  .description("Page operations — read (no mutation) or act (mutation). Sub-commands: `page read <browserId> <action>`, `page act <browserId> <action>`. Run `browserpowers help page-read` or `browserpowers help page-act` for the full action list.")
+  .description("Page operations — read (no mutation), act (mutation), cdp (raw CDP passthrough), or net (WS + HTTP observe/block). Sub-commands: `page read|act|cdp|net <browserId> ...`. Run `browserpowers help page-read` or `browserpowers help page-act` for the full action list.")
   .addCommand(
     new Command("read")
       .description("Read page content without mutating it. Use `browserpowers help page-read` to list all read actions.")
@@ -359,8 +359,68 @@ program
           }
         }
       }),
+  )
+  .addCommand(
+    new Command("cdp")
+      .description("Raw CDP passthrough — send any CDP method (e.g. Input.dispatchKeyEvent). Gated like page.js via page.execute.")
+      .argument("<browserId>", "Target browser ID")
+      .argument("<method>", "CDP method (e.g. Input.dispatchKeyEvent)")
+      .argument("[paramsJSON]", "CDP params as JSON, e.g. '{\"type\":\"keyDown\",\"key\":\"a\"}'")
+      .option("--json", "Output raw JSON")
+      .action(async (browserId: string, method: string, paramsJSON: string | undefined, options: { json?: boolean }) => {
+        let params: Record<string, unknown> = {};
+        if (paramsJSON) {
+          try {
+            const parsed: unknown = JSON.parse(paramsJSON);
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              cliError("paramsJSON must be a JSON object");
+            }
+            params = parsed as Record<string, unknown>;
+          } catch (err) {
+            cliError(`Invalid paramsJSON: ${(err as Error).message}`);
+          }
+        }
+        const res: unknown = await executeViaRest(browserId, "page.cdp", { method, params });
+        if (res === null) return; // async mode
+        if (typeof res !== "object" || res === null || !("success" in res)) {
+          cliError("Page CDP failed: unexpected response shape");
+        }
+        const typed = res as { success: boolean; error?: string; data?: unknown };
+        if (!typed.success) {
+          cliError(typed.error ?? "Page CDP failed");
+        }
+        if (options.json) {
+          console.log(JSON.stringify(typed.data, null, 2));
+        } else {
+          console.log(prettyPrint(typed.data));
+        }
+      }),
+  )
+  .addCommand(
+    new Command("net")
+      .description("Observe and drive page network — WS hooks + HTTP observe/block. Power tool, gated like page.js via page.execute. Actions: ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock.")
+      .argument("<browserId>", "Target browser ID")
+      .argument("<action>", "Net action: ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock")
+      .argument("[params...]", "key=value params or JSON. Examples: hook_id=hook_1, data=hello, pattern=*analytics*, id=http_1, limit=20, include_bodies=true")
+      .option("--json", "Output raw JSON")
+      .action(async (browserId: string, action: string, paramArgs: string[], options: { json?: boolean }) => {
+        const params = parseParamArgs(paramArgs);
+        const res: unknown = await executeViaRest(browserId, "page.net", { action, ...params });
+        if (res === null) return; // async mode
+        if (typeof res !== "object" || res === null || !("success" in res)) {
+          cliError("Page net failed: unexpected response shape");
+        }
+        const typed = res as { success: boolean; error?: string; data?: unknown };
+        if (!typed.success) {
+          cliError(typed.error ?? "Page net failed");
+        }
+        if (options.json) {
+          console.log(JSON.stringify(typed.data, null, 2));
+        } else {
+          console.log(prettyPrint(typed.data));
+        }
+      }),
   );
-
 // ── status (health) ──
 // Health = daemon alive + browser connected + heartbeat fresh.
 // Dedicated automation browser model: user does NOT use this browser day-to-day,

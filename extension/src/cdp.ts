@@ -27,10 +27,10 @@
  *       command serialization queue, runtimeEvaluate wrapper, Input.*
  *       wrappers, focusElement / setElementValue helpers, public state
  *       surface for page.read action=runtime_status.
- * EXPORTS: ensureAttached, detach, getState, runtimeEvaluate, getConsoleBuffer,
+ * EXPORTS: ensureAttached, detach, getState, runtimeEvaluate, sendCommand, getConsoleBuffer,
  *          dispatchMouseEvent, insertText, dispatchKeyEvent, focusElement, setElementValue,
  *          init (called once at SW startup to register listeners), CdpState,
- *          AttachResult, EvalResult, ConsoleEntry, DispatchMouseEventResult,
+ *          AttachResult, EvalResult, SendCommandResult, ConsoleEntry, DispatchMouseEventResult,
  *          InsertTextResult, DispatchKeyEventResult, FocusElementResult,
  *          SetElementValueResult.
  * DOCS:   .agents/reports/plan_cdp-max-authority_2026-06-22.md,
@@ -38,6 +38,7 @@
  */
 
 import { isExtensionContext } from "./safety.js";
+import { forgetHook } from "./page-network.js";
 
 // ── Public types ─────────────────────────────────────────────────────────
 
@@ -196,6 +197,9 @@ export function init(): void {
           console.warn(`[bp-cdp] Auto-detach on navigation failed: ${(err as Error).message}`);
         });
       }
+      // page.net MAIN-world hook dies with the document — forget so the next
+      // page.net call re-injects via scripting.executeScript.
+      try { forgetHook(tabId); } catch { /* bookkeeping only */ }
     });
   }
 
@@ -780,6 +784,66 @@ export async function setElementValue(
     value: evalValue?.value,
     durationMs,
   };
+}
+
+export interface SendCommandResult {
+  ok: boolean;
+  value?: unknown;
+  error?: string;
+  durationMs: number;
+}
+
+/**
+ * Raw CDP passthrough — send any CDP method with arbitrary params on a tab.
+ * Lazy-attaches on first call, queues per-tab. Never throws — returns
+ * `{ ok: false, error }` on attach or protocol failure. The result value is
+ * JSON-roundtripped for wire safety (falls back to a string descriptor when
+ * the value is not JSON-serializable).
+ */
+export async function sendCommand(
+  tabId: number,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<SendCommandResult> {
+  if (!method) {
+    return { ok: false, error: "No CDP method provided", durationMs: 0 };
+  }
+  const tail = cmdQueues.get(tabId) ?? Promise.resolve();
+  const next = tail
+    .catch(() => undefined)
+    .then(async () => {
+      const attach = await ensureAttached(tabId, "page.cdp");
+      if (!attach.attached) {
+        return {
+          ok: false,
+          error: attach.error ?? "CDP attach failed",
+          durationMs: 0,
+        } satisfies SendCommandResult;
+      }
+      const start = performance.now();
+      try {
+        const raw = await chrome.debugger.sendCommand(
+          { tabId },
+          method,
+          params as Record<string, unknown>,
+        );
+        let value: unknown = raw;
+        try {
+          value = raw === undefined ? undefined : JSON.parse(JSON.stringify(raw));
+        } catch {
+          value = String(raw);
+        }
+        return { ok: true, value, durationMs: performance.now() - start } satisfies SendCommandResult;
+      } catch (err) {
+        return {
+          ok: false,
+          error: (err as Error)?.message ?? String(err),
+          durationMs: performance.now() - start,
+        } satisfies SendCommandResult;
+      }
+    });
+  cmdQueues.set(tabId, next.catch(() => undefined));
+  return next;
 }
 
 /**

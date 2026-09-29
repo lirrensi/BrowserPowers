@@ -19,6 +19,9 @@ export interface ConnectionStatus {
   connected: boolean;
   reconnectAttempts: number;
   authRequired: boolean;
+  extVersion: string;
+  coreVersion: string | null;
+  registered: boolean;
 }
 
 let ws: WebSocket | null = null;
@@ -35,7 +38,9 @@ let connectPromiseGeneration = -1;
 let connectionGeneration = 0;
 let reconnectEnabled = true;
 let authRequired = false;
-
+let coreVersion: string | null = null;
+/** True once the core has answered `register` with `registered`. */
+let registered = false;
 export function onMessage(handler: MessageHandler): void {
   messageHandler = handler;
 }
@@ -110,6 +115,9 @@ export async function connect(): Promise<void> {
         } catch {
           return;
         }
+        if (msg && msg.type === "registered") {
+          handleRegisteredReply(msg.payload);
+        }
         if (messageHandler) {
           void messageHandler(msg);
         }
@@ -122,6 +130,7 @@ export async function connect(): Promise<void> {
 
         stopHeartbeat();
         ws = null;
+        registered = false;
 
         if (!reconnectEnabled || generation !== connectionGeneration) {
           connectionState = "disconnected";
@@ -170,6 +179,7 @@ export function disconnect(): void {
     }
   }
   connectionState = "disconnected";
+  registered = false;
 }
 
 export async function reconnect(): Promise<void> {
@@ -192,11 +202,18 @@ export function isConnected(): boolean {
 }
 
 export function getConnectionStatus(): ConnectionStatus {
+  let extVersion = "unknown";
+  try {
+    extVersion = chrome.runtime.getManifest().version;
+  } catch { /* non-extension context (tests) — keep fallback */ }
   return {
     state: connectionState,
     connected: connectionState === "connected",
     reconnectAttempts,
     authRequired,
+    extVersion,
+    coreVersion,
+    registered,
   };
 }
 
@@ -204,7 +221,26 @@ export function setAuthRequired(required: boolean): void {
   authRequired = required;
 }
 
+/** Core version reported by the last `registered` reply. Null until first registration. */
+export function getCoreVersion(): string | null {
+  return coreVersion;
+}
+
 // ── internal ──
+
+function handleRegisteredReply(payload: unknown): void {
+  if (!payload || typeof payload !== "object" || !("coreVersion" in payload)) return;
+  const reported = payload.coreVersion;
+  if (typeof reported !== "string") return;
+  coreVersion = reported;
+  registered = true;
+  try {
+    ownVersion = chrome.runtime.getManifest().version;
+  } catch { /* keep fallback */ }
+  if (ownVersion !== "unknown" && reported !== ownVersion) {
+    console.warn(`[bp-ext] Version skew: extension v${ownVersion} vs core v${reported} — reload the extension if tools fail with "Unknown tool"`);
+  }
+}
 
 async function onConnected(): Promise<void> {
   const settings = await getSettings();
@@ -228,11 +264,16 @@ async function onConnected(): Promise<void> {
     console.log("[bp-ext] No saved browserId — first connection");
   }
 
+  let extVersion = "unknown";
+  try {
+    extVersion = chrome.runtime.getManifest().version;
+  } catch { /* non-extension context — keep fallback */ }
   const registerPayload: Record<string, unknown> = {
     name: settings.browserName,
     capabilities,
     permissions,
     browserId: savedId,
+    extVersion,
   };
   if (settings.authKey) {
     registerPayload.authKey = settings.authKey;
@@ -300,6 +341,7 @@ function getAvailableCapabilities(settings: { permissions: Record<string, string
     { tool: "page.read", description: "Read page content — inspect, text, html, attr, meta, forms, count, select", group: "page.read" },
     { tool: "page.act", description: "Interact with the page — click, fill, check, select, press, scroll, submit, wait", group: "page.act" },
     { tool: "page.js", description: "Execute arbitrary JavaScript on the page (escape hatch)", group: "page.execute" },
+    { tool: "page.cdp", description: "Raw CDP passthrough (any method, e.g. Input.dispatchKeyEvent) — power tool, gated like page_js", group: "page.execute" },
 
     // Screenshots
     { tool: "screenshots.capture", description: "Take a screenshot", group: "screenshots" },
@@ -319,6 +361,7 @@ function getAvailableCapabilities(settings: { permissions: Record<string, string
 
     // Network
     { tool: "network.requests", description: "Get network requests", group: "network" },
+    { tool: "page.net", description: "Observe/block page network — WS hooks (ws_list/ws_send/ws_tail) + HTTP observe/block rules. Power tool, gated like page_js", group: "page.execute" },
 
     // Storage
     { tool: "storage.get", description: "Read local storage", group: "storage" },

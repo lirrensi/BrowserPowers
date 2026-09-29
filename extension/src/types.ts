@@ -13,6 +13,8 @@ export interface ExtensionSettings {
   coreUrl: string;
   authKey: string;  // API key for core authentication (empty = none)
   approvalNotificationsEnabled: boolean;
+  /** YOLO mode: single switch that allows everything, everywhere. Dedicated automation browser only. */
+  yoloMode: boolean;
   permissions: Record<string, PermissionLevel>;
   pageSitePermissions: Record<PagePermissionGroup, SitePermissionLists>;
 }

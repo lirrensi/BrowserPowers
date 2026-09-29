@@ -35,6 +35,9 @@ interface ConnectionStatus {
   connected: boolean;
   reconnectAttempts: number;
   authRequired?: boolean;
+  extVersion?: string;
+  coreVersion?: string | null;
+  registered?: boolean;
 }
 
 interface ApprovalItem {
@@ -108,8 +111,7 @@ async function init(mode: SurfaceMode): Promise<void> {
   authKeyInput.value = settings.authKey ?? "";
   authKeyInput.addEventListener("change", () => { void saveAuthKey(authKeyInput); });
   approvalNotificationsInput.checked = settings.approvalNotificationsEnabled;
-
-  wireLocaleSelect({ statusEl, capsList, approvalsListEl, approvalBadge });
+  wireYoloToggle(capsList);
 
   renderCapabilities(capsList, effectivePermissions);
   const pageCapsContainer = byId("page-capabilities-list");
@@ -190,6 +192,7 @@ function wireLocaleSelect(args: {
 
 function renderCapabilities(container: HTMLElement, permissions: Record<string, string>): void {
   container.innerHTML = "";
+  const yolo = permissions.__yolo === "allow" || document.body.classList.contains("yolo-on");
 
   for (const group of CAP_GROUPS) {
     const current = permissions[group.id] ?? "ask";
@@ -227,6 +230,7 @@ function renderCapabilities(container: HTMLElement, permissions: Record<string, 
     });
 
     select.className = `perm-${current}`;
+    if (yolo) select.disabled = true;
     row.appendChild(info);
     row.appendChild(select);
     container.appendChild(row);
@@ -237,6 +241,7 @@ function renderCapabilities(container: HTMLElement, permissions: Record<string, 
 
 function renderPageCapabilities(container: HTMLElement): void {
   container.innerHTML = "";
+  const yolo = document.body.classList.contains("yolo-on");
 
   for (const group of PAGE_CAP_GROUPS) {
     const section = document.createElement("div");
@@ -263,6 +268,7 @@ function renderPageCapabilities(container: HTMLElement): void {
       textarea.dataset.list = listName;
       textarea.rows = 2;
       textarea.placeholder = listName === "allow" ? t("sites.allowPh") : "";
+      if (yolo) textarea.disabled = true;
 
       // Debounced save
       let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -326,12 +332,36 @@ async function loadPageCapabilities(container: HTMLElement): Promise<void> {
 }
 
 async function updateStatus(statusEl: HTMLElement): Promise<void> {
+  const versionEl = document.getElementById("version-info") as HTMLElement | null;
   try {
     const status = await chrome.runtime.sendMessage({ type: "getConnectionStatus" }) as ConnectionStatus | undefined;
+
+    if (versionEl) {
+      const ext = status?.extVersion ?? "…";
+      const core = status?.coreVersion ?? "…";
+      const mismatch = status?.registered === true
+        && status?.extVersion !== undefined
+        && status?.coreVersion !== null
+        && status.extVersion !== status.coreVersion;
+      versionEl.textContent = `ext v${ext} · core v${core}`;
+      versionEl.classList.toggle("version-skew", mismatch);
+      versionEl.title = mismatch
+        ? `Version skew: extension v${ext} vs core v${core} — reload the extension (chrome://extensions → reload) so new tools appear`
+        : `Extension v${ext}, core v${core} — reload the extension after reinstall if tools fail with "Unknown tool"`;
+    }
 
     if (status?.authRequired) {
       statusEl.textContent = t("status.authRequired");
       statusEl.className = "status disconnected";
+      applyStaticI18n(document);
+      return;
+    }
+
+    // Registered (handshake done) wins over socket state: a connected socket
+    // without a `registered` reply is still "connecting" from the user's view.
+    if (status?.connected && status?.registered !== true) {
+      statusEl.textContent = t("status.registering");
+      statusEl.className = "status connecting";
       applyStaticI18n(document);
       return;
     }
@@ -381,6 +411,30 @@ async function saveApprovalNotifications(approvalNotificationsInput: HTMLInputEl
   await saveSettings({ approvalNotificationsEnabled: approvalNotificationsInput.checked });
 }
 
+/** YOLO switch: one flag, no permission writes. Re-render caps read-only state on toggle. */
+function wireYoloToggle(capsList: HTMLElement): void {
+  const toggle = document.getElementById("yolo-mode") as HTMLInputElement | null;
+  if (!toggle) return;
+  void (async () => {
+    const settings = await getSettings();
+    toggle.checked = settings.yoloMode === true;
+    document.body.classList.toggle("yolo-on", toggle.checked);
+  })();
+  toggle.addEventListener("change", () => {
+    void (async () => {
+      await saveSettings({ yoloMode: toggle.checked });
+      document.body.classList.toggle("yolo-on", toggle.checked);
+      // Re-register so the core sees the mode change on next execute; reconnect is cheap.
+      try {
+        await chrome.runtime.sendMessage({ type: "reconnectToCore" });
+      } catch { /* popup may close mid-send */ }
+      renderCapabilities(capsList, await getEffectivePermissions());
+      const pageCapsContainer = byId("page-capabilities-list");
+      renderPageCapabilities(pageCapsContainer);
+      await loadPageCapabilities(pageCapsContainer);
+    })();
+  });
+}
 async function reconnect(statusEl: HTMLElement): Promise<void> {
   statusEl.textContent = t("status.connecting");
   statusEl.className = "status connecting";

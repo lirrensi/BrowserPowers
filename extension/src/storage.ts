@@ -57,6 +57,7 @@ function createDefaultSettings(): ExtensionSettings {
     coreUrl: "ws://127.0.0.1:4199/ws",
     authKey: "",
     approvalNotificationsEnabled: true,
+    yoloMode: false,
     permissions: {
       tabs: "allow",
       "page.read": "allow",
@@ -80,7 +81,6 @@ function createDefaultSettings(): ExtensionSettings {
     pageSitePermissions: createDefaultPageSitePermissions(),
   };
 }
-
 async function readStoredSettings(): Promise<ExtensionSettings | undefined> {
   if (!isExtensionContext()) return undefined;
   const result = await chrome.storage.local.get("settings");
@@ -95,7 +95,11 @@ async function readSessionPermissionOverrides(): Promise<Record<string, string>>
 
 export async function getSettings(): Promise<ExtensionSettings> {
   const stored = await readStoredSettings();
-  if (stored) return stored;
+  if (stored) {
+    // Backfill for pre-YOLO profiles: absent flag means off, never on.
+    if (stored.yoloMode === undefined) stored.yoloMode = false;
+    return stored;
+  }
 
   const defaults = createDefaultSettings();
   if (isExtensionContext()) {
@@ -127,6 +131,7 @@ export async function resetSettings(): Promise<void> {
 
 export async function getEffectivePermissions(): Promise<Record<string, string>> {
   const settings = await getSettings();
+  if (settings.yoloMode === true) return { ...settings.permissions, __yolo: "allow" };
   const overrides = await readSessionPermissionOverrides();
   return { ...settings.permissions, ...overrides };
 }

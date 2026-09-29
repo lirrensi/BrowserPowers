@@ -1,6 +1,6 @@
 // FILE: core/src/adapters/mcp.ts
 // PURPOSE: Expose BrowserPowers commands as MCP tools over a stateless per-request HTTP endpoint.
-// OWNS: MCP tool registrations (11 tools), tool result formatting, help meta-tool, endpoint mounting.
+// OWNS: MCP tool registrations (15 tools), tool result formatting, help meta-tool, endpoint mounting.
 // EXPORTS: mountMcpServer(app: Hono): void
 // DOCS: docs/architecture/core.md (MCP section), docs/spec/spec.md
 // NOTES: Built on @modelcontextprotocol/server v2 — createMcpHandler(buildMcpServer) constructs a
@@ -12,7 +12,7 @@ import { commandService } from "../command-service/service.js";
 import { VERSION } from "../version.js";
 import { loadConfig } from "../config.js";
 import { saveScreenshotToTemp } from "../screenshot.js";
-import { buildHelpIndex, buildTopicHelp, buildToolHelp } from "./help-text.js";
+import { buildActionHelp, buildHelpIndex, buildTopicHelp, buildToolHelp } from "./help-text.js";
 
 const config = loadConfig();
 
@@ -165,6 +165,17 @@ const pageJsSchema = z.object({
   message: "Either browser_id or browser_name is required",
 });
 
+const pageCdpSchema = z.object({
+  browser_id: z.string().optional(),
+  browser_name: z.string().optional(),
+  method: z.string().describe("CDP method, e.g. Input.dispatchKeyEvent"),
+  params: z.record(z.string(), z.unknown()).optional().describe("CDP method params as key-value pairs"),
+  timeout_ms: z.number().optional(),
+  mode: z.enum(["sync", "async"]).optional(),
+}).refine(data => data.browser_id || data.browser_name, {
+  message: "Either browser_id or browser_name is required",
+});
+
 const tabsSchema = z.object({
   action: z.enum(["list", "navigate", "goBack", "goForward", "close"]),
   browser_id: z.string().optional(),
@@ -199,6 +210,24 @@ const windowsSchema = z.object({
   browser_name: z.string().optional(),
   url: z.string().optional(),
   window_id: z.number().optional(),
+  incognito: z.boolean().optional().describe("For create: open an incognito window (default false)"),
+  mode: z.enum(["sync", "async"]).optional(),
+}).refine(data => data.browser_id || data.browser_name, {
+  message: "Either browser_id or browser_name is required",
+});
+
+const pageNetSchema = z.object({
+  action: z.enum(["ws_list", "ws_send", "ws_tail", "http_observe", "http_block", "http_rules", "http_unblock"]),
+  browser_id: z.string().optional(),
+  browser_name: z.string().optional(),
+  tabId: z.number().optional().describe("Target tab (default: active tab)"),
+  hook_id: z.string().optional().describe("WS hook id from ws_list (ws_send, ws_tail)"),
+  socket_id: z.string().optional().describe("Alias for hook_id (ws_send, ws_tail)"),
+  data: z.string().optional().describe("Frame payload to inject (ws_send)"),
+  limit: z.number().optional().describe("Max frames/entries to return (ws_tail, http_observe)"),
+  pattern: z.string().optional().describe("URL pattern, substring or * wildcard (http_observe, http_block)"),
+  id: z.string().optional().describe("Rule id from http_rules (http_unblock)"),
+  include_bodies: z.boolean().optional().describe("Include truncated (4KB) response bodies in http_observe (default: metadata only)"),
   mode: z.enum(["sync", "async"]).optional(),
 }).refine(data => data.browser_id || data.browser_name, {
   message: "Either browser_id or browser_name is required",
@@ -749,6 +778,30 @@ function generateToolHelpLegacy(toolName: string): string {
       "Returns window list for list, success confirmation for create/focus/close.",
     ].join("\n"),
 
+    page_net: [
+      "## page_net",
+      "",
+      "Observe and drive page network via an in-page WS/HTTP wrapper hook. Gated like page_js via page.execute.",
+      "",
+      "### Parameters",
+      "- `action` (enum, required) — ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock",
+      "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
+      "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
+      "- `tabId` (number, optional) — Target tab (default: active tab)",
+      "- `hook_id`/`socket_id` (string, required for ws_send, ws_tail) — WS hook id from ws_list",
+      "- `data` (string, required for ws_send) — Frame payload to inject into the page socket",
+      "- `limit` (number, optional) — Max frames/entries (ws_tail default 50, http_observe default 100)",
+      "- `pattern` (string, required for http_observe, http_block) — URL pattern, substring or * wildcard",
+      "- `id` (string, required for http_unblock) — Rule id from http_rules",
+      "- `include_bodies` (boolean, optional) — Include truncated (4KB) response bodies in http_observe; default metadata only",
+      "",
+      "### Output",
+      "ws_list: hooked sockets with frame counts. ws_tail: ring-buffered frames (cap 200/hook). http_observe: matching requests (method/url/status, no bodies by default). http_block: wrapper-level fetch short-circuit with synthetic 403 — NOT network-stack blocking.",
+      "",
+      "### xterm serial-console case",
+      "ws_tail shows terminal bytes flowing over the socket; ws_send injects keystrokes into it.",
+    ].join("\n"),
+
     request_help: [
       "## request_help",
       "",
@@ -1090,6 +1143,32 @@ function buildMcpServer(): McpServer {
     },
   );
 
+  // page_cdp — raw CDP passthrough, gated like page_js via page.execute
+  mcpServer.registerTool(
+    "page_cdp",
+    {
+      description: "Raw CDP passthrough (any method, e.g. Input.dispatchKeyEvent) — power tool, gated like page_js.",
+      inputSchema: helpStub,
+    },
+    async (args: Record<string, unknown>) => {
+      if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_cdp") }] };
+      const parsed = pageCdpSchema.parse(args);
+      const browser_id = await resolveBrowserId(parsed);
+      const { method, params, timeout_ms, mode } = parsed;
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, "page.cdp", { method, params, timeout_ms });
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
+      const result = await commandService.execute(browser_id, "page.cdp", { method, params, timeout_ms });
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: formatResult(result.data) }] };
+    },
+  );
+
   // ── Cookies tool (consolidated from cookies_get/set/remove/list) (#006) ──
 
   mcpServer.registerTool(
@@ -1151,7 +1230,7 @@ function buildMcpServer(): McpServer {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("windows") }] };
       const parsed = windowsSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { action, url, window_id, mode } = parsed;
+      const { action, url, window_id, incognito, mode } = parsed;
 
       // Enhanced list: chrome.windows.getAll({ populate: true }) already includes tabs
       if (action === "list") {
@@ -1177,7 +1256,7 @@ function buildMcpServer(): McpServer {
       switch (action) {
         case "create":
           command = "windows.create";
-          params = { url };
+          params = { url, incognito };
           break;
         case "focus":
           command = "windows.focus";
@@ -1195,6 +1274,45 @@ function buildMcpServer(): McpServer {
       }
 
       const result = await commandService.execute(browser_id, command, params);
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: formatResult(result.data) }] };
+    },
+  );
+
+  // ── page_net (WS + HTTP observe/block, gated like page_js via page.execute) ──
+
+  mcpServer.registerTool(
+    "page_net",
+    {
+      description: "Observe and drive page network: WS hooks (ws_list, ws_send, ws_tail) + HTTP observe/block (http_observe, http_block, http_rules, http_unblock). Power tool, gated like page_js.",
+      inputSchema: helpStub,
+    },
+    async (args: Record<string, unknown>) => {
+      if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_net") }] };
+      const parsed = pageNetSchema.parse(args);
+      const browser_id = await resolveBrowserId(parsed);
+      const { action, tabId, hook_id, socket_id, data, limit, pattern, id, include_bodies, mode } = parsed;
+
+      const params: Record<string, unknown> = { action };
+      if (tabId !== undefined) params.tabId = tabId;
+      const hookId = hook_id ?? socket_id;
+      if (hookId !== undefined && (action === "ws_send" || action === "ws_tail")) {
+        params.hook_id = hookId;
+      }
+      if (data !== undefined) params.data = data;
+      if (limit !== undefined) params.limit = limit;
+      if (pattern !== undefined) params.pattern = pattern;
+      if (id !== undefined) params.id = id;
+      if (include_bodies !== undefined) params.include_bodies = include_bodies;
+
+      if (mode === "async") {
+        const { requestId } = await commandService.executeAsync(browser_id, "page.net", params);
+        return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
+      }
+
+      const result = await commandService.execute(browser_id, "page.net", params);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
@@ -1256,15 +1374,20 @@ function buildMcpServer(): McpServer {
   mcpServer.registerTool(
     "help",
     {
-      description: "Get the full system reference — capability summary, workflow guides, tool relationships, visual layer / overlay docs, and how everything fits together. Pass `topic` to focus on a section (default: 'all').",
+      description: "Get the full system reference — capability summary, workflow guides, tool relationships, visual layer / overlay docs, and how everything fits together. Pass `topic` to focus on a section (default: 'all'). Pass `action` with topic='page-act'/'page-read' for a per-action deep-dive (same output as CLI help page.act <action>).",
       inputSchema: z.object({
         topic: z
           .enum(["all", "navigation", "anchors", "gates", "page-read", "page-act", "page-js", "visual", "permissions"])
           .optional()
           .describe("Optional topic to focus on (default: 'all')."),
+        action: z.string().optional().describe("Per-action deep-dive, e.g. action='click_at' with topic='page-act'. Same output as CLI help page.act click_at."),
       }),
     },
-    async ({ topic }: { topic?: "all" | "navigation" | "anchors" | "gates" | "page-read" | "page-act" | "page-js" | "visual" | "permissions" }) => {
+    async ({ topic, action }: { topic?: "all" | "navigation" | "anchors" | "gates" | "page-read" | "page-act" | "page-js" | "visual" | "permissions"; action?: string }) => {
+      if (action !== undefined) {
+        const text = buildActionHelp(topic ?? "all", action);
+        return { content: [{ type: "text" as const, text }] };
+      }
       const text = buildHelpTopic(topic ?? "all");
       return { content: [{ type: "text" as const, text }] };
     },

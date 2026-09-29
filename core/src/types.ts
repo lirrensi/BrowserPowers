@@ -38,6 +38,8 @@ export interface Browser {
   commandMode: CommandMode;
   connectedAt: number;
   lastHeartbeat: number;
+  /** Extension build version reported at register time (manifest version). Absent for old builds. */
+  extVersion?: string;
 }
 
 /** A single capability the browser exposes */
@@ -60,7 +62,7 @@ export type ExtToCore =
 
 /** Core → Extension messages */
 export type CoreToExt =
-  | { type: "registered"; payload: { browserId: string } }
+  | { type: "registered"; payload: { browserId: string; coreVersion: string } }
   | { type: "execute"; payload: { requestId: string; tool: string; params: Record<string, unknown>; commandMode: CommandMode } }
   | { type: "heartbeat_ack" }
   | { type: "config_updated"; payload: PermissionProfile }
@@ -77,6 +79,8 @@ export interface RegisterPayload {
   authKey?: string;
   /** Execution mode for this browser ("sync" | "async"). Defaults to server config if omitted. */
   commandMode?: CommandMode;
+  /** Extension build version (manifest version). Sent by new builds; absent from old builds. */
+  extVersion?: string;
 }
 
 

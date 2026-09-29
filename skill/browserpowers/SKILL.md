@@ -9,7 +9,7 @@ description: |
 
 # browserpowers
 
-Use MCP tools (`browsers`, `tabs`, `screenshot`, `page_read`, `page_act`, `page_js`,
+Use MCP tools (`browsers`, `tabs`, `screenshot`, `page_read`, `page_act`, `page_js`, `page_cdp`,
 `cookies`, `windows`, `execute_all`, `execute_batch`, `help`) to work in the user's
 **real, persistent browsers** — with their logins, cookies, extensions. This skill does
 not install the extension. Never extract credentials, cookies, tokens, or other secrets.
@@ -38,6 +38,8 @@ the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpow
 | `page_read({ action })` | `browserpowers page read <browser> <action> [key=value ...] [--json]` | `bp.pageRead(browser, action, params)` |
 | `page_act({ action })` | `browserpowers page act <browser> <action> [key=value ...] [--json]` | `bp.pageAct(browser, action, params)` |
 | `page_js({ code })` | `browserpowers exec <browser> page.js '{"code":"..."}'` | `bp.pageJs(browser, code)` |
+| `page_cdp({ method, params })` | `browserpowers page cdp <browser> <method> [paramsJSON]` | `bp.execute(browser, "page.cdp", { method, params })` |
+| `page_net({ action })` | `browserpowers page net <browser> <action> [key=value ...] [--json]` | `bp.execute(browser, "page.net", { action, ... })` |
 | `cookies` / `windows` | `browserpowers exec <browser> cookies.list '{"url":"https://example.com"}'` (any tool works via `exec`) | `bp.execute(browser, tool, params)` (any tool) |
 | `execute_all` | `browserpowers exec-all <tool> [json-params]` | `bp.executeAll(tool, params)` |
 | `execute_batch` | REST `POST /api/execute-batch` (no CLI shorthand — use `exec` in a loop) | `bp.executeBatch([{ browser, tool, params }])` |
@@ -184,8 +186,10 @@ page_act({ action: "dialog_respond", response: { confirm: true } })
 
 - Upload discloses file to site. `file_data` must be base64, ≤20MB lite. `file_data` must be base64.
 - `page_js({ code: "..." })` is last resort, gated (`page.execute` default deny). Must return JSON-serializable. Never evaluate secrets.
+- `page_cdp({ method, params })` — raw CDP passthrough, gated like `page_js` via `page.execute`. No allowlist; caller owns consequences. Trusted keydown into xterm/canvas that ignores synthetic events: `page_cdp({ method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } })` then the matching `keyUp`.
 - `cookies({ action: "list", url: "https://example.com" })`, `windows({ action: "list" })` for state.
 - `console` / `runtime_status` for diagnostics; `network` via `network.requests` tool (200/tab ring).
+- `page_net` — WS + HTTP observe/block via in-page wrapper hook, gated like `page_js` via `page.execute` (no new group). xterm serial-console case: `page_net({ action: "ws_tail", hook_id })` shows terminal bytes, `page_net({ action: "ws_send", hook_id, data })` injects keystrokes. `http_observe({ pattern })` / `http_block({ pattern })` take substring or `*` patterns (`*analytics*`); observe returns method/url/status only (bodies only with `include_bodies: true`, truncated 4KB); block short-circuits matched `fetch` with synthetic 403 — wrapper-level, NOT network-stack blocking (no `declarativeNetRequest`).
 - Record lite: `record({ action: "start", purpose: "checkout flow" })` → act → `record({ action: "stop" })` → trace.json (ops + last 10 states). Never banking/SSO/password-manager.
 - Audit (redacted): `browserpowers audit list|show|rm` or `GET /api/audit`. Origin-only URLs, values redacted, 30d retention.
 - Health: `browserpowers status --json`, `browserpowers doctor`, `GET /api/health`. See `docs/sandboxed-agents.md` for `BROWSERPOWERS_HOME` + WSL split.
@@ -194,6 +198,12 @@ page_act({ action: "dialog_respond", response: { confirm: true } })
 ## Approvals and human steps
 
 Default gates: `tabs/page.read/screenshots/human` allow, `page.act/cookies/windows` ask, `page.execute` deny. Site rules can override.
+
+YOLO mode (dedicated automation browser only): the extension popup has a single
+"Automation Mode" switch at the bottom of Settings. While on, every approval
+auto-approves instantly and nothing is persisted — flipping it off restores the
+exact prior posture. Prefer it over Approve Forever for throwaway automation;
+never enable it on a browser holding real sessions.
 
 When `ask` hits:
 1. Core queues approval, extension badges + popup shows Approve Once / Session / Forever / Reject.
@@ -211,7 +221,6 @@ browserpowers request-help <browser> --prompt "Please complete sign-in" --url-co
 Outcomes: `continued` (human clicked Continue) / `completed` (url criteria met) → re-inspect (refs stale). `cancelled`/`timed_out` → respect, don't repeat. Navigation alone ≠ completion.
 
 ## Errors and recovery
-
 | Result | Next |
 | --- | --- |
 | Stale anchor (`ANCHOR_STALE`) | Re-inspect, retry once with fresh anchor |

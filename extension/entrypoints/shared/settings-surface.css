@@ -53,6 +53,31 @@ header h1 {
   color: var(--accent);
 }
 
+.title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.version-info {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.version-info.version-skew {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.yolo-card {
+  border-color: var(--danger);
+}
+
+body.yolo-on .yolo-card {
+  background: #991b1b20;
+}
+
 .status {
   font-size: 11px;
   padding: 3px 8px;

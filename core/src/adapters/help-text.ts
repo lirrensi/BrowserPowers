@@ -15,14 +15,16 @@
  *                                          command (e.g. `help page.act`)
  *            - buildTopicHelp(topic)    — section deep-dive (e.g.
  *                                          `help page-read`)
+ *            - buildActionHelp(topic, action) — per-action deep-dive (e.g.
+ *                                          `help page.act click_at`)
  *            - buildToolHelp(name)      — MCP tool reference (matches the
  *                                          shape of `{ help: true }`)
  *            - getCommandNames()        — list of commander command names
  *            - getTopics()              — list of valid topic names
  *
  * OWNS: Help text registry, topic catalog, command catalog.
- * EXPORTS: buildHelpIndex, buildCommandHelp, buildTopicHelp, buildToolHelp,
- *          getCommandNames, getTopics.
+ * EXPORTS: buildHelpIndex, buildCommandHelp, buildTopicHelp, buildActionHelp,
+ *          buildToolHelp, getCommandNames, getTopics.
  * DOCS: .agents/reports/plan_visual-help-csp-tighten_2026-06-23.md §2.4
  */
 
@@ -112,6 +114,14 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
 - timeout_ms (number, optional): Max wait (default 120000)`,
   },
   {
+    name: "page_cdp",
+    group: "page-interaction",
+    description: "Raw CDP passthrough (any method, e.g. Input.dispatchKeyEvent) — power tool, gated like page_js via page.execute.",
+    params: `- method (string, required): CDP method, e.g. Input.dispatchKeyEvent
+- params (record, optional): CDP method params as key-value pairs
+- timeout_ms (number, optional): Max wait (default 120000)`,
+  },
+  {
     name: "cookies",
     group: "browser-state",
     description: "Manage browser cookies (get, set, remove, list).",
@@ -122,6 +132,17 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     group: "browser-state",
     description: "Manage browser windows (list, create, focus, close).",
     actions: ["list", "create", "focus", "close"],
+    params: `- browser_id or browser_name (one required)
+- action (string, required): list | create | focus | close
+- url (string, optional): Initial URL for create
+- window_id (number, optional): Required for focus, close
+- incognito (boolean, optional): For create — open an incognito window`,
+  },
+  {
+    name: "page_net",
+    group: "page-interaction",
+    description: "Observe and drive page network via in-page WS/HTTP wrapper hook — power tool, gated like page_js via page.execute.",
+    actions: ["ws_list", "ws_send", "ws_tail", "http_observe", "http_block", "http_rules", "http_unblock"],
   },
   {
     name: "request_help",
@@ -340,6 +361,43 @@ export function buildTopicHelp(topic: string): string {
   return renderTopic(topic as HelpTopic);
 }
 
+// ── Public: deep-dive on a single page action ──────────────────────────
+
+/**
+ * Build the help text for a single page action (e.g. `page.act click_at`).
+ * Normalizes topic aliases: "page-act"/"page_act" → act, "page-read"/"page_read" → read.
+ * With topic "all", tries the act list first, then the read list.
+ * Unknown action → "Unknown action" + available list; unknown topic → "No topic found".
+ */
+export function buildActionHelp(topic: string, action: string): string {
+  const normalized = topic === "page-act" || topic === "page_act" || topic === "page.act" || topic === "act" ? "act"
+    : topic === "page-read" || topic === "page_read" || topic === "page.read" || topic === "read" ? "read"
+    : topic === "all" ? "all"
+    : null;
+  if (normalized === null) {
+    return `No topic found for "${topic}".`;
+  }
+  const candidates: Array<"act" | "read"> = normalized === "all" ? ["act", "read"] : [normalized];
+  for (const tool of candidates) {
+    const list = tool === "act" ? PAGE_ACT_ACTIONS : PAGE_READ_ACTIONS;
+    if ((list as readonly string[]).includes(action)) {
+      const toolName = tool === "act" ? "page.act" : "page.read";
+      const lines: string[] = [];
+      lines.push(`# ${toolName} ${action}`);
+      lines.push("");
+      lines.push(actionOneLiner(toolName, action));
+      lines.push("");
+      lines.push(actionDeepDive(tool, action));
+      return lines.join("\n");
+    }
+  }
+  const scope = normalized === "all"
+    ? [...PAGE_ACT_ACTIONS, ...PAGE_READ_ACTIONS]
+    : normalized === "act" ? [...PAGE_ACT_ACTIONS] : [...PAGE_READ_ACTIONS];
+  const toolLabel = normalized === "all" ? "page.act" : normalized === "act" ? "page.act" : "page.read";
+  return `Unknown action "${action}" for ${toolLabel}. Available: ${scope.join(", ")}.`;
+}
+
 // ── Public: get the list of commander command names ────────────────────
 
 export function getCommandNames(program: Command): string[] {
@@ -450,7 +508,7 @@ function permissionTable(): string {
     "| `tabs` | `allow` | list, navigate, goBack, goForward, close, update |",
     "| `page.read` | `allow` | inspect, content, text, html, attr, meta, forms, count, select, summary, readable, full_html |",
     "| `page.act` | `ask` | click, fill, check, select_option, press, scroll, submit, type, click_at, dblclick_at, hover_at, … |",
-    "| `page.execute` | `deny` | page.js (gated escape hatch) |",
+    "| `page.execute` | `deny` | page.js (gated escape hatch), page_cdp (raw CDP passthrough) |",
     "| `screenshots` | `allow` | capture (overlay, full_page) |",
     "| `human` | `allow` | requestHelp (login/CAPTCHA/OTP/confirm, no borrow) |",
     "| `history` | `deny` | search, delete |",
@@ -551,7 +609,7 @@ function gateModel(): string {
     "Some tools require explicit approval before execution:",
     "",
     "- **Browser connection** — initial browser connection triggers an approval prompt.",
-    "- **`page.execute` / `page_js`** — gated escape hatch; default deny.",
+    "- **`page.execute` / `page_js` / `page_cdp`** — gated escape hatch + raw CDP passthrough; default deny.",
     "- **`page.act`** — default `ask`; user approves each invocation in the extension popup.",
     "- **`cookies` / `windows`** — gated at the group level (one gate for the whole group).",
     "- **`human.requestHelp`** — always `allow` (no gate); it *is* the human step for login/CAPTCHA/OTP/confirm.",
@@ -606,7 +664,7 @@ function actionOneLiner(tool: "page.read" | "page.act", action: string): string 
       fill: "Set an input value (CDP `Runtime.evaluate` in main world, honest FILL_VALUE_MISMATCH)",
       check: "Toggle a checkbox/radio",
       select_option: "Select a `<select>` option by value or label",
-      press: "Press a key on a focused element (CDP `Input.dispatchKeyEvent`)",
+      press: "Press a key on a focused element (CDP `Input.dispatchKeyEvent`; isolated untrusted fallback, dispatch ≠ processed)",
       scroll: "Scroll the page (up/down) — for element use scroll_to",
       scroll_to: "Scroll element into view, returns visible bounds (partial ok, not occlusion-tested)",
       wheel: "Native wheel input (delta_x/delta_y, one nonzero) at target or viewport centre",
@@ -614,7 +672,7 @@ function actionOneLiner(tool: "page.read" | "page.act", action: string): string 
       blur: "Remove focus via Runtime.evaluate",
       submit: "Submit a form",
       wait_for: "Wait for an element/condition/URL",
-      type: "Type text into a focused element (CDP `Input.insertText`)",
+      type: "Type text into a focused element (CDP `Input.insertText`; DOM got text ≠ backend got it — verify via page.read)",
       smart_click: "Click using only a semantic target (no anchor needed)",
       fill_form: "Fill multiple form fields in one call",
       upload: "Upload a file to a file input",
@@ -685,8 +743,10 @@ function actionDeepDive(tool: "read" | "act", action: string): string {
       "",
       "Implementation:",
       "- Primary: CDP `Input.dispatchKeyEvent` (keyDown + keyUp) with key→code mapping.",
-      "- Fallback: synthetic KeyboardEvent if CDP attach is denied.",
+      "- Fallback (untrusted): synthetic `KeyboardEvent` dispatched in the isolated world — `isTrusted=false`, so xterm-like widgets and hardened handlers may ignore it. Verdict: `world: \"isolated\"`, `path: \"isolated.fallbackKeyEvent\"`.",
       "- Verdict: `world: \"cdp\"`, `path: \"cdp.input.dispatchKeyEvent\"` on success.",
+      "",
+      "Dispatch success means the key events were dispatched, not that the backend or app processed them — verify the effect (e.g. re-read the field via `page.read`).",
       "",
       "Examples:",
       "```",
@@ -710,6 +770,22 @@ function actionDeepDive(tool: "read" | "act", action: string): string {
       "  to bypass React controlled-input protection, then dispatches `input` and `change`.",
       "- Fallback: isolated-world native setter + events.",
       "- Verdict: `world: \"main\"`, `path: \"cdp.runtime.evaluate\"` on success.",
+    ].join("\n");
+  }
+  if (tool === "act" && action === "type") {
+    return [
+      "Type text into a focused element (or globally if no target).",
+      "",
+      "Parameters:",
+      "- `target` (object, optional): Structured target to focus first.",
+      "- `anchor` (string, optional): Anchor ID from `page.read action=inspect`.",
+      "- `text` (string, required): Text to insert.",
+      "",
+      "Implementation:",
+      "- Primary: CDP `Input.insertText` at the current caret/selection.",
+      "- Verdict: `world: \"cdp\"`, `path: \"cdp.input.insertText\"` on success.",
+      "",
+      "CDP `Input.insertText` success means the DOM got the text, not that the backend got it — verify the effect (re-read via `page.read action=attr` / value and check `valueMatched`).",
     ].join("\n");
   }
   if (tool === "read" && action === "inspect") {

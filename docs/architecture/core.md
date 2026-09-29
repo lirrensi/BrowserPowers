@@ -168,7 +168,7 @@ HonoRouter exposing:
 
 Model Context Protocol server using streamable HTTP transport:
 
-**Browser-level tools** (11 tools total):
+**Browser-level tools** (15 tools total):
 - `browsers` — list connected browsers (replaces `browser_list`)
 - `screenshot` — capture screenshot (replaces `browser_screenshot`)
 - `tabs` — list, navigate, goBack, goForward, close tabs (replaces `browser_navigate`, `browser_list_tabs`)
@@ -179,14 +179,19 @@ Model Context Protocol server using streamable HTTP transport:
 - `page_read` — unified read tool with action dispatch (inspect, content, text, html, attr, meta, forms, count, select, summary, generate_selector)
 - `page_act` — unified act tool with action dispatch (click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond)
 - `page_js` — JavaScript execution escape hatch (gated behind `page.execute` group)
+- `page_cdp` — raw CDP passthrough, any method (gated behind `page.execute` like `page_js`; verdict `cdp.<method>`)
+- `page_net` — WS hooks + HTTP observe/block via MAIN-world hook (gated behind `page.execute`; blocking is wrapper-level)
 
 **Browser state tools**:
 - `cookies` — consolidated cookie management (get, set, remove, list)
-- `windows` — consolidated window management (list, create, focus, close)
+- `windows` — consolidated window management (list, create, focus, close; create takes `incognito`)
+
+**Human / record tools**:
+- `request_help` — human-in-the-loop (OS notification, completion criteria, polled orchestration)
+- `record` — trace.json textbook (start/stop/status, redacted ops)
 
 **Meta tool**:
-- `help` — full system reference and workflow guides
-
+- `help` — full system reference and workflow guides (optional per-action `action` deep-dive)
 - Built on `@modelcontextprotocol/server` v2 — `createMcpHandler(buildMcpServer)` invokes the factory once per HTTP request (stateless per-request serving)
 - No sessions or transport state persist between requests; sequential/concurrent MCP clients cannot collide on a shared connection
 - Legacy 2025-era protocol clients are served under the SDK default `legacy: 'stateless'` posture; legacy GET (SSE stream) and DELETE (session teardown) answer 405
@@ -196,7 +201,7 @@ Model Context Protocol server using streamable HTTP transport:
 
 Commander.js program with commands:
 
-- `list`, `navigate <id> <url>`, `screenshot <id> [file]`, `content <id> [selector]`, `select <id>`, `page read <id> <action> [params...]`, `page act <id> <action> [params...]`, `page js <id> <code>`, `tabs <id>`, `exec <id> <tool> [params...]`, `exec-all <tool> [params...]`
+- `list`, `navigate <id> <url>`, `screenshot <id> [file]`, `content <id> [selector]`, `select <id>`, `page read <id> <action> [params...]`, `page act <id> <action> [params...]`, `page cdp <id> <method> [paramsJSON]`, `page net <id> <action> [params...]`, `tabs <id>`, `exec <id> <tool> [params...]`, `exec-all <tool> [params...]`
 - `status` — Check daemon status, uptime, connected browsers
 - `stop` — Stop the running daemon
 - `disconnect <id>` — Disconnect a browser from the daemon
