@@ -159,6 +159,8 @@ HonoRouter exposing:
 | POST | `/execute-all` | Execute a tool on all browsers |
 | POST | `/execute-batch` | Execute multiple tools across browsers in parallel |
 | GET | `/browsers/:id/screenshot` | Screenshot convenience endpoint |
+| GET | `/browsers/:id/annotations[?tabId=N]` | List human annotations (core-local) |
+| DELETE | `/browsers/:id/annotations[?tabId=N]` | Clear human annotations (ids in body, tabId in query, or all) |
 | GET | `/results/:requestId` | Poll for async execution result |
 | GET | `/approvals` | List all pending approval requests |
 | DELETE | `/approvals/:id` | Cancel a pending approval request |
@@ -168,7 +170,7 @@ HonoRouter exposing:
 
 Model Context Protocol server using streamable HTTP transport:
 
-**Browser-level tools** (15 tools total):
+**Browser-level tools** (16 tools total):
 - `browsers` — list connected browsers (replaces `browser_list`)
 - `screenshot` — capture screenshot (replaces `browser_screenshot`)
 - `tabs` — list, navigate, goBack, goForward, close tabs (replaces `browser_navigate`, `browser_list_tabs`)
@@ -189,7 +191,7 @@ Model Context Protocol server using streamable HTTP transport:
 **Human / record tools**:
 - `request_help` — human-in-the-loop (OS notification, completion criteria, polled orchestration)
 - `record` — trace.json textbook (start/stop/status, redacted ops)
-
+- `annotations` — human click-clack notes (list/clear, per browser+tab, core-local store, no browser I/O)
 **Meta tool**:
 - `help` — full system reference and workflow guides (optional per-action `action` deep-dive)
 - Built on `@modelcontextprotocol/server` v2 — `createMcpHandler(buildMcpServer)` invokes the factory once per HTTP request (stateless per-request serving)

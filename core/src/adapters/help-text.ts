@@ -167,6 +167,16 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     actions: ["start", "stop", "status"],
   },
   {
+    name: "annotations",
+    group: "human",
+    description: "Read/clear human page annotations stored on the core (element notes + screenshots, per browser+tab).",
+    actions: ["list", "clear"],
+    params: `- browser_id or browser_name (one required)
+- action (optional): list (default) | clear
+- tab_id (optional): scope to one tab
+- ids (clear only, optional): clear only these annotation ids`,
+  },
+  {
     name: "help",
     group: "system",
     description: "Get the full system reference (this tool's own output, in a different format).",

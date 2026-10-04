@@ -219,6 +219,52 @@ describe("WebSocket Server + Registry Integration", () => {
 
     ws2.close();
   });
+
+  it("acks a human annotation off-queue and stores it per browser+tab", async () => {
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+    ws.send(JSON.stringify({ type: "register", payload: { name: "Annot Browser", capabilities: [], permissions: {} } }));
+    const regRaw = await new Promise<string>((resolve) => ws.once("message", (data) => resolve(data.toString())));
+    const browserId: string = JSON.parse(regRaw).payload.browserId;
+
+    const ackP = new Promise<string>((resolve) => ws.once("message", (data) => resolve(data.toString())));
+    ws.send(JSON.stringify({
+      type: "annotation",
+      payload: { kind: "element", comment: "cut off on mobile", tabId: 42, selector: "button.cta", clientId: "c-1" },
+    }));
+    const ack = JSON.parse(await ackP);
+    expect(ack.type).toBe("annotation_ack");
+    expect(ack.payload.id).toMatch(/^ann_/);
+    expect(ack.payload.clientId).toBe("c-1");
+
+    const { listAnnotations } = await import("../../src/annotations.js");
+    const all = listAnnotations(browserId);
+    expect(all).toHaveLength(1);
+    expect(all[0].tabId).toBe(42);
+    expect(listAnnotations(browserId, { tabId: 42 })).toHaveLength(1);
+    expect(listAnnotations(browserId, { tabId: 7 })).toHaveLength(0);
+
+    ws.close();
+  });
+
+  it("rejects an invalid annotation with an error, stores nothing", async () => {
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.on("open", () => resolve()));
+    ws.send(JSON.stringify({ type: "register", payload: { name: "Annot Reject", capabilities: [], permissions: {} } }));
+    const regRaw = await new Promise<string>((resolve) => ws.once("message", (data) => resolve(data.toString())));
+    const browserId: string = JSON.parse(regRaw).payload.browserId;
+
+    const errP = new Promise<string>((resolve) => ws.once("message", (data) => resolve(data.toString())));
+    ws.send(JSON.stringify({ type: "annotation", payload: { kind: "element", comment: "  ", tabId: 1, selector: "div" } }));
+    const err = JSON.parse(await errP);
+    expect(err.type).toBe("error");
+    expect(err.payload.message).toContain("annotation rejected");
+
+    const { listAnnotations } = await import("../../src/annotations.js");
+    expect(listAnnotations(browserId)).toHaveLength(0);
+
+    ws.close();
+  });
 });
 
 describe("WS Auth", () => {

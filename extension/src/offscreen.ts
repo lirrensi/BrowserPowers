@@ -71,6 +71,34 @@ async function waitForOffscreenReady(timeoutMs = 3000): Promise<void> {
 let requestCounter = 0;
 
 /**
+ * Ask the offscreen document to crop a PNG to a viewport-space region and
+ * return the cropped PNG bytes. Region + PNG size + viewport size all
+ * arrive in CSS px; the crop rect is scaled by pngWidth/viewportWidth.
+ */
+export async function cropPngViaOffscreen(
+  pngBytes: Uint8Array,
+  crop: { x: number; y: number; width: number; height: number },
+  viewport?: { width: number; height: number },
+): Promise<{ pngBytes: Uint8Array; width: number; height: number }> {
+  await ensureOffscreenDocument();
+  await waitForOffscreenReady();
+  const requestId = `bp-crop-${++requestCounter}`;
+  const result = await chrome.runtime.sendMessage({
+    type: "bp:overlay:crop",
+    requestId,
+    pngBase64: bytesToBase64(pngBytes),
+    crop,
+    viewport,
+  });
+  if (!result) throw new Error("offscreen document did not respond");
+  if (result.type === "bp:overlay:error") throw new Error(`offscreen crop failed: ${result.error}`);
+  if (result.type !== "bp:overlay:crop-result" || !result.pngBase64) {
+    throw new Error(`offscreen returned unexpected type: ${result.type}`);
+  }
+  return { pngBytes: base64ToBytes(result.pngBase64), width: result.width, height: result.height };
+}
+
+/**
  * Ask the offscreen document to render the overlay on top of the
  * given PNG and return the new PNG bytes. Resolves to the bytes.
  */

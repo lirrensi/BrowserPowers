@@ -257,6 +257,16 @@ const recordSchema = z.object({
   message: "Either browser_id or browser_name is required",
 });
 
+const annotationsSchema = z.object({
+  action: z.enum(["list", "clear"]).optional().describe("list (default) or clear consumed notes"),
+  browser_id: z.string().optional(),
+  browser_name: z.string().optional(),
+  tab_id: z.number().int().optional().describe("Scope to one tab (many tabs per browser)"),
+  ids: z.array(z.string()).optional().describe("Clear only these annotation ids (clear only)"),
+}).refine(data => data.browser_id || data.browser_name, {
+  message: "Either browser_id or browser_name is required",
+});
+
 /** Stub schema used for tool registration — help-first pattern (#017). */
 const helpStub = z.object({
   help: z.boolean().optional().describe("Show full parameter reference instead of executing"),
@@ -835,6 +845,24 @@ function generateToolHelpLegacy(toolName: string): string {
       "start/status: { recording, ops }. stop: trace { version, ops, states }.",
       "Follow trace targets/values in order, not old refs. Trace grants no extra auth.",
     ].join("\n"),
+
+    annotations: [
+      "## annotations",
+      "",
+      "Read/clear human page annotations stored on the core (no browser I/O).",
+      "Human arms the picker from the extension popup, clicks elements, types notes;",
+      "notes pile up per browser+tab until the agent reads and clears them.",
+      "",
+      "### Parameters",
+      "- `action` (enum, optional) — list (default) or clear",
+      "- `browser_name`/`browser_id` (one required)",
+      "- `tab_id` (number, optional) — Scope to one tab (many tabs per browser)",
+      "- `ids` (string[], optional) — Clear only these ids (clear only)",
+      "",
+      "### Output",
+      "list: { browser_id, total, byTab, annotations[] } — each with id, kind (element|screenshot), comment, tabId, url/title, selector, tag, text, rect, screenshotPath.",
+      "clear: { browser_id, cleared, remaining }.",
+    ].join("\n"),
   };
 
   return help[toolName] ?? `No help available for \`${toolName}\`.`;
@@ -1368,6 +1396,28 @@ function buildMcpServer(): McpServer {
       return { content: [{ type: "text" as const, text: formatResult(result.data) }] };
     },
   );
+
+  // ── annotations (human click-clack notes; core-local store, no browser I/O) ──
+  mcpServer.registerTool(
+    "annotations",
+    {
+      description: "Read/clear human page annotations (element notes + screenshots) stored on the core. Human clicks elements in the tab, notes pile up per browser+tab, agent reads them here and clears when done.",
+      inputSchema: helpStub,
+    },
+    async (args: Record<string, unknown>) => {
+      if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("annotations") }] };
+      const parsed = annotationsSchema.parse(args);
+      const browser_id = await resolveBrowserId(parsed);
+      const { listAnnotations, clearAnnotations, countAnnotations } = await import("../annotations.js");
+      if (parsed.action === "clear") {
+        const cleared = clearAnnotations(browser_id, { ids: parsed.ids, tabId: parsed.tab_id });
+        return { content: [{ type: "text" as const, text: formatResult({ browser_id, ...cleared }) }] };
+      }
+      const annotations = listAnnotations(browser_id, parsed.tab_id === undefined ? undefined : { tabId: parsed.tab_id });
+      return { content: [{ type: "text" as const, text: formatResult({ browser_id, ...countAnnotations(browser_id), annotations }) }] };
+    },
+  );
+
 
   // ── Global help meta-tool (#018) ──
 

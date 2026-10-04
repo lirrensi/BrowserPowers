@@ -237,6 +237,9 @@ function init(): void {
       chrome.storage.local.get("browserId");
       if (!isConnected()) {
         connect();
+      } else {
+        // Socket back — flush any notes queued while offline.
+        void flushAnnotationOutbox();
       }
     }
   });
@@ -320,6 +323,79 @@ function init(): void {
         break;
       }
 
+      case "annotateArm": {
+        // Popup button → arm the picker in the active tab (element or region).
+        // Replies fast; content script does the DOM work and reports back.
+        void (async () => {
+          try {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            const tab = tabs[0];
+            const tabId = tab?.id;
+            if (tabId === undefined) {
+              sendResponse({ success: false, error: "No active tab" });
+              return;
+            }
+            const blocked = restrictedAnnotateReason(tab?.url);
+            if (blocked) {
+              sendResponse({ success: false, error: blocked });
+              return;
+            }
+            const wantMode = message.mode === "region" ? "region" : "element";
+            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "arm", params: { mode: wantMode } }) as Record<string, unknown>;
+            sendResponse({ success: res?.armed !== false, tabId, mode: wantMode });
+          } catch (err) {
+            sendResponse({ success: false, error: friendlyAnnotateError((err as Error).message) });
+          }
+        })();
+        break;
+      }
+
+      case "annotateDisarm": {
+        void (async () => {
+          try {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            const tabId = tabs[0]?.id;
+            if (tabId === undefined) {
+              sendResponse({ success: false, error: "No active tab" });
+              return;
+            }
+            await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "disarm", params: {} });
+            sendResponse({ success: true, tabId });
+          } catch (err) {
+            sendResponse({ success: false, error: friendlyAnnotateError((err as Error).message) });
+          }
+        })();
+        break;
+      }
+
+      case "annotateStatus": {
+        void (async () => {
+          try {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            const tabId = tabs[0]?.id;
+            if (tabId === undefined) {
+              sendResponse({ armed: false });
+              return;
+            }
+            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "status", params: {} }) as Record<string, unknown>;
+            sendResponse({ armed: res?.armed === true, tabId });
+          } catch {
+            sendResponse({ armed: false });
+          }
+        })();
+        break;
+      }
+
+      case "bp:annotation": {
+        // Picker draft from the content script → WS `annotation` → core store.
+        // SW stamps tabId/windowId (content must not self-report identity),
+        // captures the screenshot when asked, queues to session outbox when
+        // the socket is down (flushed on reconnect).
+        void forwardAnnotation(_sender?.tab?.id, _sender?.tab?.windowId, (message.draft ?? {}) as Record<string, unknown>)
+          .then((id) => sendResponse({ received: true, id }))
+          .catch((err) => sendResponse({ received: false, error: (err as Error).message }));
+        break;
+      }
       case "bp:net-frame": {
         // page.net relay (TSK-0015): content script forwards MAIN-hook frames.
         // Ingest is best-effort bookkeeping — never fails the message channel.
@@ -342,6 +418,123 @@ function init(): void {
     }
     return true; // keep channel open for async response
   });
+}
+
+// ── Annotate errors: translate "Receiving end does not exist" into actions ──
+
+function restrictedAnnotateReason(url: string | undefined): string | null {
+  if (!url) return null;
+  const blocked = ["chrome://", "chrome-extension://", "edge://", "about:", "devtools://", "view-source:", "chrome-search://", "chrome-native://"];
+  if (blocked.some((p) => url.startsWith(p))) return `Annotate doesn't work on this page (${url.split(":")[0]}://) — Chrome blocks content scripts here. Switch to an http(s) tab.`;
+  const store = ["chrome.google.com/webstore", "microsoftedge.microsoft.com/addons"];
+  if (store.some((h) => url.includes(h))) return "Annotate doesn't work on the extension web store — Chrome blocks content scripts here. Switch to the tab you want to annotate.";
+  return null;
+}
+
+function friendlyAnnotateError(raw: string): string {
+  if (raw.includes("Receiving end does not exist") || raw.includes("Could not establish connection")) {
+    return "No annotate picker in this tab — the content script isn't running here. Reload the tab once (new install or chrome:// page), then Annotate again.";
+  }
+  return raw;
+}
+
+interface PendingDraft {
+  clientId: string;
+  tabId: number;
+  windowId?: number;
+  draft: Record<string, unknown>;
+  queuedAt: number;
+}
+
+const OUTBOX_KEY = "bp:annotation-outbox";
+const OUTBOX_MAX = 50;
+
+function newClientId(): string {
+  return `c_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
+async function readOutbox(): Promise<PendingDraft[]> {
+  try {
+    const got = await chrome.storage.session.get(OUTBOX_KEY) as Record<string, unknown>;
+    const list = got?.[OUTBOX_KEY];
+    return Array.isArray(list) ? (list as PendingDraft[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeOutbox(list: PendingDraft[]): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [OUTBOX_KEY]: list.slice(-OUTBOX_MAX) });
+  } catch { /* outbox best-effort; WS send already attempted first */ }
+}
+
+/** Push one draft toward the core. Returns the clientId (ack matching). */
+async function forwardAnnotation(tabId: number | undefined, windowId: number | undefined, draft: Record<string, unknown>): Promise<string> {
+  if (tabId === undefined || tabId < 0) throw new Error("annotation requires a tab");
+  const comment = typeof draft.comment === "string" ? draft.comment.trim() : "";
+  if (!comment) throw new Error("annotation requires a non-empty comment");
+  const clientId = newClientId();
+  const payload: Record<string, unknown> = { ...draft, comment, tabId, ...(windowId !== undefined ? { windowId } : {}) };
+  if (payload.kind === "screenshot") {
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab({ format: "png" });
+      const base64 = String(dataUrl).replace(/^data:image\/png;base64,/, "");
+      const region = payload.region as { x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number } | undefined;
+      if (region && region.width >= 12 && region.height >= 12) {
+        try {
+          const { cropPngViaOffscreen } = await import("../src/offscreen.js");
+          const raw = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+          const cropped = await cropPngViaOffscreen(raw, region, region.viewportWidth && region.viewportHeight
+            ? { width: region.viewportWidth, height: region.viewportHeight }
+            : undefined);
+          let bin = "";
+          for (const b of cropped.pngBytes) bin += String.fromCharCode(b);
+          payload.screenshotBase64 = btoa(bin);
+          payload.crop = { width: cropped.width, height: cropped.height };
+        } catch (cropErr) {
+          // Crop failed (offscreen asleep, bad rect) — send the FULL tab
+          // screenshot instead of killing the note. Region rect stays on
+          // the note so the agent still sees the intended box.
+          payload.screenshotBase64 = base64;
+          payload.cropError = (cropErr as Error).message;
+        }
+      } else {
+        payload.screenshotBase64 = base64;
+      }
+    } catch {
+      // Capture itself failed (occluded window, chrome:// page) — keep the note.
+      payload.kind = "element";
+    }
+  }
+  if (isConnected()) {
+    send({ type: "annotation", payload: { ...payload, clientId } });
+    return clientId;
+  }
+  const outbox = await readOutbox();
+  outbox.push({ clientId, tabId, windowId, draft: payload, queuedAt: Date.now() });
+  await writeOutbox(outbox);
+  try { void chrome.action.setBadgeText({ text: "•" }); } catch { /* ignore */ }
+  return clientId;
+}
+
+/** Flush session outbox after (re)connect — best-effort, order preserved. */
+async function flushAnnotationOutbox(): Promise<void> {
+  if (!isConnected()) return;
+  const outbox = await readOutbox();
+  if (outbox.length === 0) return;
+  await writeOutbox([]);
+  for (const item of outbox) {
+    try {
+      send({ type: "annotation", payload: { ...item.draft, clientId: item.clientId } });
+    } catch {
+      const rest = await readOutbox();
+      rest.push(item);
+      await writeOutbox(rest);
+      return;
+    }
+  }
+  try { void chrome.action.setBadgeText({ text: "" }); } catch { /* ignore */ }
 }
 
 function updateBadge(): void {

@@ -413,7 +413,7 @@ On reconnect, the extension MUST send a fresh `register` message.
 
 ### 2. MCP Tools
 
-The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport, served statelessly: every HTTP request is handled by a freshly constructed server instance, and no session state persists between requests. The server registers 15 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `page_cdp`, `page_net`, `cookies`, `windows`, `request_help`, `record`, and `help`.
+The core exposes a Model Context Protocol (MCP) server at `/mcp` (configurable) using streamable HTTP transport, served statelessly: every HTTP request is handled by a freshly constructed server instance, and no session state persists between requests. The server registers 16 tools: `browsers`, `screenshot`, `tabs`, `execute_all`, `execute_batch`, `page_read`, `page_act`, `page_js`, `page_cdp`, `page_net`, `cookies`, `windows`, `request_help`, `record`, `annotations`, and `help`.
 
 #### 2.1 Tool: `browsers`
 
@@ -945,6 +945,20 @@ Respond to a pending dialog.
 - `create` — Create a new window, optionally with a URL
 - `focus` — Focus a window by ID
 - `close` — Close a window by ID
+
+#### 2.10b Tool: `annotations`
+
+| Property | Value |
+|---|---|
+| Description | Read/clear human page annotations (element notes + cropped region screenshots) stored core-local per browser+tab. No browser I/O — works while the browser sleeps. |
+| Input | `{ browser_id: string, action?: "list" \| "clear", tab_id?: number, ids?: string[] }` |
+| Output | list: `{ browser_id, total, byTab, annotations[] }` — each `{ id, kind: "element" \| "screenshot", comment, tabId, url?, title?, selector?, tag?, text?, role?, rect?, region?, regionElement?, crop?, cropError?, screenshotPath? }`. clear: `{ browser_id, cleared, remaining }` |
+
+**Actions:**
+- `list` (default) — List stored notes, optionally scoped to one `tab_id` (many tabs per browser)
+- `clear` — Clear consumed notes: by `ids` (explicit ack), by `tab_id` (whole tab), or all
+
+**Flow:** popup has two buttons — `🎯 Annotate element` (click element → type → send, pure HTML-attached) and `📷 Region screenshot` (drag rectangle → type → send). Content → SW (`tabId`/`windowId` stamped from `_sender.tab`; region notes: visible tab captured, cropped to the dragged box via the offscreen canvas with the sender tab's viewport dims for PNG scaling) → WS `annotation` → core store (JSON-persisted). Region drafts resolve the element under drag-start into `selector/tag/text`. Overlays hide for two painted frames before the draft leaves so captures never contain picker chrome; crop failure falls back to full-tab with `cropError` stamped. Offline notes queue in `chrome.storage.session` and flush on reconnect. Esc exits any mode. Same data over REST (`GET+DELETE /api/browsers/:id/annotations[?tabId=N]`) and CLI (`browserpowers annotations <browser> [list|clear] [--tab-id N] [--ids ...]`).
 
 #### 2.11 Tool: `help`
 

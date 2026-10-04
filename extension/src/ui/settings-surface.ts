@@ -120,7 +120,7 @@ async function init(mode: SurfaceMode): Promise<void> {
   void updateStatus(statusEl);
   applyStaticI18n(document);
 
-  coreUrlInput.addEventListener("change", () => { void saveCoreUrl(coreUrlInput); });
+  wireAnnotateButtons();
   approvalNotificationsInput.addEventListener("change", () => { void saveApprovalNotifications(approvalNotificationsInput); });
   saveNameBtn.addEventListener("click", () => { void saveName(nameInput); });
   reconnectBtn.addEventListener("click", () => { void reconnect(statusEl); });
@@ -434,6 +434,35 @@ function wireYoloToggle(capsList: HTMLElement): void {
       await loadPageCapabilities(pageCapsContainer);
     })();
   });
+}
+
+/** Annotate card: two mode buttons — element picker vs region screenshot. Esc exits. */
+function wireAnnotateButtons(): void {
+  const elBtn = document.getElementById("annotate-element") as HTMLButtonElement | null;
+  const regionBtn = document.getElementById("annotate-region") as HTMLButtonElement | null;
+  const state = document.getElementById("annotate-state");
+  if (!elBtn || !regionBtn) return;
+  const say = (msg: string): void => { if (state) state.textContent = msg; };
+  const arm = (mode: "element" | "region", hint: string): void => {
+    void (async () => {
+      try {
+        const res = await chrome.runtime.sendMessage({ type: "annotateArm", mode }) as { success?: boolean; error?: string } | undefined;
+        say(res?.success === true ? hint : `Failed: ${res?.error ?? "unknown"}`);
+      } catch {
+        say("Failed to arm picker.");
+      }
+    })();
+  };
+  elBtn.addEventListener("click", () => arm("element", "element mode — click page elements (Esc exits)"));
+  regionBtn.addEventListener("click", () => arm("region", "region mode — drag a rectangle, type, send (Esc exits)"));
+  void (async () => {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "annotateStatus" }) as { armed?: boolean; mode?: string } | undefined;
+      if (res?.armed === true) say(res.mode === "region" ? "region mode — drag a rectangle (Esc exits)" : "element mode — click page elements (Esc exits)");
+    } catch {
+      say("");
+    }
+  })();
 }
 async function reconnect(statusEl: HTMLElement): Promise<void> {
   statusEl.textContent = t("status.connecting");

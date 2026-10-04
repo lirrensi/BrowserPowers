@@ -25,7 +25,7 @@ vi.mock("../../src/config.js", () => ({
   loadConfig: vi.fn(() => mockConfig),
 }));
 
-/** All 15 MCP tools the server must expose. */
+/** All 16 MCP tools the server must expose. */
 const EXPECTED_TOOL_NAMES = [
   "browsers",
   "screenshot",
@@ -41,12 +41,13 @@ const EXPECTED_TOOL_NAMES = [
   "windows",
   "request_help",
   "record",
+  "annotations",
   "help",
 ];
 
 /**
  * Run one full MCP client session against the running server:
- * connect → listTools (15 tools) → callTool("browsers", {}) success.
+ * connect → listTools (16 tools) → callTool("browsers", {}) success.
  * Regression for the shared-McpServer double-connect bug: with the old
  * sessionful wiring, the SECOND such session 500'd ("Already connected").
  */

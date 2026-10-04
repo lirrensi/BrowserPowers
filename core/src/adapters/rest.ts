@@ -168,6 +168,45 @@ restApp.delete("/approvals/:id", async (c) => {
   return c.json({ success: true, id });
 });
 
+// ── Annotations (human-originated page notes; core-local, no browser I/O) ──
+
+// GET /api/browsers/:id/annotations[?tabId=N] — list stored notes
+restApp.get("/browsers/:id/annotations", async (c) => {
+  const browserId = resolveBrowserId(c.req.param("id"));
+  if (!browserId) return c.json({ error: "Browser not found" }, 404);
+  const { listAnnotations, countAnnotations } = await import("../annotations.js");
+  const tabRaw = c.req.query("tabId");
+  const tabId = tabRaw !== undefined && tabRaw !== "" ? Number(tabRaw) : undefined;
+  if (tabRaw !== undefined && tabRaw !== "" && !Number.isInteger(tabId)) {
+    return c.json({ error: "tabId must be an integer" }, 400);
+  }
+  const annotations = listAnnotations(browserId, tabId === undefined ? undefined : { tabId });
+  return c.json({ browserId, ...countAnnotations(browserId), annotations });
+});
+
+// DELETE /api/browsers/:id/annotations[?tabId=N] | { ids?: string[] } — clear notes
+restApp.delete("/browsers/:id/annotations", async (c) => {
+  const browserId = resolveBrowserId(c.req.param("id"));
+  if (!browserId) return c.json({ error: "Browser not found" }, 404);
+  const { clearAnnotations } = await import("../annotations.js");
+  const tabRaw = c.req.query("tabId");
+  const tabId = tabRaw !== undefined && tabRaw !== "" ? Number(tabRaw) : undefined;
+  if (tabRaw !== undefined && tabRaw !== "" && !Number.isInteger(tabId)) {
+    return c.json({ error: "tabId must be an integer" }, 400);
+  }
+  let ids: string[] | undefined;
+  try {
+    const body = await c.req.json() as { ids?: unknown };
+    if (body.ids !== undefined) {
+      if (!Array.isArray(body.ids) || body.ids.some((v) => typeof v !== "string")) {
+        return c.json({ error: "ids must be a string array" }, 400);
+      }
+      ids = body.ids;
+    }
+  } catch { /* empty body — clear by tabId or all */ }
+  return c.json({ browserId, ...clearAnnotations(browserId, { ids, tabId }) });
+});
+
 // ── Audit (redacted read API) ──
 restApp.get("/audit", async (c) => {
   const { listAudits, auditStats } = await import("../audit.js");

@@ -175,6 +175,8 @@ async function handleMessage(
         return withRuntimeStatus(await handleNetSend(message.params || {}));
       case "bp:net-rules":
         return withRuntimeStatus(await handleNetRules(message.params || {}));
+      case "bp:annotate":
+        return withRuntimeStatus(await handleAnnotate(message.action || "", message.params || {}));
       default:
         return withRuntimeStatus({ success: false, message: `Unknown message type: ${message.type}`, errorCode: "UNKNOWN_TYPE" });
     }
@@ -657,6 +659,47 @@ function buildRuntimeStatus(): Record<string, unknown> {
       'isolated:content-script',
     ],
   };
+}
+
+// ── Human annotations (picker overlay) ──
+//
+// SW arms/disarms via `bp:annotate`. Drafts flow back picker → content →
+// SW (`bp:annotation` runtime message) → WS `annotation` → core store.
+// Content side never touches the socket; SW attach clientId for ack matching
+// and captures the screenshot when the human ticked the box.
+
+import { armPicker, disarmPicker, isPickerArmed, setPickerMode, getPickerMode } from "../src/annotate/picker.js";
+
+async function handleAnnotate(action: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await ensureReady();
+  if (action === "arm") {
+    const want = _params.mode === "region" ? "region" : "element";
+    if (isPickerArmed()) {
+      setPickerMode(want);
+      return { armed: true, already: true, mode: want };
+    }
+    const ok = armPicker((draft) => {
+      try {
+        const p = chrome.runtime.sendMessage({ type: "bp:annotation", draft }) as unknown;
+        if (p && typeof (p as Promise<unknown>).catch === "function") (p as Promise<unknown>).catch(() => {});
+      } catch { /* SW asleep — SW-side outbox is filled by the popup path instead */ }
+    }, want);
+    return ok
+      ? { armed: true, mode: want }
+      : { success: false, message: "picker failed to arm", errorCode: "ANNOTATE_ARM_FAILED" };
+  }
+  if (action === "mode") {
+    if (!isPickerArmed()) return { armed: false };
+    return { armed: true, mode: setPickerMode(_params.mode === "region" ? "region" : "element") };
+  }
+  if (action === "disarm") {
+    disarmPicker();
+    return { armed: false };
+  }
+  if (action === "status") {
+    return { armed: isPickerArmed(), ...(isPickerArmed() ? { mode: getPickerMode() } : {}) };
+  }
+  return { success: false, message: `Unknown annotate action: ${action}`, errorCode: "UNKNOWN_ANNOTATE_ACTION" };
 }
 
 // ── page.net bridge (TSK-0015) ──

@@ -4,9 +4,15 @@ All notable changes to BrowserPowers are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-10-05
+
+Human-annotations release: Agentation-style click-clack notes, human-first, proven on real YouTube tabs.
+
+### Added
+- **Human annotations** (Agentation-style click-clack notes, human-first): popup has two buttons — `🎯 Annotate element` (click element → type → send, pure HTML-attached) and `📷 Region screenshot` (drag rectangle → type → send, screenshot cropped to the box via offscreen canvas). Esc exits any mode. Notes travel content → SW → WS `annotation` → core store per browser+tab (`tabId` SW-stamped, JSON-persisted, survives disconnect), pile up 1..N across many tabs, offline-safe via session outbox. Overlays hide for two painted frames before capture so screenshots never contain picker chrome; crop failure falls back to full-tab with `cropError` stamped. Region drags resolve the element under drag-start into `selector/tag/text`. Agents read/clear core-local (no browser I/O): MCP `annotations` (list/clear, `tab_id`/`ids` scoping), `browserpowers annotations <browser> [list|clear]`, `GET+DELETE /api/browsers/:id/annotations`.
+
 ## [1.7.0] — 2026-09-29
 
-Field-feedback release: serial-console session drove five gaps shut, plus two new power tools.
 
 ### Added
 - **Raw CDP passthrough** (`page.cdp` / MCP `page_cdp` / `browserpowers page cdp <browser> <method> [paramsJSON]`): any CDP method, no allowlist, gated via `page.execute` like `page_js`. Trusted `Input.dispatchKeyEvent` for xterm-style widgets that ignore synthetic events.

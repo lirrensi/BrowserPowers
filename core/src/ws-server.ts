@@ -6,6 +6,8 @@ import type { CoreToExt, ExtToCore } from "./types.js";
 import { registry } from "./registry.js";
 import { loadConfig } from "./config.js";
 import { isAuthRequired, validateApiKey } from "./auth.js";
+import { addAnnotation } from "./annotations.js";
+import { saveScreenshotToTemp } from "./screenshot.js";
 import { VERSION } from "./version.js";
 
 /** Active WebSocket connections: browserId → WebSocket */
@@ -195,6 +197,40 @@ export function createWsServer(httpServer: Server): WebSocketServer {
           break;
         }
 
+        case "annotation": {
+          // Human-originated note: NOT a command result — no requestId, no
+          // queue. browserId is authoritative from the connection (register),
+          // never from the payload. Annotations survive disconnect.
+          if (!browserId || !isActiveConnection(browserId, ws)) {
+            console.warn(`[ws] Ignoring annotation from stale/unregistered connection`);
+            break;
+          }
+          try {
+            const raw = (msg.payload ?? {}) as unknown;
+            const payload: Record<string, unknown> = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+            const { clientId, screenshotBase64, ...draft } = payload;
+            const saveImage = typeof screenshotBase64 === "string" && screenshotBase64.length > 0 && screenshotBase64.length <= 12_000_000
+              ? saveScreenshotToTemp(screenshotBase64, browserId as string).then((r) => r.filePath)
+              : Promise.resolve(undefined);
+            if (typeof screenshotBase64 === "string" && screenshotBase64.length > 12_000_000) {
+              console.warn(`[ws] annotation screenshot too large (${screenshotBase64.length} chars) — stored note without image`);
+            }
+            const activeBrowser = browserId as string;
+            void saveImage.then((screenshotPath) => {
+              try {
+                const ann = addAnnotation(activeBrowser, { ...(draft as object), screenshotPath } as never);
+                ws.send(JSON.stringify({ type: "annotation_ack", payload: { id: ann.id, ...(typeof clientId === "string" ? { clientId } : {}) } }));
+              } catch (err) {
+                ws.send(JSON.stringify({ type: "error", payload: { message: `annotation rejected: ${(err as Error).message}` } }));
+              }
+            }).catch(() => {
+              ws.send(JSON.stringify({ type: "error", payload: { message: "annotation rejected: screenshot save failed" } }));
+            });
+          } catch (err) {
+            ws.send(JSON.stringify({ type: "error", payload: { message: `annotation rejected: ${(err as Error).message}` } }));
+          }
+          break;
+        }
         case "heartbeat": {
           if (browserId) {
             if (!isActiveConnection(browserId, ws)) {

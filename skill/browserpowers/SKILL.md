@@ -10,7 +10,7 @@ description: |
 # browserpowers
 
 Use MCP tools (`browsers`, `tabs`, `screenshot`, `page_read`, `page_act`, `page_js`, `page_cdp`,
-`cookies`, `windows`, `execute_all`, `execute_batch`, `help`) to work in the user's
+`cookies`, `windows`, `execute_all`, `execute_batch`, `annotations`, `help`) to work in the user's
 **real, persistent browsers** — with their logins, cookies, extensions. This skill does
 not install the extension. Never extract credentials, cookies, tokens, or other secrets.
 
@@ -45,7 +45,7 @@ the same thing. `bp` is shorthand for `browserpowers` (`bp status` = `browserpow
 | `execute_batch` | REST `POST /api/execute-batch` (no CLI shorthand — use `exec` in a loop) | `bp.executeBatch([{ browser, tool, params }])` |
 | `request_help` | `browserpowers request-help <browser> --prompt "..." [--url-contains ...]` | `bp.execute(browser, "human.requestHelp", { prompt, ... })` |
 | `record` | `browserpowers record <browser> start\|stop\|status [--purpose ...] [--out trace.json]` | `bp.execute(browser, "record.start" \| "record.stop" \| "record.status", { ... })` |
-| `help` | `browserpowers help [topic]` / `browserpowers help page.act click` | n/a (docs only) |
+| `annotations` | `browserpowers annotations <browser> [list\|clear] [--tab-id N] [--ids ...]` / `GET+DELETE /api/browsers/:id/annotations` | n/a (human notes, core-local store) |
 | approvals | `browserpowers approvals list` (approve/deny in extension popup) | n/a (human in popup) |
 | health | `browserpowers status [--json]` / `browserpowers doctor [--json]` / `GET /api/health` | `bp.health()` / `bp.waitForBrowser(name)` |
 | audit | `browserpowers audit list\|show <file>\|rm <file>` / `GET /api/audit` | n/a (use CLI/REST) |
@@ -194,6 +194,15 @@ page_act({ action: "dialog_respond", response: { confirm: true } })
 - Audit (redacted): `browserpowers audit list|show|rm` or `GET /api/audit`. Origin-only URLs, values redacted, 30d retention.
 - Health: `browserpowers status --json`, `browserpowers doctor`, `GET /api/health`. See `docs/sandboxed-agents.md` for `BROWSERPOWERS_HOME` + WSL split.
 - Evals: `npm run eval` (validate), `npm run eval:smoke` (needs browser). 5 core cases in `evals/browser/cases/core/`.
+
+## Human annotations (click-clack notes)
+
+Human-first flow, no agent round-trip until read time. Popup has two buttons, Esc exits any mode:
+1. `🎯 Annotate element` — click elements, type a note per element, Send. Pure HTML-attached (selector + rect + text), no screenshot.
+2. `📷 Region screenshot` — drag a rectangle, type, Send. Screenshot is cropped to the box (offscreen canvas, sender-tab viewport for scaling); overlays hide before capture so the PNG never contains picker chrome. Stays armed for 1..N notes across many tabs.
+3. Notes pile up on the core per browser+tab (`tabId` stamped by the service worker, never by the page). Region drags resolve the element under drag-start into `selector/tag/text`; crop failure falls back to full-tab with `cropError` stamped.
+4. Agent reads when told: `annotations({ action: "list" })` (scope with `tab_id` for one tab), fixes, then `annotations({ action: "clear", ids: [...] })` or `clear` + `tab_id` for a whole tab.
+Offline notes queue in `chrome.storage.session` and flush on reconnect. Read/clear never touch the browser — works while it sleeps.
 
 ## Approvals and human steps
 

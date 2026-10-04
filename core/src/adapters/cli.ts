@@ -915,6 +915,47 @@ program
     }
   });
 
+// ── annotations (human page notes; core-local, no browser I/O) ──
+program
+  .command("annotations <browserId> [action]")
+  .description("Read/clear human page annotations (element notes + screenshots). Human clicks elements in the tab; notes pile up per browser+tab until read and cleared. Actions: list (default) | clear.")
+  .option("--tab-id <n>", "Scope to one tab (many tabs per browser)", (v) => Number(v))
+  .option("--ids <ids...>", "Clear only these annotation ids (clear only)")
+  .option("--json", "Print raw JSON")
+  .action(async (browserId: string, action: string | undefined, options: { tabId?: number; ids?: string[]; json?: boolean }) => {
+    const act = action ?? "list";
+    if (!["list", "clear"].includes(act)) cliError(`annotations action must be list|clear (got ${act})`);
+    const query = options.tabId !== undefined ? `?tabId=${encodeURIComponent(String(options.tabId))}` : "";
+    if (act === "list") {
+      const res = await apiFetch(`${BASE}/browsers/${encodeURIComponent(browserId)}/annotations${query}`);
+      const data = await res.json() as { error?: string; annotations?: unknown[]; total?: number };
+      if (!res.ok || data.error) cliError(data.error ?? `annotations list failed (HTTP ${res.status})`);
+      if (options.json) {
+        console.log(JSON.stringify(data, null, 2));
+        return;
+      }
+      if (!data.annotations || data.annotations.length === 0) {
+        console.log("No annotations.");
+        return;
+      }
+      console.log(`  ${data.total ?? data.annotations.length} annotation(s):`);
+      for (const a of data.annotations as Array<{ id: string; kind: string; tabId: number; comment: string; selector?: string; url?: string; screenshotPath?: string }>) {
+        const where = [a.url ?? "", a.selector ? `(${a.selector})` : ""].filter(Boolean).join(" ");
+        console.log(`  • ${a.id}  [${a.kind} tab ${a.tabId}]  ${a.comment}${where ? `  — ${where}` : ""}${a.screenshotPath ? `  📷 ${a.screenshotPath}` : ""}`);
+      }
+      return;
+    }
+    const body = options.ids ? { ids: options.ids } : {};
+    const res = await apiFetch(`${BASE}/browsers/${encodeURIComponent(browserId)}/annotations${query}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json() as { error?: string; cleared?: number; remaining?: number };
+    if (!res.ok || data.error) cliError(data.error ?? `annotations clear failed (HTTP ${res.status})`);
+    console.log(`✅ Cleared ${data.cleared ?? 0} annotation(s), ${data.remaining ?? 0} remaining.`);
+  });
+
 // ── audit (redacted read API) ──
 program
   .command("audit")

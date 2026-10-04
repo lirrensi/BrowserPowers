@@ -58,6 +58,40 @@ function areaOf(r) {
   return Math.max(0, r.width) * Math.max(0, r.height);
 }
 
+async function renderCrop({ pngBase64, crop, viewport }) {
+  const canvas = document.getElementById("stage");
+  const bytes = base64ToBytes(pngBase64);
+  const blob = new Blob([bytes], { type: "image/png" });
+  const bitmap = await createImageBitmap(blob);
+  if (bitmap.width === 0 || bitmap.height === 0) {
+    throw new Error(`offscreen crop source has zero size: ${bitmap.width}x${bitmap.height}`);
+  }
+  // PNG px per CSS px: full-tab capture maps the layout viewport onto the
+  // bitmap. Use the sender tab's viewport (passed in), NOT the offscreen
+  // document's own window size (offscreen has no layout viewport).
+  const vw = (viewport && viewport.width) || 0;
+  const vh = (viewport && viewport.height) || 0;
+  if (!vw || !vh) throw new Error("offscreen crop needs viewport dimensions");
+  const sx = bitmap.width / vw;
+  const sy = bitmap.height / vh;
+  const x = Math.max(0, Math.round(crop.x * sx));
+  const y = Math.max(0, Math.round(crop.y * sy));
+  const w = Math.min(bitmap.width - x, Math.round(crop.width * sx));
+  const h = Math.min(bitmap.height - y, Math.round(crop.height * sy));
+  if (w <= 0 || h <= 0) throw new Error(`offscreen crop rect empty after scaling (${w}x${h})`);
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("2D canvas context unavailable in offscreen document");
+  ctx.drawImage(bitmap, x, y, w, h, 0, 0, w, h);
+  bitmap.close?.();
+  const outBlob = await new Promise((resolve, reject) => {
+    canvas.toBlob((b) => b ? resolve(b) : reject(new Error("toBlob returned null")), "image/png");
+  });
+  const outBuf = await outBlob.arrayBuffer();
+  return { pngBase64: bytesToBase64(new Uint8Array(outBuf)), width: w, height: h };
+}
+
 async function renderOverlay({ pngBase64, pngBytes, anchors, options }) {
   const canvas = document.getElementById("stage");
   // Prefer the base64 string — the round-trip through structured clone
@@ -132,9 +166,14 @@ async function renderOverlay({ pngBase64, pngBytes, anchors, options }) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!msg || msg.type !== "bp:overlay:render") return false;
+  if (!msg || (msg.type !== "bp:overlay:render" && msg.type !== "bp:overlay:crop")) return false;
   (async () => {
     try {
+      if (msg.type === "bp:overlay:crop") {
+        const { pngBase64, width, height } = await renderCrop({ pngBase64: msg.pngBase64, crop: msg.crop, viewport: msg.viewport });
+        sendResponse({ type: "bp:overlay:crop-result", requestId: msg.requestId, pngBase64, width, height });
+        return;
+      }
       const { pngBase64, drawn } = await renderOverlay({
         pngBase64: msg.pngBase64,
         pngBytes: msg.pngBytes,

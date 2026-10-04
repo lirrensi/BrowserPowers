@@ -1,10 +1,10 @@
-// ── Core Types for BrowserPowers ──
-
+import type { AnnotationDraft } from "./annotations.js";
 /** Permission level for a tool or toolgroup */
 export type Permission = "allow" | "deny" | "ask";
 
 /** Known toolgroups (capability categories) */
 export type ToolGroup =
+  | "annotations"
   | "tabs"
   | "page.read"
   | "page.act"
@@ -54,15 +54,16 @@ export interface Capability {
 
 /** Extension → Core messages */
 export type ExtToCore =
+  | { type: "annotation"; payload: AnnotationDraft & { clientId?: string } }
   | { type: "register"; payload: RegisterPayload }
   | { type: "result"; payload: { requestId: string; data: unknown } }
   | { type: "error"; payload: { requestId: string; message: string } }
   | { type: "heartbeat" }
   | { type: "approval_response"; payload: { requestId: string; approved: boolean; timed_out?: boolean } };
 
-/** Core → Extension messages */
 export type CoreToExt =
   | { type: "registered"; payload: { browserId: string; coreVersion: string } }
+  | { type: "annotation_ack"; payload: { id: string; clientId?: string } }
   | { type: "execute"; payload: { requestId: string; tool: string; params: Record<string, unknown>; commandMode: CommandMode } }
   | { type: "heartbeat_ack" }
   | { type: "config_updated"; payload: PermissionProfile }
