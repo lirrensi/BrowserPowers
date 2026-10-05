@@ -7,7 +7,9 @@
   <img src="https://img.shields.io/badge/firefox-experimental-orange?style=flat-square" alt="Firefox Experimental" />
   <img src="https://img.shields.io/badge/node-%3E%3D18-339933?style=flat-square" alt="Node >= 18" />
 </p>
-
+<p align="center">
+  <a href="./README.md">English</a> · <a href="./README.zh.md">中文版</a>
+</p>
 <p align="center">
   <img src="assets/browserpowers_cat.jpeg" alt="BrowserPowers Cat" />
 </p>
@@ -75,17 +77,55 @@ Instead of ephemeral headless browser automation (Playwright, Puppeteer, Seleniu
 
 ---
 
-## Key Features
+## What it can do
 
-| | |
-|---|---|
-| **Multi-Browser** | Connect any number of real browsers (Chrome, Firefox, etc.) to one core. Each is an independent identity with its own permissions and configuration. |
-| **Permission Gates** | Per-browser permissions with simple global controls for browser powers and site-pattern controls for page powers. Allow, ask, or deny — you stay in control. |
-| **MCP-First** | Full Model Context Protocol server — agents in Claude Desktop, Cursor, and any MCP client can command your browsers directly. |
-| **REST API** | HTTP endpoints for browser management and tool execution — integrate from any language. |
-| **CLI** | `browserpowers list`, `browserpowers navigate`, `browserpowers screenshot`, `browserpowers page read` — scriptable from your terminal. |
-| **Real Browsers** | Not a headless simulacrum. Your actual logged-in sessions, cookies, extensions, and bookmarks — available to your agents. |
-| **Observability** | Every command, every result, every error is logged. You can always see what happened and when. |
+Everything below runs against your **real, logged-in browsers** — tabs, sessions, cookies, extensions included. Agents drive it through MCP; humans and shell scripts use the CLI against the same core; scripts use one vendored SDK import.
+
+### 📑 Tabs — many browsers, many tabs
+
+List, open, navigate, go back/forward, close. Every command takes a browser name or ID, and names persist across restarts (`quick-fox-a3b2`). One core fans out to any number of browsers — run the same check on all of them at once (`exec-all`), or batch different jobs across browsers in parallel (`execute_batch`).
+
+### 👀 Read the page — inspect, text, articles, markup
+
+`inspect` returns the interactable tree with anchor IDs (`a1`, `a2`…) — the fast path for everything else. Then `content` (visible text), `readable` (article text, nav/ads stripped), `meta` (title, OG tags), `forms` (fields + state), `attr`/`html`/`text` (scoped reads), `full_html` (whole document), `select` (current selection), `summary`/`count`/`frames`, plus `console` and `runtime_status` for diagnostics. Anchors go stale on navigation — re-inspect, retry once.
+
+### 🖱️ Drive the page — click to canvas, forms to uploads
+
+Click, fill, check, select, press keys, type, hover, scroll (element or page), native wheel, focus/blur, submit, wait-for conditions, whole-form fill, file upload, drag, double-click — by visible text (survives reloads), anchor ID (fastest), CSS/role/label/placeholder, even inside shadow DOM. Canvas-rendered UI (maps, games, xterm): screenshot with overlay, read coords off the image, `click_at` literal viewport pixels.
+
+### 📸 See the page — screenshots that survive WSL
+
+Viewport PNG, full-page via CDP, or anchor overlays (`labels`/`coords`/`both` — IDs and x,y painted on). Returns both a core-side `filePath` and inline `base64`, so WSL/VM/container callers that can't read the core's disk still get the image.
+
+### 🌐 Escape hatches — JS, CDP, network
+
+`page_js` runs arbitrary JS (gated, last resort, must return JSON). `page_cdp` passes any CDP method straight through (trusted key events into xterm/canvas that ignore synthetic input). `page_net` hooks page WebSockets (list/tail/send keystrokes into a serial console) and observes/blocks HTTP by pattern. These live behind `page.execute` (default deny) — the core never grants itself more than you allow.
+
+### 🍪 Browser state — cookies, windows, history, bookmarks, storage
+
+Cookies (get/set/remove/list per URL), windows (list/create/focus/close, incognito included), history search + delete, bookmarks list/create/delete, downloads list/open, localStorage get/set, network-request ring buffer. Your sessions stay yours — agents borrow the view, never the keys (credentials and secrets are never extracted).
+
+### 🙋 Human in the loop — help, approvals, annotations
+
+Stuck on login/CAPTCHA/OTP? The agent asks *you* (`request_help` → OS notification → Continue/Cancel), then re-inspects. Sensitive tools pause on `ask` gates — approve once/session/forever in the popup, auto-deny in 60s, or flip YOLO mode on a throwaway automation browser. And **annotations** (v1.8): you click `Annotate element` or drag `Region screenshot` in the page, type a note, and it piles up on the core per browser+tab until the agent reads and clears it — human-first bug reports with cropped screenshots.
+
+### 📼 Record, audit, health
+
+`record` turns a session into a trace.json textbook (ops + page states, banking/SSO excluded). The audit log keeps redacted history (origin-only URLs, values stripped, 30d). `status`/`doctor` tell you daemon health, browser heartbeats, and what's misconfigured.
+
+### 🛠️ Three ways to drive it
+
+MCP (Claude Desktop, Cursor, any MCP client at `/mcp`), REST (`/api` from any language), CLI (`browserpowers …`, `bp` shorthand) — all hitting the same gates, same browsers. For example:
+
+```bash
+browserpowers list                                  # browsers online
+browserpowers navigate "my-chrome" https://example.com
+browserpowers page read "my-chrome" inspect        # interactable tree
+browserpowers page act "my-chrome" click "text:Save"
+browserpowers screenshot "my-chrome" ./shot.png
+```
+
+Full command surface, flags, and scripting (one SDK import, parallel fan-out) live in [CLI Reference](#cli-reference) and [Scripting](#scripting) below. `browserpowers help <topic>` (or any MCP tool with `{ help: true }`) is the in-terminal manual.
 
 ---
 
@@ -345,106 +385,41 @@ Same surface as a script — one import, many calls, parallel fan-out:
 | `browserpowers status` | `bp.health()` / `bp.waitForBrowser(name)` |
 
 > **Dev mode**: Use `npm run cli -- <command>` instead of `browserpowers <command>`.
-### Page Interaction Syntax
 
-The CLI supports smart target detection for page operations:
+## How you control a browser
+
+One mental model, three scopes. Everything below is the same over MCP, CLI, and REST — pick the surface, keep the verbs.
+
+**1. Browser scope — which browser, which tab.** Commands take a browser name or ID (`quick-fox-a3b2` survives restarts). `list` shows who's online; `tabs` lists tabs; `navigate` opens or steers; `exec-all` runs one tool everywhere; `execute_batch` runs different jobs in parallel.
+
+**2. Page scope — see, then touch.** Always read before acting: `page read … inspect` returns the anchor tree, then `page act` clicks/fills/types against it. Targeting, most-stable first: visible text (`"text:Save"`, survives reloads) → anchor ID (`a7`, fastest, single-use) → CSS/role/label/placeholder → shadow-DOM path. Re-inspect after navigation or big DOM changes; what the inspector misses, you ground visually (screenshot with overlay → `click_at` pixels).
 
 ```bash
-# Read a page
-browserpowers page read "my-chrome" inspect              # Inspect interactable elements
-browserpowers page read "my-chrome" content              # Get full page text
-browserpowers page read "my-chrome" meta                 # Page metadata (OG, title, etc.)
-
-# Interact with a page
-browserpowers page act "my-chrome" click target=#submit-btn      # Click by CSS selector
-browserpowers page act "my-chrome" click "text:Save"             # Click by text
-browserpowers page act "my-chrome" fill target=#email value=hi@example.com  # Fill form field
-
-# Shorthand selectors — auto-detected:
-#   "#id"       → CSS selector
-#   ".class"    → CSS selector
-#   "[attr]"    → CSS selector
-#   "text:..."  → text content match
-#   bare text   → text content match
+browserpowers page read "my-chrome" inspect              # interactable tree
+browserpowers page read "my-chrome" readable              # article text
+browserpowers page act "my-chrome" click "text:Save"       # click by text
+browserpowers page act "my-chrome" fill target=#email value=hi@example.com
+# Shorthand: "#id"/".class"/"[attr]" → CSS, "text:…" or bare text → text match
 ```
 
-### Scripting — one import string, copy it every time
+**3. Trust scope — gates decide what runs.** Every tool sits in a group (`tabs`, `page.read`, `page.act`, `page.execute`, `screenshots`, `cookies`, `windows`, …). Each browser profile says `allow` (runs), `ask` (popup approval: once/session/forever, auto-deny 60s), or `deny` (blocked). Page tools add site-pattern overrides (`*`, `example.com`, `*.example.com`). Defaults: reading is allowed, acting asks, JS/CDP/network are denied. [Permission System](#permission-system) has the full table.
 
-Step 1 — resolve the string once (stash it in your notes):
-```bash
-bp sdk path
-# C:\Users\<you>\.browserpowers\sdk  →  your import string is:
-# file:///C:/Users/<you>/.browserpowers/sdk/client.js
-```
-Same path on every script, every folder, every drive session — the installer
-owns it, the repo is deletable, nothing to `npm install`. (`bp sdk path`
-prints your real path — paste what it prints, not what's above.)
+The human side of trust: `request_help` pings you for login/CAPTCHA/OTP (Continue/Cancel, then the agent re-inspects); **annotations** flip it around — you annotate elements or drag region screenshots in the page, notes pile up per browser+tab, the agent reads and clears when told.
 
-Step 2 — paste it into any script, inline or file:
-```bash
-node --input-type=module -e "import { BrowserPowersClient } from 'file:///C:/Users/<you>/.browserpowers/sdk/client.js'; const bp = new BrowserPowersClient(); console.log('health:', (await bp.health()).status);"
-```
-```js
-// any .mjs file, any folder — same string (use YOUR path from `bp sdk path`)
-import { BrowserPowersClient } from "file:///C:/Users/<you>/.browserpowers/sdk/client.js";
-const bp = new BrowserPowersClient();
-const browser = await bp.waitForBrowser("my-browser"); // ID or name
-await bp.navigate(browser.id, "https://example.com");
-```
-Windows tax: triple slash (`file:///C:/...`), and `-e` needs
-`--input-type=module` for `import` to parse.
+## Scripting
 
-### Scripting from Node (longer scripts)
-
-Same import string, grown up:
+One import string, copy it everywhere (`bp sdk path` prints your real path — paste what it prints):
 
 ```js
 import { BrowserPowersClient } from "file:///C:/Users/<you>/.browserpowers/sdk/client.js";
-
-const bp = new BrowserPowersClient(); // base + key from env, see below
+const bp = new BrowserPowersClient(); // base + key from env
 const browser = await bp.waitForBrowser("my-browser"); // ID or name
 await bp.navigate(browser.id, "https://example.com");
-
-// Read, then filter in-process — one round trip, not one per element.
-// data is the ActionResult: anchors at result.data.data.anchors, check both success flags.
 const tree = await bp.pageRead(browser.id, "inspect", { limit: 30 });
-if (!tree.success) throw new Error(`inspect failed: ${tree.error}`);
-if (!tree.data?.success) throw new Error(`inspect not performed: ${tree.data?.message}`);
-const anchors = tree.data?.data?.anchors ?? [];
-const buttons = anchors.filter((a) => a.tag === "button");
-console.log(`inspect: ${anchors.length} anchors (${buttons.length} buttons)`);
-
-// Parallel fan-out: both reads in flight under one await.
-const [content, meta] = await Promise.all([
-  bp.pageRead(browser.id, "content"),
-  bp.pageRead(browser.id, "meta"),
-]);
-
-// Batch across browsers, order preserved. Screenshot straight to disk.
-const results = await bp.executeBatch([
-  { browser: "alpha", tool: "page.read", params: { action: "content" } },
-  { browser: "beta", tool: "page.read", params: { action: "content" } },
-]);
-await bp.saveScreenshot(browser.id, "./shot.png", { overlay: "none" });
+await bp.saveScreenshot(browser.id, "./shot.png");
 ```
 
-<!-- What it prints (real run shape):
-core: http://127.0.0.1:4199/api
-browser: quick-fox-a3b2 (b-1)
-inspect: 14 anchors (3 buttons)
-  a1 <button> Save
-content: 1823 chars of JSON
-meta: {"title":"Example Domain",...}
-screenshot: ./shot.png
--->
-
-Starter script: `node core/examples/quickstart.mjs [browser] [url]`.
-
-Env (same names the harnesses already use): `BROWSERPOWERS_BASE` (or
-`BP_BASE`, or core-origin `BP_CORE`), `BROWSERPOWERS_API_KEY` (or `BP_API_KEY`).
-`execute()` returns the `{ success, data, error }` envelope — check
-`.success`, don't catch. `executeBatch()` takes ID-or-name browsers and
-preserves order. Full API: `core/src/client.ts`.
+Windows tax: triple slash (`file:///C:/...`), and `-e` needs `--input-type=module`. Starter: `node core/examples/quickstart.mjs [browser] [url]`. Env: `BROWSERPOWERS_BASE` (or `BP_BASE`), `BROWSERPOWERS_API_KEY` (or `BP_API_KEY`). `execute()` returns `{ success, data, error }` — check `.success`, don't catch. Full API: `core/src/client.ts`.
 
 ---
 
@@ -489,13 +464,18 @@ browserpowers mcp-config --client cursor
 | Tool | Description |
 |------|-------------|
 | `browsers` | List all connected browsers with capabilities and status |
-| `screenshot` | Capture a screenshot of the active tab |
-| `tabs` | List and navigate browser tabs |
-| `page_read` | Read page content (inspect, text, html, meta, forms, etc.) |
-| `page_act` | Interact with page elements (click, fill, check, etc.) |
+| `screenshot` | Capture a screenshot of the active tab (overlay, full-page) |
+| `tabs` | List, navigate, go back/forward, close tabs |
+| `page_read` | Read page content (inspect, content, readable, meta, forms, …) |
+| `page_act` | Interact with page elements (click, fill, type, scroll, …) |
 | `page_js` | Execute arbitrary JavaScript (gated escape hatch) |
+| `page_cdp` | Raw CDP passthrough (any method, gated like `page_js`) |
+| `page_net` | Observe/drive page network (WS hooks, HTTP observe/block) |
 | `cookies` | Get, set, remove, and list cookies |
 | `windows` | List, create, focus, and close browser windows |
+| `request_help` | Ask the human to complete an in-page step |
+| `record` | Record ops into a trace.json textbook |
+| `annotations` | Read/clear human page annotations (element notes + screenshots) |
 | `execute_all` | Execute a tool on ALL connected browsers simultaneously |
 | `execute_batch` | Execute multiple tools across browsers in parallel |
 | `help` | Get the full system reference |
@@ -521,8 +501,9 @@ Every tool belongs to a **permission group**. Each browser has a permission prof
 | `tabs` | List, create, navigate, close tabs | allow |
 | `page.read` | Read page content (inspect, text, html, meta) | allow |
 | `page.act` | Interact with page elements (click, fill, etc.) | ask |
-| `page.execute` | Execute arbitrary JavaScript on the page | deny |
+| `page.execute` | Arbitrary JS, raw CDP, page network hooks | deny |
 | `screenshots` | Capture visible tab screenshots | allow |
+| `human` | Human-in-the-loop prompts (never gated — it *is* the human step) | allow |
 | `history.read` | Search browsing history | allow |
 | `history.delete` | Delete browsing history | ask |
 | `bookmarks.read` | List bookmarks | allow |
@@ -533,6 +514,8 @@ Every tool belongs to a **permission group**. Each browser has a permission prof
 | `network` | Observe network requests | ask |
 | `storage` | Read/write page localStorage | ask |
 | `windows` | List, create, focus, close windows | ask |
+
+> `record` and `annotations` aren't browser-gated — the core stores them locally without touching the browser, so no permission applies.
 
 You can configure permissions:
 - **In the extension popup** — per browser, per group
