@@ -13,7 +13,7 @@
  *          `fillElementFallback` for the case where CDP attach fails.
  * OWNS: Target resolution, inspection, act actions, dialog control, wait conditions, read operations,
  *       resolve-and-locate for CDP-bound actions, fallback synthetic-event dispatch.
- * EXPORTS: resolveTarget, inspectElements, listFrames,
+ * EXPORTS: resolveTarget, inspectElements,
  *          walkShadowPath, getShadowHostChain, buildJsExpression,
  *          clickElement, dblclickElement, hoverElement, typeText, fillElement,
  *          dispatchClickEventFallback, dispatchDblclickEventFallback,
@@ -107,16 +107,6 @@ export interface ResolutionResult {
   error?: string;
   /** Which resolution strategy produced this result. */
   pathTaken?: "shadow-walk" | "css-chain" | "css-flat" | "text" | "anchor" | "role" | "label" | "placeholder" | "testId";
-}
-
-export interface FrameInfo {
-  index: number;
-  id?: string;
-  name?: string;
-  src?: string;
-  sameOrigin: boolean;
-  title?: string;
-  url?: string;
 }
 
 // ── CSS Escape Helper ──
@@ -547,15 +537,8 @@ export function inspectElements(
     walkElements(rootEl, collected, []);
   }
 
-  const iframes = document.querySelectorAll<HTMLIFrameElement>("iframe");
-  for (let fi = 0; fi < iframes.length; fi++) {
-    if (collected.length >= maxAnchors) break;
-    try {
-      if (iframes[fi].contentDocument && iframes[fi].contentDocument!.body) {
-        walkElements(iframes[fi].contentDocument!.body, collected, []);
-      }
-    } catch (_) { /* cross-origin */ }
-  }
+  // No iframe walk: anchors are actionable only in the document that produced
+  // them. Frames are inspected explicitly with frame_url/frame_name/frameId.
 
   const documentId = "doc-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
@@ -566,34 +549,6 @@ export function inspectElements(
     anchors: collected.slice(0, maxAnchors),
   };
 }
-
-export function listFrames(): FrameInfo[] {
-  const frames: FrameInfo[] = [];
-  const iframes = document.querySelectorAll<HTMLIFrameElement>("iframe");
-  for (let i = 0; i < iframes.length; i++) {
-    const iframe = iframes[i];
-    const frameInfo: FrameInfo = {
-      index: i,
-      id: iframe.id || undefined,
-      name: iframe.name || undefined,
-      src: (iframe.src || "").slice(0, 200),
-      sameOrigin: false,
-    };
-    try {
-      if (iframe.contentDocument) {
-        frameInfo.sameOrigin = true;
-        frameInfo.title = iframe.contentDocument.title || undefined;
-        frameInfo.url = iframe.contentDocument.URL || undefined;
-      }
-    } catch (_) {
-      // Cross-origin — can't access content
-    }
-    frames.push(frameInfo);
-  }
-  return frames;
-}
-
-// ── Act Actions ──
 
 function isDescendantOrSelf(ancestor: Element, descendant: Element): boolean {
   let current: Element | null = descendant;

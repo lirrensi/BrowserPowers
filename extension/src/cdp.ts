@@ -377,10 +377,17 @@ export function getState(tabId: number): CdpState {
  * serialized per tab to avoid interleaving. Never throws — returns a typed
  * EvalResult with `ok: false` and `exceptionDetails` on error.
  */
+export interface EvalOptions {
+  awaitPromise?: boolean;
+  returnByValue?: boolean;
+  /** CDP execution context (e.g. Page.createIsolatedWorld) — evaluates inside that frame/world. */
+  contextId?: number;
+}
+
 export async function runtimeEvaluate(
   tabId: number,
   expression: string,
-  opts: { awaitPromise?: boolean; returnByValue?: boolean } = {},
+  opts: EvalOptions = {},
 ): Promise<EvalResult> {
   const tail = cmdQueues.get(tabId) ?? Promise.resolve();
   const next = tail
@@ -406,6 +413,7 @@ export async function runtimeEvaluate(
           expression,
           returnByValue: opts.returnByValue ?? true,
           awaitPromise: opts.awaitPromise ?? true,
+          ...(opts.contextId !== undefined ? { contextId: opts.contextId } : {}),
         } as unknown as object,
       )) as RemoteEvaluateResult | undefined;
       const durationMs = performance.now() - start;

@@ -17,12 +17,15 @@ interface AnchorEntry {
   target: Target;
   /** Optional chain of shadow host tag names leading to the anchor. */
   shadowPath?: string[];
+  /** Frame the anchor was captured in (0 = top). Enables frame-aware follow-up actions. */
+  frameId?: number;
 }
 
 export interface StoredAnchor {
   selector: string;
   target: Target;
   shadowPath?: string[];
+  frameId?: number;
 }
 
 const tabAnchors = new Map<number, Map<string, AnchorEntry>>();
@@ -35,7 +38,7 @@ const tabGenerations = new Map<number, number>();
 export function setAnchors(
   tabId: number,
   documentId: string,
-  anchors: Array<{ anchor: string; target: Target; selector: string; shadowPath?: string[] }>,
+  anchors: Array<{ anchor: string; target: Target; selector: string; shadowPath?: string[]; frameId?: number }>,
 ): number {
   const map = new Map<string, AnchorEntry>();
   for (const a of anchors) {
@@ -45,6 +48,7 @@ export function setAnchors(
       tabId,
       target: a.target,
       shadowPath: a.shadowPath,
+      frameId: a.frameId,
     });
   }
   tabAnchors.set(tabId, map);
@@ -67,7 +71,12 @@ export function getAnchor(
   const entry = map.get(anchorId);
   if (!entry) return null;
   if (documentId !== undefined && entry.documentId !== documentId) return null; // stale
-  return { selector: entry.selector, target: entry.target, shadowPath: entry.shadowPath };
+  return { selector: entry.selector, target: entry.target, shadowPath: entry.shadowPath, frameId: entry.frameId };
+}
+
+/** Frame id an anchor was captured in, if known (undefined for pre-frame anchor maps). */
+export function getAnchorFrameId(tabId: number, anchorId: string): number | undefined {
+  return tabAnchors.get(tabId)?.get(anchorId)?.frameId;
 }
 
 /**

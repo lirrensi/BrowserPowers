@@ -78,8 +78,14 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
   {
     name: "tabs",
     group: "browser-management",
-    description: "List, navigate, go back/forward, close browser tabs. Action discriminator.",
-    actions: ["list", "navigate", "goBack", "goForward", "close"],
+    description: "List, create, navigate, activate, update, and close browser tabs. Action discriminator.",
+    actions: ["list", "create", "navigate", "goBack", "goForward", "activate", "update", "close"],
+    params: `- browser_id or browser_name (one required)
+- tab_id (number, optional): target tab (alias tabId); required for activate, default active tab elsewhere where allowed
+- url (string, optional): create / navigate / update target
+- active (boolean, optional): create/update — activate the tab (navigate defaults true)
+- limit / offset (list, optional): pagination
+- wait_until / timeout_ms / snapshot (navigate, optional)`,
   },
   {
     name: "execute_all",
@@ -99,18 +105,34 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     group: "page-interaction",
     description: "Read page content without mutating it. Action discriminator.",
     actions: PAGE_READ_ACTIONS,
+    params: `- browser_id or browser_name (one required)
+- tab_id (number, optional): target tab (alias tabId; default active tab)
+- frameId / frame_url / frame_name (optional): target iframe
+- NOTE: frame params resolve to real Chrome frame ids (page_read action=frames lists them); unresolved frames fail loudly
+- target (object, optional): css | text | role | name | label | placeholder | testId
+- limit / compact / include_hidden / max_tokens / cursor (optional)
+- name (attr action), timeout_ms, mode`,
   },
   {
     name: "page_act",
     group: "page-interaction",
     description: "Interact with or mutate the page. Action discriminator. Most actions go through CDP `Input.*` (CSP-immune).",
     actions: PAGE_ACT_ACTIONS,
+    params: `- browser_id or browser_name (one required)
+- tab_id (number, optional): target tab (alias tabId; default active tab)
+- frameId / frame_url / frame_name (optional): target iframe
+- NOTE: in subframes, click/dblclick/hover/type/fill/press use synthetic events (world isolated); click_at/dblclick_at/hover_at/visual_click/wheel are top-frame only
+- target / anchor / value / checked / key / keys / direction / amount / timeout_ms / condition / text / fields (action-specific)
+- mode`,
   },
   {
     name: "page_js",
     group: "page-interaction",
     description: "Execute JavaScript on the page via CDP `Runtime.evaluate` (gated escape hatch — CSP-immune).",
     params: `- code (string, required): JavaScript to evaluate
+- tab_id (number, optional): target tab (alias tabId; default active tab)
+- frameId / frame_url / frame_name (optional): target iframe
+- NOTE: subframes evaluate through CDP in a frame-scoped isolated world (DOM access only; no page JS globals)
 - timeout_ms (number, optional): Max wait (default 120000)`,
   },
   {
@@ -119,7 +141,9 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     description: "Raw CDP passthrough (any method, e.g. Input.dispatchKeyEvent) — power tool, gated like page_js via page.execute.",
     params: `- method (string, required): CDP method, e.g. Input.dispatchKeyEvent
 - params (record, optional): CDP method params as key-value pairs
-- timeout_ms (number, optional): Max wait (default 120000)`,
+- tab_id (number, optional): target tab (alias tabId; default active tab)
+- timeout_ms (number, optional): Max wait (default 120000)
+- NOTE: the debugger session is tab-scoped — browser-level methods (Target.*) are not available; use tab_id to pick the tab instead`,
   },
   {
     name: "cookies",
@@ -145,6 +169,7 @@ const MCP_TOOL_CATALOG: McpToolEntry[] = [
     actions: ["ws_list", "ws_send", "ws_tail", "http_observe", "http_block", "http_rules", "http_unblock"],
     params: `- browser_id or browser_name (one required)
 - action (string, required): ws_list | ws_send | ws_tail | http_observe | http_block | http_rules | http_unblock
+- tab_id (number, optional): target tab (alias tabId; default active tab)
 - hook_id|socket_id (ws_send, ws_tail): hook from ws_list
 - data (ws_send, string): frame bytes to inject via the page's own socket.send()
 - pattern (http_observe, http_block): substring or *-wildcard URL match
@@ -521,7 +546,7 @@ function permissionTable(): string {
   return [
     "| Group | Default | Tools |",
     "|---|---|---|",
-    "| `tabs` | `allow` | list, navigate, goBack, goForward, close, update |",
+    "| `tabs` | `allow` | list, create, navigate, goBack, goForward, activate, update, close |",
     "| `page.read` | `allow` | inspect, content, text, html, attr, meta, forms, count, select, summary, readable, full_html |",
     "| `page.act` | `ask` | click, fill, check, select_option, press, scroll, submit, type, click_at, dblclick_at, hover_at, … |",
     "| `page.execute` | `deny` | page.js (gated escape hatch), page_cdp (raw CDP passthrough) |",

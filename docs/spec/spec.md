@@ -452,16 +452,21 @@ Boxes are 2px-stroked, color-coded by tag (button=blue, input/textarea=green, li
 
 | Property | Value |
 |---|---|
-| Description | List and navigate browser tabs. Use `action` to choose the operation. |
-| Input | `{ browser_id: string, action: "list" | "navigate" | "goBack" | "goForward" | "close", url?: string, tab_id?: number, limit?: number, offset?: number, wait_until?: string, timeout_ms?: number, snapshot?: boolean }` |
-| Output | Tab list for `list`, navigation result for `navigate`/`goBack`/`goForward`, confirmation for `close` |
+| Description | List, create, navigate, activate, update, and close browser tabs. Use `action` to choose the operation. |
+| Input | `{ browser_id: string, action: "list" | "create" | "navigate" | "goBack" | "goForward" | "activate" | "update" | "close", url?: string, tab_id?: number, tabId?: number, active?: boolean, limit?: number, offset?: number, wait_until?: string, timeout_ms?: number, snapshot?: boolean }` |
+| Output | Tab list for `list`, tab details for `create`/`navigate`/`goBack`/`goForward`/`activate`/`update`, confirmation for `close` |
 
 **Actions:**
 - `list` — List all open tabs, with optional `limit` (default 100) and `offset` (default 0)
-- `navigate` — Navigate to a URL. If `tab_id` is provided, navigates an existing tab in-place; otherwise creates a new tab. `wait_until` controls load timing (`none`, `domcontentloaded`, `complete`; default `complete`). `snapshot: true` runs a compact inspect after navigation.
+- `create` — Open a new tab (`url`, `active`)
+- `navigate` — Navigate to a URL. If `tab_id` is provided, navigates an existing tab in-place; otherwise creates a new tab. `wait_until` controls load timing (`none`, `domcontentloaded`, `complete`; default `complete`). `snapshot: true` runs a compact inspect after navigation. `active` defaults to `true`.
 - `goBack` — Navigate back in tab history
 - `goForward` — Navigate forward in tab history
+- `activate` — Focus an existing tab (`tab_id` required)
+- `update` — Change a tab's URL and/or focus state (`tab_id`, `url`, `active`; at least one of `url`/`active`)
 - `close` — Close a tab
+
+`tab_id` is canonical; `tabId` is accepted as an alias. Page tools (`page_read`, `page_act`, `page_js`, `page_cdp`) accept the same pair and operate on that tab without focusing it.
 
 This tool consolidates the legacy `browser_navigate` and `browser_list_tabs` tools.
 
@@ -492,8 +497,10 @@ Page Read is the unified tool for extracting information from a loaded page with
 | Property | Value |
 |---|---|
 | Description | Read page content without mutating it. Use `action` to specify what to read. |
-| Input | `{ browser_id: string, action: string, target?: Target, limit?: number, include_hidden?: boolean, name?: string, frameId?: number, frame_url?: string, frame_name?: string, compact?: boolean, timeout_ms?: number, mode?: "sync" \| "async" }` |
+| Input | `{ browser_id: string, action: string, tab_id?: number, tabId?: number, target?: Target, limit?: number, include_hidden?: boolean, name?: string, frameId?: number, frame_url?: string, frame_name?: string, compact?: boolean, timeout_ms?: number, mode?: "sync" \| "async" }` |
 | Output | ActionResult envelope with `data` containing read results |
+
+> **Frame targeting**: `frameId` / `frame_url` / `frame_name` resolve to a real Chrome frame id (the `frames` action returns `{ frameId, parentFrameId, url, name? }`). Reads execute inside that frame's content script; omitting all three reads the top frame. An unresolvable frame fails with `frame not found (…)` instead of silently reading the top frame.
 
 **Read actions:**
 
@@ -663,8 +670,10 @@ Page Act is the unified tool for interacting with or mutating page elements. It 
 | Property | Value |
 |---|---|
 | Description | Interact with or mutate the page. Use `action` to specify what to do. |
-| Input | `{ browser_id: string, action: string, target?: Target, anchor?: string, value?: string, checked?: boolean, key?: string, keys?: string[], direction?: string, amount?: number, timeout_ms?: number, frameId?: number, frame_url?: string, frame_name?: string, mode?: "sync" \| "async", condition?: string, text?: string, delay?: number, file_data?: string, file_name?: string, file_type?: string, x?: number, y?: number, response?: object, fields?: object[] }` |
+| Input | `{ browser_id: string, action: string, tab_id?: number, tabId?: number, target?: Target, anchor?: string, value?: string, checked?: boolean, key?: string, keys?: string[], direction?: string, amount?: number, timeout_ms?: number, frameId?: number, frame_url?: string, frame_name?: string, mode?: "sync" \| "async", condition?: string, text?: string, delay?: number, file_data?: string, file_name?: string, file_type?: string, x?: number, y?: number, response?: object, fields?: object[] }` |
 | Output | ActionResult envelope |
+
+> **Frame targeting**: inside a subframe, click / dblclick / hover / type / fill / press dispatch synthetic events from that frame's content script (`world: "isolated"`); DOM-only actions (check, select_option, submit, scroll, scroll_to, wait_for, fill_form, upload, drag, focus, blur) run directly in the frame. Coordinate actions (`click_at`, `dblclick_at`, `hover_at`, `visual_click`, `wheel`) are top-frame only and reject a non-zero frame. Anchors remember the frame they were inspected in, so `anchor` alone re-targets that frame.
 
 **Target resolution order** (see §2.14 Structured Target for details):
 1. `anchor` (fast path — pre-resolved from inspect)
@@ -875,8 +884,10 @@ Respond to a pending dialog.
 | Property | Value |
 |---|---|
 | Description | Execute arbitrary JavaScript code on the page — gated escape hatch. Use only when `page_read` and `page_act` cannot express the task. |
-| Input | `{ browser_id: string, code: string, frameId?: number, frame_url?: string, frame_name?: string, timeout_ms?: number, mode?: "sync" \| "async" }` |
+| Input | `{ browser_id: string, code: string, tab_id?: number, tabId?: number, frameId?: number, frame_url?: string, frame_name?: string, timeout_ms?: number, mode?: "sync" \| "async" }` |
 | Output | ActionResult envelope with `data.result` containing the return value of the executed code (which must be JSON-serializable) |
+
+> **Frame targeting**: subframes evaluate through CDP in a frame-scoped isolated world (`Page.createIsolatedWorld` + `Runtime.evaluate` with that context id). DOM access works; page JS globals do not — verdict `world: "isolated"`, path `cdp.runtime.evaluate.frame`. The top frame keeps the main-world path (`cdp.runtime.evaluate`). Frame ids are bridged to CDP frame ids by URL; ambiguous duplicate frame URLs fail loudly.
 
 > **Security**: This tool is gated behind the `page.execute` permission group (the old group name is preserved for backward compatibility). It MUST NOT be accessible if `page.execute` is set to `deny` or `ask` (without approval). It is intentionally the highest-risk tool in the system. The MCP tool name is `page_js`; internally it dispatches as tool `page.js` which maps to permission group `page.execute`.
 
@@ -884,18 +895,18 @@ Respond to a pending dialog.
 
 | Property | Value |
 |---|---|
-| Description | Raw CDP passthrough — send any CDP method with arbitrary params on the active tab (e.g. `Input.dispatchKeyEvent` for trusted key input into xterm/canvas). Power tool, gated like `page_js`. No allowlist — any method is forwarded; the caller owns the consequences. |
-| Input | `{ browser_id: string, method: string, params?: Record<string, unknown>, timeout_ms?: number, mode?: "sync" \| "async" }` |
+| Description | Raw CDP passthrough — send any CDP method with arbitrary params on the target tab (default: active tab; e.g. `Input.dispatchKeyEvent` for trusted key input into xterm/canvas). Power tool, gated like `page_js`. No allowlist — any method is forwarded; the caller owns the consequences. |
+| Input | `{ browser_id: string, method: string, params?: Record<string, unknown>, tab_id?: number, tabId?: number, timeout_ms?: number, mode?: "sync" \| "async" }` |
 | Output | `{ method, result }` plus verdict `{ executed: true, world: "cdp", durationMs, path: "cdp.<method>" }` |
 
-> **Security**: Gated behind the `page.execute` permission group exactly like `page_js` (default `deny` → ask-gated in practice). `frameId` is NOT supported — non-zero `frameId` is rejected (top frame / CDP Page-target scope only). Unknown methods surface the CDP protocol error text (`CDP <method> failed: <err>`).
+> **Security**: Gated behind the `page.execute` permission group exactly like `page_js` (default `deny` → ask-gated in practice). `frameId` is NOT supported — non-zero `frameId` is rejected (top frame / CDP Page-target scope only). The debugger session is tab-scoped: browser-level methods such as `Target.getTargets` are unavailable (`-32000 Not allowed`), so choose the tab with `tab_id` instead. Unknown methods surface the CDP protocol error text (`CDP <method> failed: <err>`).
 
 #### 2.8c Tool: `page_net`
 
 | Property | Value |
 |---|---|
 | Description | Observe and drive page network: CDP socket tap (observe any socket from attach onward, no page code) + MAIN-world wrapper hook (page-hook sockets, HTTP observe/block). Power tool, gated like `page_js`. |
-| Input | `{ browser_id: string, action: "ws_list" \| "ws_send" \| "ws_tail" \| "http_observe" \| "http_block" \| "http_rules" \| "http_unblock", tabId?: number, hook_id \| socket_id?: string, data?: string, limit?: number, pattern?: string, id?: string, include_bodies?: boolean, mode?: "sync" \| "async" }` |
+| Input | `{ browser_id: string, action: "ws_list" \| "ws_send" \| "ws_tail" \| "http_observe" \| "http_block" \| "http_rules" \| "http_unblock", tab_id?: number, tabId?: number, hook_id \| socket_id?: string, data?: string, limit?: number, pattern?: string, id?: string, include_bodies?: boolean, mode?: "sync" \| "async" }` |
 | Output | Per-action payload plus verdict `{ executed: true, world: "isolated", durationMs: 0, path: "isolated.pageNetwork" }` (`ws_list` also reports `installed` + per-hook `via`). The unused `network.requests` webRequest case is untouched. |
 
 **Actions:**
@@ -1480,7 +1491,7 @@ These groups control access to browser-level data and operations. They are each 
 
 ##### 5.1.2 Page API Tool Groups
 
-Page tools are organized into five tool families (v2 API). All page tools are implemented under the hood via `chrome.scripting.executeScript` (except `page.cdp`, which goes through `chrome.debugger`), but the permission gate is on the **declared intent** (what the agent asked for), not the implementation mechanism.
+Page tools are organized into five tool families (v2 API). Page tools run through the persistent content script (`chrome.tabs.sendMessage` with an explicit `{frameId}`), except coordinate/CDP actions and `page.cdp`, which go through `chrome.debugger`; frame-targeted `page_js` uses CDP isolated-world contexts. The permission gate is on the **declared intent** (what the agent asked for), not the implementation mechanism.
 
 | Tool (internal) | MCP Tool | Group | Risk | Description |
 |---|---|---|---|---|

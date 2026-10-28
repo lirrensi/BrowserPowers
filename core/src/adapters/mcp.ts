@@ -49,6 +49,22 @@ const targetSchema = z.object({
   testId: z.string().optional(),
 });
 
+/**
+ * Tab targeting for page tools. `tab_id` is canonical (MCP surface),
+ * `tabId` is accepted as an alias because that is what the extension
+ * expects internally — before this existed, zod silently stripped both
+ * and every page call hit whatever tab happened to be active.
+ */
+const tabTargetFields = {
+  tab_id: z.number().int().optional().describe("Target tab ID (default: active tab)"),
+  tabId: z.number().int().optional().describe("Alias for tab_id (default: active tab)"),
+};
+
+/** Pick the requested tab regardless of which alias the caller used. */
+function resolveTabId(input: { tab_id?: number; tabId?: number }): number | undefined {
+  return input.tab_id ?? input.tabId;
+}
+
 // ── Full parameter schemas (used for manual validation after stub passes through) ──
 
 const browsersSchema = z.object({
@@ -89,6 +105,7 @@ const executeBatchSchema = z.object({
 const pageReadSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
+  ...tabTargetFields,
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
@@ -109,6 +126,7 @@ const pageReadSchema = z.object({
 const pageActSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
+  ...tabTargetFields,
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
@@ -155,6 +173,7 @@ const pageActSchema = z.object({
 const pageJsSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
+  ...tabTargetFields,
   frameId: z.number().optional(),
   frame_url: z.string().optional().describe("Target iframe by URL substring match (alternative to frameId)"),
   frame_name: z.string().optional().describe("Target iframe by name attribute (alternative to frameId)"),
@@ -168,6 +187,7 @@ const pageJsSchema = z.object({
 const pageCdpSchema = z.object({
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
+  ...tabTargetFields,
   method: z.string().describe("CDP method, e.g. Input.dispatchKeyEvent"),
   params: z.record(z.string(), z.unknown()).optional().describe("CDP method params as key-value pairs"),
   timeout_ms: z.number().optional(),
@@ -177,11 +197,13 @@ const pageCdpSchema = z.object({
 });
 
 const tabsSchema = z.object({
-  action: z.enum(["list", "navigate", "goBack", "goForward", "close"]),
+  action: z.enum(["list", "create", "navigate", "goBack", "goForward", "activate", "update", "close"]),
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
-  tab_id: z.number().optional(),
+  tab_id: z.number().int().optional().describe("Target tab ID (default: active tab where the action allows it)"),
+  tabId: z.number().int().optional().describe("Alias for tab_id"),
   url: z.string().url().optional(),
+  active: z.boolean().optional().describe("create/update: activate the tab (navigate defaults to true)"),
   wait_until: z.enum(["none", "domcontentloaded", "complete"]).optional(),
   timeout_ms: z.number().optional(),
   snapshot: z.boolean().optional(),
@@ -220,7 +242,7 @@ const pageNetSchema = z.object({
   action: z.enum(["ws_list", "ws_send", "ws_tail", "http_observe", "http_block", "http_rules", "http_unblock"]),
   browser_id: z.string().optional(),
   browser_name: z.string().optional(),
-  tabId: z.number().optional().describe("Target tab (default: active tab)"),
+  ...tabTargetFields,
   hook_id: z.string().optional().describe("WS hook id from ws_list (ws_send, ws_tail)"),
   socket_id: z.string().optional().describe("Alias for hook_id (ws_send, ws_tail)"),
   data: z.string().optional().describe("Frame payload to inject (ws_send)"),
@@ -548,23 +570,29 @@ function generateToolHelpLegacy(toolName: string): string {
     tabs: [
       "## tabs",
       "",
-      "List, navigate, and manipulate browser tabs. Use `action` to choose the operation.",
+      "List, create, navigate, activate, update, and close browser tabs. Use `action` to choose the operation.",
       "",
       "### Common Parameters",
-      "- `action` (enum, required) — Which tab operation: list, navigate, goBack, goForward, close",
+      "- `action` (enum, required) — Which tab operation: list, create, navigate, goBack, goForward, activate, update, close",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
-      "- `tab_id` (number, optional) — Target tab ID (default: active tab for goBack/goForward/close)",
+      "- `tab_id` (number, optional) — Target tab ID (alias: `tabId`; default: active tab where the action allows it)",
       "",
       "### Parameters (list)",
       "- `action` (enum) — `\"list\"` to list all open tabs",
       "- `limit` (number, optional) — Max tabs to return (default 100)",
       "- `offset` (number, optional) — Number of tabs to skip (default 0)",
       "",
+      "### Parameters (create)",
+      "- `action` (enum) — `\"create\"` to open a new tab",
+      "- `url` (string, optional) — URL to open",
+      "- `active` (boolean, optional) — Focus the new tab (Chrome default)",
+      "",
       "### Parameters (navigate)",
       "- `action` (enum) — `\"navigate\"` to navigate to a URL",
       "- `url` (string, required) — The URL to navigate to",
       "- `tab_id` (number, optional) — Navigate an existing tab in-place (default: create new tab)",
+      "- `active` (boolean, optional) — Focus the tab (default true)",
       "- `wait_until` (enum, optional) — Load state to wait for: none, domcontentloaded, complete (default: complete)",
       "- `timeout_ms` (number, optional) — Max wait time in ms (default 30000)",
       "- `snapshot` (boolean, optional) — If true, run compact inspect after navigation and return anchors",
@@ -577,12 +605,22 @@ function generateToolHelpLegacy(toolName: string): string {
       "- `action` (enum) — `\"goForward\"` to navigate forward in tab history",
       "- `tab_id` (number, optional) — Tab to go forward in (default: active tab)",
       "",
+      "### Parameters (activate)",
+      "- `action` (enum) — `\"activate\"` to focus an existing tab",
+      "- `tab_id` (number, required) — Tab to activate",
+      "",
+      "### Parameters (update)",
+      "- `action` (enum) — `\"update\"` to change a tab's URL and/or focus state",
+      "- `tab_id` (number, optional) — Tab to update (default: active tab)",
+      "- `url` (string, optional) — New URL",
+      "- `active` (boolean, optional) — Focus the tab",
+      "",
       "### Parameters (close)",
       "- `action` (enum) — `\"close\"` to close a tab",
       "- `tab_id` (number, optional) — Tab to close (default: active tab)",
       "",
       "### Output",
-      "For list: returns tab list with IDs, URLs, and titles. For navigate/goBack/goForward: returns tabId, direction, and elapsed time. For close: returns confirmation.",
+      "For list: returns tab list with IDs, URLs, and titles. For create/navigate/goBack/goForward/activate/update: returns tab details. For close: returns confirmation.",
     ].join("\n"),
 
     page_read: [
@@ -614,9 +652,11 @@ function generateToolHelpLegacy(toolName: string): string {
       "### Parameters",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
+      "- `tab_id` (number, optional) — Target tab ID (alias: `tabId`; default: active tab)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
       "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
       "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
+      "- NOTE: frame params resolve to real Chrome frame ids (`frames` action lists them); unresolved frames fail loudly",
       "- `action` (enum, required) — What to read: inspect, content, text, html, attr, meta, forms, count, select, summary, generate_selector",
       "- `target` (object, optional) — Structured target describing what to read:",
       "  - `text` (string) — Visible text to match (recommended primary targeting method)",
@@ -700,9 +740,11 @@ function generateToolHelpLegacy(toolName: string): string {
       "### Parameters",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
+      "- `tab_id` (number, optional) — Target tab ID (alias: `tabId`; default: active tab)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
       "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
       "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
+      "- NOTE: subframe click/dblclick/hover/type/fill/press use synthetic events (world isolated); click_at/visual_click/wheel are top-frame only",
       "- `action` (enum, required) — Action to perform: click, fill, check, select_option, press, scroll, submit, wait_for, type, smart_click, fill_form, upload, drag, dblclick, hover, dialog_override, dialog_respond, click_at, dblclick_at, hover_at",
       "- `target` (object, optional) — Element selector: prefer `{ text: \"visible label\" }` for stable targeting",
       "  - `text` (string) — Visible text to match (recommended primary targeting method)",
@@ -745,9 +787,11 @@ function generateToolHelpLegacy(toolName: string): string {
       "### Parameters",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
+      "- `tab_id` (number, optional) — Target tab ID (alias: `tabId`; default: active tab)",
       "- `frameId` (number, optional) — Target frame ID for iframe isolation",
       "- `frame_url` (string, optional) — Target iframe by URL substring match (alternative to frameId)",
       "- `frame_name` (string, optional) — Target iframe by name attribute (alternative to frameId)",
+      "- NOTE: subframes evaluate through CDP in a frame-scoped isolated world (DOM access only; no page JS globals)",
       "- `code` (string, required) — JavaScript code to execute (must return JSON-serializable value)",
       "- `timeout_ms` (number, optional) — Max wait time in ms (default 120000)",
       "",
@@ -797,7 +841,7 @@ function generateToolHelpLegacy(toolName: string): string {
       "- `action` (enum, required) — ws_list, ws_send, ws_tail, http_observe, http_block, http_rules, http_unblock",
       "- `browser_name` (string, optional) — Target browser name (preferred, or use browser_id)",
       "- `browser_id` (string, optional) — Target browser ID (fallback if browser_name unknown)",
-      "- `tabId` (number, optional) — Target tab (default: active tab)",
+      "- `tab_id` (number, optional) — Target tab ID (alias: `tabId`; default: active tab)",
       "- `hook_id`/`socket_id` (string, required for ws_send, ws_tail) — WS hook id from ws_list",
       "- `data` (string, required for ws_send) — Frame payload to inject into the page socket",
       "- `limit` (number, optional) — Max frames/entries (ws_tail default 50, http_observe default 100)",
@@ -1001,7 +1045,8 @@ function buildMcpServer(): McpServer {
     async (args: Record<string, unknown>) => {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("tabs") }] };
       const parsed = tabsSchema.parse(args);
-      const { action, url, wait_until, timeout_ms, snapshot, limit, offset, tab_id } = parsed;
+      const { action, url, wait_until, timeout_ms, snapshot, limit, offset, active } = parsed;
+      const tab_id = resolveTabId(parsed);
       const browser_id = await resolveBrowserId(parsed);
 
       let command: string;
@@ -1014,6 +1059,12 @@ function buildMcpServer(): McpServer {
           if (limit !== undefined) params.limit = limit;
           if (offset !== undefined) params.offset = offset;
           break;
+        case "create":
+          command = "tabs.create";
+          params = {};
+          if (url !== undefined) params.url = url;
+          if (active !== undefined) params.active = active;
+          break;
         case "navigate":
           command = "tabs.navigate";
           params = { url } as Record<string, unknown>;
@@ -1021,6 +1072,7 @@ function buildMcpServer(): McpServer {
           if (wait_until !== undefined) params.wait_until = wait_until;
           if (timeout_ms !== undefined) params.timeout_ms = timeout_ms;
           if (snapshot !== undefined) params.snapshot = snapshot;
+          if (active !== undefined) params.active = active;
           break;
         case "goBack":
           command = "tabs.goBack";
@@ -1031,6 +1083,23 @@ function buildMcpServer(): McpServer {
           command = "tabs.goForward";
           params = {};
           if (tab_id !== undefined) params.tabId = tab_id;
+          break;
+        case "activate":
+          if (tab_id === undefined) {
+            return { content: [{ type: "text" as const, text: "Error: tabs activate requires tab_id — use tabs({ action: \"list\" }) to find it" }], isError: true };
+          }
+          command = "tabs.update";
+          params = { tabId: tab_id, active: true };
+          break;
+        case "update":
+          if (url === undefined && active === undefined) {
+            return { content: [{ type: "text" as const, text: "Error: tabs update requires at least one of url or active" }], isError: true };
+          }
+          command = "tabs.update";
+          params = {};
+          if (tab_id !== undefined) params.tabId = tab_id;
+          if (url !== undefined) params.url = url;
+          if (active !== undefined) params.active = active;
           break;
         case "close":
           command = "tabs.close";
@@ -1104,14 +1173,16 @@ function buildMcpServer(): McpServer {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_read") }] };
       const parsed = pageReadSchema.parse(args);
       const resolvedId = await resolveBrowserId(parsed);
-      const { browser_id: _bid, browser_name: _bn, mode, ...pageParams } = parsed;
+      const { browser_id: _bid, browser_name: _bn, mode, tab_id: _tid, tabId: _tabId, ...pageParams } = parsed;
+      const tabId = resolveTabId(parsed);
+      const toolParams: Record<string, unknown> = tabId === undefined ? pageParams : { ...pageParams, tabId };
 
       if (mode === "async") {
-        const { requestId } = await commandService.executeAsync(resolvedId, "page.read", pageParams);
+        const { requestId } = await commandService.executeAsync(resolvedId, "page.read", toolParams);
         return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
-      const result = await commandService.execute(resolvedId, "page.read", pageParams);
+      const result = await commandService.execute(resolvedId, "page.read", toolParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
@@ -1130,14 +1201,16 @@ function buildMcpServer(): McpServer {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_act") }] };
       const parsed = pageActSchema.parse(args);
       const resolvedId = await resolveBrowserId(parsed);
-      const { browser_id: _bid, browser_name: _bn, mode, ...pageParams } = parsed;
+      const { browser_id: _bid, browser_name: _bn, mode, tab_id: _tid, tabId: _tabId, ...pageParams } = parsed;
+      const tabId = resolveTabId(parsed);
+      const toolParams: Record<string, unknown> = tabId === undefined ? pageParams : { ...pageParams, tabId };
 
       if (mode === "async") {
-        const { requestId } = await commandService.executeAsync(resolvedId, "page.act", pageParams);
+        const { requestId } = await commandService.executeAsync(resolvedId, "page.act", toolParams);
         return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
-      const result = await commandService.execute(resolvedId, "page.act", pageParams);
+      const result = await commandService.execute(resolvedId, "page.act", toolParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
@@ -1156,14 +1229,21 @@ function buildMcpServer(): McpServer {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_js") }] };
       const parsed = pageJsSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { code, timeout_ms, mode } = parsed;
+      const { code, timeout_ms, mode, frameId, frame_url, frame_name } = parsed;
+      const tabId = resolveTabId(parsed);
+      const toolParams: Record<string, unknown> = { code };
+      if (timeout_ms !== undefined) toolParams.timeout_ms = timeout_ms;
+      if (tabId !== undefined) toolParams.tabId = tabId;
+      if (frameId !== undefined) toolParams.frameId = frameId;
+      if (frame_url !== undefined) toolParams.frame_url = frame_url;
+      if (frame_name !== undefined) toolParams.frame_name = frame_name;
 
       if (mode === "async") {
-        const { requestId } = await commandService.executeAsync(browser_id, "page.js", { code, timeout_ms });
+        const { requestId } = await commandService.executeAsync(browser_id, "page.js", toolParams);
         return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
-      const result = await commandService.execute(browser_id, "page.js", { code, timeout_ms });
+      const result = await commandService.execute(browser_id, "page.js", toolParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
@@ -1183,13 +1263,17 @@ function buildMcpServer(): McpServer {
       const parsed = pageCdpSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
       const { method, params, timeout_ms, mode } = parsed;
+      const tabId = resolveTabId(parsed);
+      const toolParams: Record<string, unknown> = { method, params };
+      if (timeout_ms !== undefined) toolParams.timeout_ms = timeout_ms;
+      if (tabId !== undefined) toolParams.tabId = tabId;
 
       if (mode === "async") {
-        const { requestId } = await commandService.executeAsync(browser_id, "page.cdp", { method, params, timeout_ms });
+        const { requestId } = await commandService.executeAsync(browser_id, "page.cdp", toolParams);
         return { content: [{ type: "text" as const, text: `⏳ Queued as ${requestId}. Poll GET /api/results/${requestId} for the result.` }] };
       }
 
-      const result = await commandService.execute(browser_id, "page.cdp", { method, params, timeout_ms });
+      const result = await commandService.execute(browser_id, "page.cdp", toolParams);
       if (!result.success) {
         return { content: [{ type: "text" as const, text: `Error: ${result.error}` }], isError: true };
       }
@@ -1321,7 +1405,8 @@ function buildMcpServer(): McpServer {
       if (args.help) return { content: [{ type: "text" as const, text: generateToolHelp("page_net") }] };
       const parsed = pageNetSchema.parse(args);
       const browser_id = await resolveBrowserId(parsed);
-      const { action, tabId, hook_id, socket_id, data, limit, pattern, id, include_bodies, mode } = parsed;
+      const { action, hook_id, socket_id, data, limit, pattern, id, include_bodies, mode } = parsed;
+      const tabId = resolveTabId(parsed);
 
       const params: Record<string, unknown> = { action };
       if (tabId !== undefined) params.tabId = tabId;

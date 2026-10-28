@@ -256,33 +256,43 @@ export async function routeExecute(req: ExecuteRequest): Promise<ExecuteResult> 
   }
 }
 
-/** Resolve frame_url or frame_name to a numeric frameId by querying the content script. */
+/**
+ * Resolve frame_url / frame_name to a REAL Chrome frameId.
+ *
+ * Frame ids from `chrome.scripting.executeScript({allFrames})` are the same
+ * ids chrome.tabs.sendMessage expects. The old resolver used iframe ordinals
+ * from a content-script listing — those are not frameIds and never worked
+ * once messaging replaced executeScript.
+ */
 async function resolveFrameId(tabId: number, params: Record<string, unknown>): Promise<number | undefined> {
+  const explicit = params.frameId as number | undefined;
   const frameUrl = params.frame_url as string | undefined;
   const frameName = params.frame_name as string | undefined;
-  if (!frameUrl && !frameName) return params.frameId as number | undefined;
+  if (!frameUrl && !frameName) return explicit;
 
+  type FrameProbe = { href?: string; name?: string };
+  let injections: chrome.scripting.InjectionResult<FrameProbe>[] = [];
   try {
-    const response = await chrome.tabs.sendMessage(tabId, {
-      source: "browserpowers",
-      type: "bp:read",
-      action: "frames",
-      params: {},
-    }) as Record<string, unknown>;
-
-    const frames = (response?.frames as Array<Record<string, unknown>>) ?? [];
-    for (const frame of frames) {
-      if (frameUrl && typeof frame.src === "string" && frame.src.includes(frameUrl)) {
-        return frame.index as number;
-      }
-      if (frameName && frame.name === frameName) {
-        return frame.index as number;
-      }
-    }
-    return params.frameId as number | undefined;
-  } catch {
-    return params.frameId as number | undefined;
+    injections = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => ({ href: location.href, name: window.name }),
+    });
+  } catch (err) {
+    throw new Error(`frame resolution failed (cannot enumerate frames): ${(err as Error).message}`);
   }
+
+  for (const injection of injections) {
+    const info = injection.result;
+    if (!info) continue;
+    if (frameUrl && typeof info.href === "string" && info.href.includes(frameUrl)) return injection.frameId;
+    if (frameName && info.name === frameName) return injection.frameId;
+  }
+
+  const available = injections
+    .map((i) => `${i.frameId}:${i.result?.href ?? "?"}${i.result?.name ? ` (name="${i.result.name}")` : ""}`)
+    .join(", ");
+  const wanted = [frameUrl ? `frame_url~"${frameUrl}"` : "", frameName ? `frame_name="${frameName}"` : ""].filter(Boolean).join(" ");
+  throw new Error(`frame not found (${wanted}); frames: ${available || "none"}`);
 }
 
 /** Strip frame_url/frame_name from params (resolved to frameId above, no longer needed downstream). */
@@ -323,12 +333,22 @@ async function execute(
 
     case "page.act": {
       const tabId = (params.tabId as number) ?? (await getActiveTabId());
-      const frameId = await resolveFrameId(tabId, params);
+      let frameId = await resolveFrameId(tabId, params);
       const cleanParams = stripFrameParams(params);
       const actAction = cleanParams.action as string;
 
+      // Anchor fast-path: an anchor remembers the frame it was captured in,
+      // so follow-up actions land in that frame without repeating frame_url.
+      if (frameId === undefined && typeof cleanParams.anchor === "string") {
+        const { getAnchorFrameId } = await import("./v2/anchor-manager.js");
+        frameId = getAnchorFrameId(tabId, cleanParams.anchor);
+      }
+
       // Screenshot-bound point click (single-use capture_id, ORIGINAL PNG coords).
       if (actAction === "visual_click") {
+        if (frameId !== undefined && frameId !== 0) {
+          throw new Error("page.act visual_click uses top-level PNG coordinates and cannot target a subframe; use click with target/anchor inside the frame");
+        }
         const captureId = cleanParams.capture_id as string;
         const imageX = Number(cleanParams.image_x ?? cleanParams.imageX);
         const imageY = Number(cleanParams.image_y ?? cleanParams.imageY);
@@ -645,7 +665,7 @@ async function execute(
         const pngSize = parsePngSize(base64);
         let viewport = { w: pngSize?.w ?? 0, h: pngSize?.h ?? 0, dpr: 1 };
         try {
-          const vp = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:read", action: "viewport", params: {} }) as Record<string, unknown> | undefined;
+          const vp = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:read", action: "viewport", params: {} }, { frameId: 0 }) as Record<string, unknown> | undefined;
           if (vp && typeof vp.width === "number") viewport = { w: vp.width as number, h: vp.height as number, dpr: (vp.dpr as number) || 1 };
         } catch { /* viewport best-effort; mapping falls back to PNG size */ }
         pruneVisualCaptures();

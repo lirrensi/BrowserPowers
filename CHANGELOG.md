@@ -4,6 +4,16 @@ All notable changes to BrowserPowers are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] — 2026-10-28
+
+### Added
+- **Tab targeting on page tools**: `page_read`, `page_act`, `page_js`, `page_cdp`, and `page_net` accept `tab_id` (alias `tabId`) and operate on that tab without focusing it. Previously the MCP schemas dropped the field silently, so every call hit the active tab.
+- **`tabs` actions `create`, `activate`, `update`** (mapped to `tabs.create` / `tabs.update`): focus a tab by ID, change its URL, or open one, instead of navigating a throwaway tab into the foreground.
+
+### Fixed
+- **Iframe targeting actually works**: the frame parameters resolved iframe ordinals, never passed `{frameId}` to `chrome.tabs.sendMessage`, and the content script wasn't injected into subframes. Now: content script runs in all frames, `frame_url`/`frame_name` resolve to real Chrome frame ids (via `chrome.scripting`), reads/DOM actions execute in the addressed frame, anchors remember their frame, and unresolved frames fail loudly. Subframe click/dblclick/hover/type/fill/press use synthetic events (`world: "isolated"`); coordinate actions stay top-frame only. `page_js` in subframes uses `Page.createIsolatedWorld` + `Runtime.evaluate(contextId)` (DOM only, no page JS globals).
+- `tabs` now accepts the `tabId` alias for `tab_id`, matching the extension's internal parameter name.
+
 ## [1.8.0] — 2026-10-05
 
 Human-annotations release: Agentation-style click-clack notes, human-first, proven on real YouTube tabs.

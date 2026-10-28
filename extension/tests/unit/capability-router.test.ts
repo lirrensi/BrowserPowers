@@ -1,10 +1,16 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi, type Mock } from "vitest";
+import type { routeExecute as routeExecuteType } from "../../src/capability-router.js";
 
 describe("capability-router", () => {
-  let routeExecute: typeof import("../../src/capability-router.js").routeExecute;
+  let routeExecute: typeof routeExecuteType;
+  let executeScriptMock: Mock;
+  let tabsSendMessageMock: Mock;
 
   beforeEach(async () => {
     vi.resetModules();
+
+    executeScriptMock = vi.fn().mockResolvedValue([{ result: "hello" }]);
+    tabsSendMessageMock = vi.fn().mockResolvedValue(undefined);
 
     // Ensure chrome mocks are still active
     vi.stubGlobal("chrome", {
@@ -21,12 +27,12 @@ describe("capability-router", () => {
         update: vi.fn().mockResolvedValue({}),
         remove: vi.fn().mockResolvedValue(undefined),
         captureVisibleTab: vi.fn().mockResolvedValue("data:image/png;base64,abc"),
-        sendMessage: vi.fn().mockResolvedValue(undefined),
+        sendMessage: tabsSendMessageMock,
         onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
         onActivated: { addListener: vi.fn() },
       },
       scripting: {
-        executeScript: vi.fn().mockResolvedValue([{ result: "hello" }]),
+        executeScript: executeScriptMock,
       },
       windows: {
         getAll: vi.fn().mockResolvedValue([
@@ -105,6 +111,55 @@ describe("capability-router", () => {
     expect(result.success).toBe(true);
     expect(result.data).toHaveProperty("name", "test");
     expect(result.data).toHaveProperty("value", "val");
+  });
+
+  it("resolves frame_url to a real frameId and targets that frame", async () => {
+    executeScriptMock.mockResolvedValueOnce([
+      { frameId: 0, result: { href: "https://example.com/outer", name: "" } },
+      { frameId: 77, result: { href: "https://example.com/inner", name: "inner" } },
+    ]);
+    tabsSendMessageMock.mockResolvedValueOnce({
+      success: true,
+      anchors: [],
+      documentId: "doc-1",
+      url: "https://example.com/inner",
+      title: "Inner",
+    });
+
+    const { routeExecute } = await import("../../src/capability-router.js");
+    const result = await routeExecute({
+      requestId: "test-frame-1",
+      tool: "page.read",
+      params: { action: "inspect", frame_url: "/inner" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(executeScriptMock).toHaveBeenCalledWith({
+      target: { tabId: 1, allFrames: true },
+      func: expect.any(Function),
+    });
+    expect(tabsSendMessageMock).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ action: "inspect" }),
+      { frameId: 77 },
+    );
+  });
+
+  it("fails loudly when the requested frame is not found", async () => {
+    executeScriptMock.mockResolvedValueOnce([
+      { frameId: 0, result: { href: "https://example.com/outer", name: "" } },
+    ]);
+
+    const { routeExecute } = await import("../../src/capability-router.js");
+    const result = await routeExecute({
+      requestId: "test-frame-2",
+      tool: "page.read",
+      params: { action: "inspect", frame_url: "/missing" },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("frame not found");
+    expect(tabsSendMessageMock).not.toHaveBeenCalled();
   });
 
   it("surfaces ActionResult failure messages instead of a shrug", async () => {

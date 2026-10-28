@@ -26,7 +26,6 @@ import {
   // Target resolution & inspection
   resolveTarget,
   inspectElements,
-  listFrames,
   // Act actions — resolve-and-locate (used by both `bp:act` and `bp:resolve`)
   clickElement,
   fillElement,
@@ -108,6 +107,7 @@ const CONTENT_SCRIPT_REGISTERED_AT = Date.now();
 export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
+  allFrames: true,
   main() {
     // page.net (TSK-0015): MAIN-world WS/HTTP wrapper hook + isolated relay.
     // Runs at document_start so the hook installs before page scripts open sockets.
@@ -235,8 +235,6 @@ async function handleRead(
       return { selectedText: selectText() };
     case "summary":
       return readSummary();
-    case "frames":
-      return { frames: listFrames() };
     case "readable": {
       // Trafilatura-style extraction. Result is the readability shape
       // (title, content, excerpt, length, fallback) — the SW applies the
@@ -400,6 +398,16 @@ async function handleAct(
       const el = await resolveEl();
       if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
       return hoverElement(el, params.anchor as string | undefined);
+    }
+    case "focus": {
+      const el = await resolveEl();
+      if (!el) return { success: false, message: "No matching element found", errorCode: "TARGET_NOT_FOUND" };
+      return focusElementResolve(el, params.anchor as string | undefined);
+    }
+    case "blur": {
+      const active = document.activeElement as HTMLElement | null;
+      try { active?.blur?.(); } catch { /* detached element — nothing to blur */ }
+      return { success: true, message: "Removed focus", executionVerdict: { executed: true, world: "isolated", durationMs: 0, path: "isolated.blur" } };
     }
     case "dialog_override":
       return dialogOverride();

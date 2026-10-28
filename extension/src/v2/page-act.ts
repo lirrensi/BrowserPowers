@@ -111,6 +111,7 @@ async function sendActMessage(
   tabId: number,
   action: string,
   params: Record<string, unknown>,
+  frameId?: number,
 ): Promise<ActionResult> {
   const maxRetries = 3;
   const delays = [1000, 2000, 4000]; // 1s, 2s, 4s exponential backoff
@@ -122,7 +123,7 @@ async function sendActMessage(
         type: "bp:act",
         action,
         params,
-      }) as Record<string, unknown>;
+      }, { frameId: frameId ?? 0 }) as Record<string, unknown>;
 
       if (!response) {
         return blocked(action, "No response from content script", {
@@ -253,6 +254,13 @@ async function click(params: Record<string, unknown>, tabId: number, frameId?: n
     return notPerformed("click", "No target or anchor provided");
   }
 
+  // Subframes: CDP Input coordinates are tab-viewport-relative, but the
+  // element's rect is frame-relative. Use the frame's synthetic-event
+  // dispatcher and report world:"isolated" — never misclick.
+  if (frameId !== undefined && frameId !== 0) {
+    return sendFallback(tabId, "click", "bp:fallback-click", resolved as Record<string, unknown>, frameId);
+  }
+
   return await dispatchClickViaCdp(resolved as Record<string, unknown>, tabId, { clickCount: 1 });
 }
 
@@ -275,6 +283,9 @@ async function fill(params: Record<string, unknown>, tabId: number, frameId?: nu
 
   const actParams = resolved as Record<string, unknown>;
   actParams.value = value;
+  if (frameId !== undefined && frameId !== 0) {
+    return sendFallback(tabId, "fill", "bp:fallback-fill", actParams, frameId);
+  }
   return await dispatchFillViaCdp(actParams, tabId, value);
 }
 
@@ -297,7 +308,7 @@ async function check(params: Record<string, unknown>, tabId: number, frameId?: n
 
   const actParams = resolved as Record<string, unknown>;
   if (checked !== undefined) actParams.checked = checked;
-  return sendActMessage(tabId, "check", actParams);
+  return sendActMessage(tabId, "check", actParams, frameId);
 }
 
 async function selectOption(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -319,7 +330,7 @@ async function selectOption(params: Record<string, unknown>, tabId: number, fram
   const actParams = resolved as Record<string, unknown>;
   actParams.value = params.value;
   actParams.label = params.label;
-  return sendActMessage(tabId, "select_option", actParams);
+  return sendActMessage(tabId, "select_option", actParams, frameId);
 }
 
 async function press(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -357,6 +368,15 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
 
   if (!activeKey) {
     return notPerformed("press", "No key provided (use 'key' or 'keys')");
+  }
+
+  // Subframes: dispatch a synthetic KeyboardEvent inside the frame. Global
+  // (targetless) key dispatch is intentionally top-frame only.
+  if (frameId !== undefined && frameId !== 0) {
+    if (resolved === "NONE") {
+      return notPerformed("press", "press inside a frame requires target/anchor (global key dispatch is top-frame only)");
+    }
+    return sendActMessage(tabId, "press", { ...(resolved as Record<string, unknown>), key, keys }, frameId);
   }
 
   // CDP path: focus the target first (if we have one), then dispatchKeyEvent.
@@ -398,7 +418,7 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
     // CDP attach failed — fall through to the CS synthetic event path.
     actParams.key = key;
     actParams.keys = keys;
-    return markPressFallback(await sendActMessage(tabId, "press", actParams), activeKey, attach.error);
+    return markPressFallback(await sendActMessage(tabId, "press", actParams, frameId), activeKey, attach.error);
   }
 
   // No target — global press (e.g. page-level Escape). Try CDP first.
@@ -419,7 +439,7 @@ async function press(params: Record<string, unknown>, tabId: number, frameId?: n
     }
   }
   // CDP attach failed (or no target) — fall back to CS synthetic event.
-  return markPressFallback(await sendActMessage(tabId, "press", { key, keys }), activeKey, attach.error);
+  return markPressFallback(await sendActMessage(tabId, "press", { key, keys }, frameId), activeKey, attach.error);
 }
 
 /**
@@ -460,8 +480,9 @@ async function sendActFallbackPress(
   key: string | undefined,
   keys: string[] | undefined,
   cdpError: string | undefined,
+  frameId?: number,
 ): Promise<ActionResult> {
-  const csResult = await sendActMessage(tabId, "press", { ...actParams, key, keys });
+  const csResult = await sendActMessage(tabId, "press", { ...actParams, key, keys }, frameId);
   const fallbackKey = keys && keys.length > 0 ? keys[keys.length - 1] : key;
   return markPressFallback(csResult, fallbackKey, cdpError);
 }
@@ -477,7 +498,7 @@ async function scrollAction(params: Record<string, unknown>, tabId: number, fram
     return scrollToAction({ ...params, direction: "to_element" }, tabId, frameId);
   }
 
-  return sendActMessage(tabId, "scroll", { direction, amount });
+  return sendActMessage(tabId, "scroll", { direction, amount }, frameId);
 }
 
 /**
@@ -501,9 +522,11 @@ async function scrollToAction(params: Record<string, unknown>, tabId: number, fr
   }
   const actParams = resolved as Record<string, unknown>;
   actParams.direction = "to_element";
-  const res = await sendActMessage(tabId, "scroll", actParams);
+  const res = await sendActMessage(tabId, "scroll", actParams, frameId);
   if (!res.success) return { ...res, action: "scroll_to" };
   // Attach visible bounds via resolve (center + elementInfo) for caller geometry.
+  // Frame-relative coords would be misleading, so geometry stays top-frame only.
+  if (frameId !== undefined && frameId !== 0) return { ...res, action: "scroll_to", evidence: { ...(res.evidence ?? {}), note: "frame-relative scroll; visible_bounds omitted for subframes" } };
   try {
     const geom = await sendResolve(tabId, "click", resolved as Record<string, unknown>);
     if (geom.ok && geom.coords) {
@@ -524,6 +547,9 @@ async function scrollToAction(params: Record<string, unknown>, tabId: number, fr
  * Returns echoed input (not guaranteed scroll distance — page may preventDefault).
  */
 async function wheelAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  if (frameId !== undefined && frameId !== 0) {
+    return notPerformed("wheel", "wheel is CDP/top-frame only (Input.dispatchMouseEvent); inside a frame use scroll or scroll_to with a target");
+  }
   const deltaX = Number(params.delta_x ?? params.deltaX ?? 0) || 0;
   const deltaY = Number(params.delta_y ?? params.deltaY ?? 0) || 0;
   if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY) || (deltaX === 0 && deltaY === 0)) {
@@ -567,6 +593,15 @@ async function focusAction(params: Record<string, unknown>, tabId: number, frame
   const resolved = resolveTargetParams(tabId, target, anchor);
   if (resolved === "STALE") return blocked("focus", `Anchor ${anchor} is no longer valid`, { errorCode: "ANCHOR_STALE", recoverable: true });
   if (resolved === "NONE") return notPerformed("focus", "No target or anchor provided");
+  // Subframes: focus via the frame's content script (isolated world).
+  if (frameId !== undefined && frameId !== 0) {
+    const frameResolve = await sendResolve(tabId, "focus", resolved as Record<string, unknown>, frameId);
+    if (!frameResolve.ok) return frameResolve.result;
+    return performed("focus", "Focused element in frame (isolated world)", {
+      evidence: { coords: frameResolve.coords },
+      executionVerdict: { executed: true, world: "isolated", durationMs: frameResolve.resolveVerdict?.durationMs ?? 0, path: "isolated.focus" },
+    });
+  }
   const r = await sendResolve(tabId, "focus", resolved as Record<string, unknown>);
   if (!r.ok) return r.result;
   if (!r.jsExpression) return blocked("focus", "Resolve did not return jsExpression", { errorCode: "RESOLVE_NO_EXPRESSION", recoverable: true });
@@ -576,6 +611,9 @@ async function focusAction(params: Record<string, unknown>, tabId: number, frame
 }
 
 async function blurAction(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  if (frameId !== undefined && frameId !== 0) {
+    return sendActMessage(tabId, "blur", {}, frameId);
+  }
   // Blur whatever is focused; target optional (if given, focus-check after blur).
   const target = params.target as Target | undefined;
   const anchor = params.anchor as string | undefined;
@@ -603,7 +641,7 @@ async function submit(params: Record<string, unknown>, tabId: number, frameId?: 
     return notPerformed("submit", "No target or anchor provided");
   }
 
-  return sendActMessage(tabId, "submit", resolved as Record<string, unknown>);
+  return sendActMessage(tabId, "submit", resolved as Record<string, unknown>, frameId);
 }
 
 async function waitFor(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
@@ -637,13 +675,13 @@ async function waitFor(params: Record<string, unknown>, tabId: number, frameId?:
   // network_idle, function: send to content script
   if (condition === "network_idle") {
     const idleMs = (params.idle_ms as number) ?? 500;
-    return sendActMessage(tabId, "wait_for", { condition: "network_idle", idle_ms: idleMs, timeout_ms: timeout });
+    return sendActMessage(tabId, "wait_for", { condition: "network_idle", idle_ms: idleMs, timeout_ms: timeout }, frameId);
   }
 
   if (condition === "function") {
     const expression = params.expression as string;
     if (!expression) return notPerformed("wait_for", "Function condition requires 'expression' parameter");
-    return sendActMessage(tabId, "wait_for", { condition: "function", expression, timeout_ms: timeout, poll_interval_ms: pollingInterval });
+    return sendActMessage(tabId, "wait_for", { condition: "function", expression, timeout_ms: timeout, poll_interval_ms: pollingInterval }, frameId);
   }
 
   // Element conditions (exists, visible, hidden, enabled, disabled, stable)
@@ -662,7 +700,7 @@ async function waitFor(params: Record<string, unknown>, tabId: number, frameId?:
     actParams.condition = condition;
     actParams.timeout_ms = timeout;
     actParams.poll_interval_ms = pollingInterval;
-    return sendActMessage(tabId, "wait_for", actParams);
+    return sendActMessage(tabId, "wait_for", actParams, frameId);
   }
 
   // No selector or target: just wait
@@ -748,6 +786,9 @@ async function typeAction(params: Record<string, unknown>, tabId: number, frameI
   const actParams = resolved as Record<string, unknown>;
   actParams.text = text;
   actParams.delay = delay;
+  if (frameId !== undefined && frameId !== 0) {
+    return sendFallback(tabId, "type", "bp:fallback-type", actParams, frameId);
+  }
   return await dispatchTypeViaCdp(actParams, tabId, text, delay);
 }
 
@@ -787,7 +828,7 @@ async function uploadAction(params: Record<string, unknown>, tabId: number, fram
   actParams.file_data = params.file_data;
   actParams.file_name = params.file_name;
   actParams.file_type = params.file_type;
-  const res = await sendActMessage(tabId, "upload", actParams);
+  const res = await sendActMessage(tabId, "upload", actParams, frameId);
   // effect_state: committed (success) | none (not performed) | unknown (blocked/ambiguous — may have happened, don't blind retry).
   const effect = res.status === "performed" || res.status === "already_in_desired_state" ? "committed" : res.status === "not_performed" ? "none" : "unknown";
   return {
@@ -818,7 +859,7 @@ async function dragAction(params: Record<string, unknown>, tabId: number, frameI
   const actParams = resolved as Record<string, unknown>;
   if (params.x !== undefined) actParams.x = params.x;
   if (params.y !== undefined) actParams.y = params.y;
-  return sendActMessage(tabId, "drag", actParams);
+  return sendActMessage(tabId, "drag", actParams, frameId);
 }
 
 // ── Double-click action ──
@@ -837,6 +878,10 @@ async function dblclickAction(params: Record<string, unknown>, tabId: number, fr
   }
   if (resolved === "NONE") {
     return notPerformed("dblclick", "No target or anchor provided");
+  }
+
+  if (frameId !== undefined && frameId !== 0) {
+    return sendFallback(tabId, "dblclick", "bp:fallback-dblclick", resolved as Record<string, unknown>, frameId);
   }
 
   return await dispatchClickViaCdp(resolved as Record<string, unknown>, tabId, { clickCount: 2, dblclick: true });
@@ -860,6 +905,10 @@ async function hoverAction(params: Record<string, unknown>, tabId: number, frame
     return notPerformed("hover", "No target or anchor provided");
   }
 
+  if (frameId !== undefined && frameId !== 0) {
+    return sendFallback(tabId, "hover", "bp:fallback-hover", resolved as Record<string, unknown>, frameId);
+  }
+
   return await dispatchHoverViaCdp(resolved as Record<string, unknown>, tabId);
 }
 
@@ -876,7 +925,11 @@ async function actAtCoords(
   action: "click_at" | "dblclick_at" | "hover_at",
   params: Record<string, unknown>,
   tabId: number,
+  frameId?: number,
 ): Promise<ActionResult> {
+  if (frameId !== undefined && frameId !== 0) {
+    return notPerformed(action, `${action} uses literal top-level viewport coordinates and cannot target a subframe; use click/hover with target or anchor inside the frame`);
+  }
   const x = params.x as number | undefined;
   const y = params.y as number | undefined;
   if (typeof x !== "number" || typeof y !== "number") {
@@ -995,28 +1048,28 @@ async function actAtCoords(
   });
 }
 
-async function clickAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
-  return actAtCoords("click_at", params, tabId);
+async function clickAt(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  return actAtCoords("click_at", params, tabId, frameId);
 }
 
-async function dblclickAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
-  return actAtCoords("dblclick_at", params, tabId);
+async function dblclickAt(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  return actAtCoords("dblclick_at", params, tabId, frameId);
 }
 
-async function hoverAt(params: Record<string, unknown>, tabId: number, _frameId?: number): Promise<ActionResult> {
-  return actAtCoords("hover_at", params, tabId);
+async function hoverAt(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
+  return actAtCoords("hover_at", params, tabId, frameId);
 }
 
 // ── Dialog actions ──
 
 async function dialogOverride(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
-  return sendActMessage(tabId, "dialog_override", {});
+  return sendActMessage(tabId, "dialog_override", {}, frameId);
 }
 
 async function dialogRespond(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
   return sendActMessage(tabId, "dialog_respond", {
     response: params.response as Record<string, unknown> | undefined,
-  });
+  }, frameId);
 }
 
 // ── fill_form: batch fill multiple form fields ──
@@ -1053,7 +1106,7 @@ async function fillForm(params: Record<string, unknown>, tabId: number, frameId?
     value: (r as { selector: string; value: string }).value,
   }));
 
-  return sendActMessage(tabId, "fill_form", { fields: selectorsAndValues });
+  return sendActMessage(tabId, "fill_form", { fields: selectorsAndValues }, frameId);
 }
 
 // ── CDP dispatch helpers (resolve → CDP → fallback) ──
@@ -1068,8 +1121,9 @@ async function sendResolve(
   tabId: number,
   action: "click" | "dblclick" | "hover" | "type" | "fill" | "focus",
   params: Record<string, unknown>,
+  frameId?: number,
 ): Promise<{ ok: true; coords?: { x: number; y: number }; jsExpression?: string; text?: string; delay?: number; value?: string; elementInfo?: Record<string, unknown>; resolveVerdict?: ExecutionVerdict } | { ok: false; result: ActionResult }> {
-  const response = await sendMessageRaw(tabId, "bp:resolve", { ...params, action });
+  const response = await sendMessageRaw(tabId, "bp:resolve", { ...params, action }, frameId);
   if (!response) {
     return { ok: false, result: blocked(action, "No response from content script", { errorCode: "CONTENT_SCRIPT_NOT_READY", recoverable: true }) };
   }
@@ -1106,8 +1160,9 @@ async function sendFallback(
   action: "click" | "dblclick" | "hover" | "type" | "fill",
   type: "bp:fallback-click" | "bp:fallback-dblclick" | "bp:fallback-hover" | "bp:fallback-type" | "bp:fallback-fill",
   params: Record<string, unknown>,
+  frameId?: number,
 ): Promise<ActionResult> {
-  const response = await sendMessageRaw(tabId, type, params);
+  const response = await sendMessageRaw(tabId, type, params, frameId);
   if (!response) {
     return blocked(action, "No response from content script (fallback)", { errorCode: "CONTENT_SCRIPT_NOT_READY", recoverable: true });
   }
@@ -1138,6 +1193,7 @@ async function sendMessageRaw(
   tabId: number,
   type: string,
   params: Record<string, unknown>,
+  frameId?: number,
 ): Promise<Record<string, unknown> | null> {
   const maxRetries = 3;
   const delays = [1000, 2000, 4000];
@@ -1147,7 +1203,7 @@ async function sendMessageRaw(
         source: "browserpowers",
         type,
         params,
-      } as any) as Record<string, unknown>;
+      }, { frameId: frameId ?? 0 }) as Record<string, unknown>;
       return response ?? null;
     } catch (err) {
       const msg = (err as Error).message || String(err);
@@ -1187,9 +1243,10 @@ async function dispatchClickViaCdp(
   resolveParams: Record<string, unknown>,
   tabId: number,
   opts: { clickCount: number; dblclick?: boolean },
+  frameId?: number,
 ): Promise<ActionResult> {
   const action: "click" | "dblclick" = opts.dblclick ? "dblclick" : "click";
-  const resolve = await sendResolve(tabId, action, resolveParams);
+  const resolve = await sendResolve(tabId, action, resolveParams, frameId);
   if (!resolve.ok) return resolve.result;
 
   const coords = resolve.coords;
@@ -1204,7 +1261,7 @@ async function dispatchClickViaCdp(
   // Lazy-attach. ensureAttached is idempotent and safe to call early.
   const attach = await ensureAttached(tabId, `input.${action}`);
   if (!attach.attached) {
-    const fallback = await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", resolveParams);
+    const fallback = await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", resolveParams, frameId);
     if (fallback.success) {
       return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
     }
@@ -1222,14 +1279,14 @@ async function dispatchClickViaCdp(
     clickCount: firstClickCount,
   });
   if (!down.ok) {
-    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: down.error });
+    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: down.error }, frameId);
   }
   const up = await dispatchMouseEvent(tabId, "mouseReleased", coords.x, coords.y, {
     button: "left",
     clickCount: firstClickCount,
   });
   if (!up.ok) {
-    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: up.error });
+    return await sendFallback(tabId, action, opts.dblclick ? "bp:fallback-dblclick" : "bp:fallback-click", { ...resolveParams, _cdpAttachError: up.error }, frameId);
   }
   if (opts.dblclick) {
     // Playwright dblclick: a second press/release pair right after, same coords.
@@ -1240,14 +1297,14 @@ async function dispatchClickViaCdp(
       clickCount: secondClickCount,
     });
     if (!down2.ok) {
-      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: down2.error });
+      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: down2.error }, frameId);
     }
     const up2 = await dispatchMouseEvent(tabId, "mouseReleased", coords.x, coords.y, {
       button: "left",
       clickCount: secondClickCount,
     });
     if (!up2.ok) {
-      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: up2.error });
+      return await sendFallback(tabId, action, "bp:fallback-dblclick", { ...resolveParams, _cdpAttachError: up2.error }, frameId);
     }
     // Sum all CDP dispatch durations — dblclick includes the second
     // press/release pair; click is just the first pair.
@@ -1286,8 +1343,9 @@ async function dispatchClickViaCdp(
 async function dispatchHoverViaCdp(
   resolveParams: Record<string, unknown>,
   tabId: number,
+  frameId?: number,
 ): Promise<ActionResult> {
-  const resolve = await sendResolve(tabId, "hover", resolveParams);
+  const resolve = await sendResolve(tabId, "hover", resolveParams, frameId);
   if (!resolve.ok) return resolve.result;
 
   const coords = resolve.coords;
@@ -1301,7 +1359,7 @@ async function dispatchHoverViaCdp(
 
   const attach = await ensureAttached(tabId, "input.hover");
   if (!attach.attached) {
-    const fallback = await sendFallback(tabId, "hover", "bp:fallback-hover", resolveParams);
+    const fallback = await sendFallback(tabId, "hover", "bp:fallback-hover", resolveParams, frameId);
     if (fallback.success) {
       return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
     }
@@ -1310,7 +1368,7 @@ async function dispatchHoverViaCdp(
 
   const moved = await dispatchMouseEvent(tabId, "mouseMoved", coords.x, coords.y);
   if (!moved.ok) {
-    return await sendFallback(tabId, "hover", "bp:fallback-hover", { ...resolveParams, _cdpAttachError: moved.error });
+    return await sendFallback(tabId, "hover", "bp:fallback-hover", { ...resolveParams, _cdpAttachError: moved.error }, frameId);
   }
 
   return performed("hover", `Hovered at (${Math.round(coords.x)}, ${Math.round(coords.y)}) via CDP`, {
@@ -1334,8 +1392,9 @@ async function dispatchTypeViaCdp(
   tabId: number,
   text: string,
   delay: number,
+  frameId?: number,
 ): Promise<ActionResult> {
-  const resolve = await sendResolve(tabId, "type", resolveParams);
+  const resolve = await sendResolve(tabId, "type", resolveParams, frameId);
   if (!resolve.ok) return resolve.result;
 
   const jsExpression = resolve.jsExpression;
@@ -1349,7 +1408,7 @@ async function dispatchTypeViaCdp(
 
   const attach = await ensureAttached(tabId, "input.type");
   if (!attach.attached) {
-    const fallback = await sendFallback(tabId, "type", "bp:fallback-type", resolveParams);
+    const fallback = await sendFallback(tabId, "type", "bp:fallback-type", resolveParams, frameId);
     if (fallback.success) {
       return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
     }
@@ -1363,11 +1422,11 @@ async function dispatchTypeViaCdp(
   // typing in the isolated world.
   const focus = await focusElement(tabId, jsExpression);
   if (!focus.ok) {
-    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpFocusError: focus.error });
+    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpFocusError: focus.error }, frameId);
   }
   const inserted = await insertText(tabId, text);
   if (!inserted.ok) {
-    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpAttachError: inserted.error });
+    return await sendFallback(tabId, "type", "bp:fallback-type", { ...resolveParams, _cdpAttachError: inserted.error }, frameId);
   }
 
   const totalDurationMs = (focus.durationMs || 0) + (inserted.durationMs || 0);
@@ -1393,8 +1452,9 @@ async function dispatchFillViaCdp(
   resolveParams: Record<string, unknown>,
   tabId: number,
   value: string | undefined,
+  frameId?: number,
 ): Promise<ActionResult> {
-  const resolve = await sendResolve(tabId, "fill", resolveParams);
+  const resolve = await sendResolve(tabId, "fill", resolveParams, frameId);
   if (!resolve.ok) return resolve.result;
 
   const jsExpression = resolve.jsExpression;
@@ -1411,7 +1471,7 @@ async function dispatchFillViaCdp(
 
   const attach = await ensureAttached(tabId, "input.fill");
   if (!attach.attached) {
-    const fallback = await sendFallback(tabId, "fill", "bp:fallback-fill", resolveParams);
+    const fallback = await sendFallback(tabId, "fill", "bp:fallback-fill", resolveParams, frameId);
     if (fallback.success) {
       return { ...fallback, data: { ...(fallback.data || {}), _cdpAttachError: attach.error } };
     }
@@ -1420,7 +1480,7 @@ async function dispatchFillViaCdp(
 
   const set = await setElementValue(tabId, jsExpression, value);
   if (!set.ok) {
-    return await sendFallback(tabId, "fill", "bp:fallback-fill", { ...resolveParams, _cdpAttachError: set.error });
+    return await sendFallback(tabId, "fill", "bp:fallback-fill", { ...resolveParams, _cdpAttachError: set.error }, frameId);
   }
 
   // Honest fill verification: formatting (masks, trimming, maxLength) may still

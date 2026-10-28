@@ -173,7 +173,7 @@ Model Context Protocol server using streamable HTTP transport:
 **Browser-level tools** (16 tools total):
 - `browsers` — list connected browsers (replaces `browser_list`)
 - `screenshot` — capture screenshot (replaces `browser_screenshot`)
-- `tabs` — list, navigate, goBack, goForward, close tabs (replaces `browser_navigate`, `browser_list_tabs`)
+- `tabs` — list, create, navigate, goBack, goForward, activate, update, close tabs (replaces `browser_navigate`, `browser_list_tabs`)
 - `execute_all` — execute tool on all browsers (replaces `browser_execute_all`)
 - `execute_batch` — execute multiple tools across browsers in parallel
 

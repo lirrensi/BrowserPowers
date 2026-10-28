@@ -17,6 +17,15 @@ not install the extension. Never extract credentials, cookies, tokens, or other 
 Dedicated automation browser model: the user does NOT use the browser being automated.
 Treat it as viewpoint-and-walk-away — no borrowing user tabs, no stealing focus unless needed.
 
+Multiple tabs? Page tools take `tab_id` (alias `tabId`) and operate on that tab without
+focusing it: `tabs({ action: "list" })` → `page_read({ action: "inspect", tab_id })`.
+Use `tabs({ action: "activate", tab_id })` only when the user must see the tab.
+
+Iframes? Pass `frame_url` / `frame_name` (or a real `frameId` from
+`page_read({ action: "frames" })`). Reads and DOM actions run inside the frame;
+click/type/fill/press in a frame are synthetic events (verdict `world: "isolated"`).
+Coordinate actions (`click_at`, `wheel`, `visual_click`) are top-frame only.
+
 ## Before starting
 
 1. `browsers` — find a connected browser. Prefer NAME, fall back to ID. Empty = extension not connected.

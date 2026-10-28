@@ -92,9 +92,10 @@ async function sendReadMessage(
   tabId: number,
   action: string,
   params: Record<string, unknown>,
+  frameId?: number,
 ): Promise<Record<string, unknown> | undefined> {
   const maxRetries = 3;
-  const delays = [1000, 2000, 4000]; // 1s, 2s, 4s exponential backoff
+  const delays = [1000, 2000, 4000];
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -103,7 +104,7 @@ async function sendReadMessage(
         type: "bp:read",
         action,
         params,
-      }) as Record<string, unknown>;
+      }, { frameId: frameId ?? 0 }) as Record<string, unknown>;
       return response;
     } catch (err) {
       if (attempt < maxRetries) {
@@ -134,7 +135,7 @@ async function inspect(params: Record<string, unknown>, tabId: number, frameId?:
   const maxTokens = (params.max_tokens as number) | 0;
 
   try {
-    const data = await sendReadMessage(tabId, "inspect", { limit: 200, includeHidden, compact });
+    const data = await sendReadMessage(tabId, "inspect", { limit: 200, includeHidden, compact }, frameId);
     if (!data) {
       return blocked("inspect", "Content script not available — page may not be loaded", {
         errorCode: "CONTENT_SCRIPT_NOT_READY",
@@ -159,6 +160,7 @@ async function inspect(params: Record<string, unknown>, tabId: number, frameId?:
           target,
           selector: (a.selector as string) || target?.css || `[unresolvable:${a.anchor as string}]`,
           shadowPath,
+          frameId: frameId ?? 0,
         };
       });
       setAnchors(tabId, data.documentId as string, anchorEntries);
@@ -231,7 +233,7 @@ async function content(params: Record<string, unknown>, tabId: number, frameId?:
   const target = params.target as Target | undefined;
 
   try {
-    const data = await sendReadMessage(tabId, "content", { target: target ?? null });
+    const data = await sendReadMessage(tabId, "content", { target: target ?? null }, frameId);
     if (!data) return contentScriptNotReady("content");
 
     const contentText = data.content as string | undefined;
@@ -253,7 +255,7 @@ async function text(params: Record<string, unknown>, tabId: number, frameId?: nu
   const limit = (params.limit as number) ?? 50;
 
   try {
-    const data = await sendReadMessage(tabId, "text", { target: { css: selector }, limit });
+    const data = await sendReadMessage(tabId, "text", { target: { css: selector }, limit }, frameId);
     if (!data) return contentScriptNotReady("text");
 
     const texts = (data.texts as string[]) || [];
@@ -275,7 +277,7 @@ async function html(params: Record<string, unknown>, tabId: number, frameId?: nu
   if (!target?.css) return notPerformed("html", "CSS selector required for html action");
 
   try {
-    const data = await sendReadMessage(tabId, "html", { target: { css: target.css }, limit });
+    const data = await sendReadMessage(tabId, "html", { target: { css: target.css }, limit }, frameId);
     if (!data) return contentScriptNotReady("html");
 
     if (data.success === false) return notPerformed("html", data.message as string);
@@ -299,7 +301,7 @@ async function attr(params: Record<string, unknown>, tabId: number, frameId?: nu
   if (!target?.css || !name) return notPerformed("attr", "CSS selector and attribute name required");
 
   try {
-    const data = await sendReadMessage(tabId, "attr", { target: { css: target.css }, name });
+    const data = await sendReadMessage(tabId, "attr", { target: { css: target.css }, name }, frameId);
     if (!data) return contentScriptNotReady("attr");
 
     if (data.success === false) return notPerformed("attr", data.message as string);
@@ -319,7 +321,7 @@ async function attr(params: Record<string, unknown>, tabId: number, frameId?: nu
 
 async function meta(tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "meta", {});
+    const data = await sendReadMessage(tabId, "meta", {}, frameId);
     if (!data) return contentScriptNotReady("meta");
 
     if (data.success === false) return notPerformed("meta", data.message as string);
@@ -337,7 +339,7 @@ async function forms(tabId: number, params?: Record<string, unknown>, frameId?: 
   const limit = (params?.limit as number) ?? 20;
 
   try {
-    const data = await sendReadMessage(tabId, "forms", { limit });
+    const data = await sendReadMessage(tabId, "forms", { limit }, frameId);
     if (!data) return contentScriptNotReady("forms");
 
     if (data.success === false) return notPerformed("forms", data.message as string);
@@ -359,7 +361,7 @@ async function count(params: Record<string, unknown>, tabId: number, frameId?: n
   if (!target?.css) return notPerformed("count", "CSS selector required");
 
   try {
-    const data = await sendReadMessage(tabId, "count", { target: { css: target.css } });
+    const data = await sendReadMessage(tabId, "count", { target: { css: target.css } }, frameId);
     if (!data) return contentScriptNotReady("count");
 
     if (data.success === false) return notPerformed("count", data.message as string);
@@ -379,7 +381,7 @@ async function count(params: Record<string, unknown>, tabId: number, frameId?: n
 
 async function selectText(tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "select", {});
+    const data = await sendReadMessage(tabId, "select", {}, frameId);
     if (!data) return contentScriptNotReady("select");
 
     const text = (data.selectedText as string) ?? "";
@@ -396,7 +398,7 @@ async function selectText(tabId: number, frameId?: number): Promise<ActionResult
 
 async function summary(tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "summary", {});
+    const data = await sendReadMessage(tabId, "summary", {}, frameId);
     if (!data) return contentScriptNotReady("summary");
 
     if (data.success === false) return notPerformed("summary", data.message as string);
@@ -410,19 +412,38 @@ async function summary(tabId: number, frameId?: number): Promise<ActionResult> {
   }
 }
 
-async function listFrames(tabId: number, frameId?: number): Promise<ActionResult> {
+/**
+ * List frames with REAL Chrome frameIds (what chrome.tabs.sendMessage accepts),
+ * built from webNavigation + window.name probes. The old content-script
+ * listing returned iframe ordinals, which are not frame ids.
+ */
+async function listFrames(tabId: number, _frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "frames", {});
-    if (!data) return contentScriptNotReady("frames");
-
-    const frames = (data.frames as Array<Record<string, unknown>>) || [];
-    return performed("frames", `Found ${frames.length} frames`, {
+    const [navFrames, injections] = await Promise.all([
+      chrome.webNavigation.getAllFrames({ tabId }),
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => ({ name: window.name }),
+      }).catch(() => []),
+    ]);
+    const names = new Map<number, string>();
+    for (const injection of injections) {
+      const name = (injection.result as { name?: string } | undefined)?.name;
+      if (name) names.set(injection.frameId, name);
+    }
+    const frames = (navFrames ?? []).map((f) => ({
+      frameId: f.frameId,
+      parentFrameId: f.parentFrameId,
+      url: f.url,
+      ...(names.get(f.frameId) ? { name: names.get(f.frameId) } : {}),
+    }));
+    return performed("frames", `Found ${frames.length} frame(s)`, {
       data: { frames },
       evidence: { frameCount: frames.length },
     });
   } catch (err) {
-    return blocked("frames", `Content script error: ${(err as Error).message}`, {
-      errorCode: "CONTENT_SCRIPT_ERROR",
+    return blocked("frames", `Frame listing failed: ${(err as Error).message}`, {
+      errorCode: "FRAMES_LIST_FAILED",
       recoverable: true,
     });
   }
@@ -435,7 +456,7 @@ async function generateSelector(params: Record<string, unknown>, tabId: number, 
   if (!css) return notPerformed("generate_selector", "CSS selector required (use target.css)");
 
   try {
-    const data = await sendReadMessage(tabId, "generate_selector", { target: { css } });
+    const data = await sendReadMessage(tabId, "generate_selector", { target: { css } }, frameId);
     if (!data) return contentScriptNotReady("generate_selector");
 
     if (!data.success) return notPerformed("generate_selector", (data.message as string) || "Failed");
@@ -466,7 +487,7 @@ async function consoleRead(params: Record<string, unknown>, tabId: number, frame
 
 async function runtimeStatus(tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "runtime_status", {});
+    const data = await sendReadMessage(tabId, "runtime_status", {}, frameId);
     if (!data) return contentScriptNotReady("runtime_status");
 
     // The runtime status IS the verdict. Surface the inner self-test at
@@ -522,7 +543,7 @@ const READABLE_MAX_BYTES = 1 * 1024 * 1024; // 1 MB
 
 async function readable(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "readable", {});
+    const data = await sendReadMessage(tabId, "readable", {}, frameId);
     if (!data) return contentScriptNotReady("readable");
     if (data.success === false) {
       return notPerformed("readable", data.message as string, {
@@ -571,7 +592,7 @@ const FULL_HTML_MAX_BYTES = 5 * 1024 * 1024; // 5 MB
 
 async function fullHtml(params: Record<string, unknown>, tabId: number, frameId?: number): Promise<ActionResult> {
   try {
-    const data = await sendReadMessage(tabId, "full_html", {});
+    const data = await sendReadMessage(tabId, "full_html", {}, frameId);
     if (!data) return contentScriptNotReady("full_html");
     if (data.success === false) {
       return notPerformed("full_html", data.message as string, {

@@ -341,7 +341,7 @@ function init(): void {
               return;
             }
             const wantMode = message.mode === "region" ? "region" : "element";
-            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "arm", params: { mode: wantMode } }) as Record<string, unknown>;
+            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "arm", params: { mode: wantMode } }, { frameId: 0 }) as Record<string, unknown>;
             sendResponse({ success: res?.armed !== false, tabId, mode: wantMode });
           } catch (err) {
             sendResponse({ success: false, error: friendlyAnnotateError((err as Error).message) });
@@ -359,7 +359,7 @@ function init(): void {
               sendResponse({ success: false, error: "No active tab" });
               return;
             }
-            await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "disarm", params: {} });
+            await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "disarm", params: {} }, { frameId: 0 });
             sendResponse({ success: true, tabId });
           } catch (err) {
             sendResponse({ success: false, error: friendlyAnnotateError((err as Error).message) });
@@ -377,7 +377,7 @@ function init(): void {
               sendResponse({ armed: false });
               return;
             }
-            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "status", params: {} }) as Record<string, unknown>;
+            const res = await chrome.tabs.sendMessage(tabId, { source: "browserpowers", type: "bp:annotate", action: "status", params: {} }, { frameId: 0 }) as Record<string, unknown>;
             sendResponse({ armed: res?.armed === true, tabId });
           } catch {
             sendResponse({ armed: false });

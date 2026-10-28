@@ -149,7 +149,7 @@ async function collectAnchors(tabId: number, limit: number): Promise<InspectAnch
       type: "bp:read",
       action: "inspect",
       params: { limit, compact: false, include_hidden: false },
-    }) as { anchors?: InspectAnchor[] } | undefined;
+    }, { frameId: 0 }) as { anchors?: InspectAnchor[] } | undefined;
     if (!response || !Array.isArray(response.anchors)) return [];
     return response.anchors.filter((a) => a.boundingRect);
   } catch (err) {
